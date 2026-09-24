@@ -94,6 +94,9 @@ outputs:
   authors:
     description: "the local author pool's names, space separated"
     value: ${{ steps.run.outputs.authors }}
+  draft-minutes:
+    description: "how long a drafting job can run: attempts x timeout, plus the fetch"
+    value: ${{ steps.run.outputs.draft_minutes }}
   author-decay:
     description: "how much an author's trial counts per epoch of age"
     value: ${{ steps.run.outputs.author_decay }}
@@ -1140,6 +1143,16 @@ runs:
             out("kinds", " ".join(enabled))
             out("shards", str(cfg["author"]["shards"]))
             out("authors", " ".join(e["name"] for e in cfg["author"]["local"]["pool"]))
+            # **The drafting job's wall clock, derived rather than guessed.**
+            # It was a hardcoded 30 minutes against six attempts of up to ten
+            # each -- sixty minutes of requests inside a thirty-minute job, so
+            # a slow author was killed mid-draw and the attempts it had left
+            # were never spent. Two magic numbers that had to agree and did
+            # not. The slack is the model fetch and the weight load, which is
+            # about two minutes cold.
+            a = cfg["author"]
+            out("draft_minutes",
+                str(max(10, -(-a["attempts"] * a["timeout"] // 60) + 6)))
             out("author_decay", "%.4f" % cfg["judge"]["author_decay"])
             out("shard_matrix", json.dumps(list(range(cfg["author"]["shards"]))))
             out("json", str(dest))

@@ -198,6 +198,7 @@ jobs:
       lineage: ${{ steps.node.outputs.node }}
       tip: ${{ steps.tip.outputs.tip }}
       shards: ${{ steps.cfg.outputs.shard-matrix }}
+      draft_minutes: ${{ steps.cfg.outputs.draft-minutes }}
       authors: ${{ steps.authors.outputs.assignment }}
       minutes: ${{ steps.budget.outputs.minutes }}
       repeats: ${{ steps.budget.outputs.repeats }}
@@ -657,7 +658,8 @@ jobs:
   # would make the search narrower the worse the draw was.
   draft:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Derived from `attempts x timeout`, not guessed. See `config`.
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.draft_minutes) }}
     needs: [follow, plan]
     if: needs.plan.outputs.have == 'yes'
     strategy:

@@ -371,6 +371,62 @@ runs:
                 jobs.append(pend)
             return wf, [re.sub(r"\$\{\{.*?\}\}", "*", j) for j in jobs]
 
+        # `inputs.NAME` as an action's own manifest writes it. GitHub does
+        # NOT fail on one that is undeclared -- it renders the empty string
+        # and warns in the log, where nobody reads it. `model` referenced
+        # `inputs.author` with no such input for a whole night: the author
+        # assignment silently became "" and the fallback took over, so the
+        # shards still alternated and nothing looked wrong.
+        USES_INPUT = re.compile(r"\binputs\.([A-Za-z_][\w-]*)")
+
+        def manifest_only(text):
+            """The file with every `run:` block scalar removed.
+
+            A reference inside a program is not a manifest reference -- it is
+            forbidden outright by the expression rule above -- and this
+            action's own claim suite is full of `inputs.x` as test DATA.
+            Scanning the whole file makes every fixture look like a bug, which
+            is how a check earns the reputation that gets it deleted.
+            """
+            out_lines, lines, i = [], text.split("\n"), 0
+            while i < len(lines):
+                line = lines[i]
+                if BLOCK.search(line):
+                    out_lines.append(line)
+                    j, first = i + 1, None
+                    while j < len(lines):
+                        cur = lines[j]
+                        if not cur.strip():
+                            j += 1; continue
+                        ind = len(cur) - len(cur.lstrip())
+                        if first is None:
+                            first = ind
+                        elif ind < first:
+                            break
+                        j += 1
+                    i = j
+                    continue
+                out_lines.append(line)
+                i += 1
+            return "\n".join(out_lines)
+
+        def declared_inputs(text):
+            """The names under this manifest's top-level `inputs:` mapping."""
+            names, depth = set(), None
+            for line in text.split("\n"):
+                if re.match(r"^inputs:\s*$", line):
+                    depth = 0
+                    continue
+                if depth is None:
+                    continue
+                if line.strip() and not line.startswith((" ", "\t")):
+                    break                      # a new top-level key ends it
+                m = re.match(r"^(\s+)([A-Za-z_][\w-]*):", line)
+                if m and (depth == 0 or len(m.group(1)) == depth):
+                    depth = len(m.group(1))
+                    names.add(m.group(2))
+            return names
+
         def has_selftest(text):
             return "selftest" in text and re.search(r"command.*selftest|selftest.*command",
                                                     text, re.S) is not None
@@ -446,6 +502,19 @@ runs:
                             and not (target / "action.yaml").is_file():
                         problems.append("%s uses %s, which has no action.yml"
                                         % (p.relative_to(root), u))
+
+            for name, p in actions:
+                text = p.read_text(encoding="utf-8")
+                have = declared_inputs(text)
+                used = {m for m in USES_INPUT.findall(manifest_only(text))}
+                undeclared = sorted(used - have)
+                if undeclared:
+                    problems.append(
+                        "%s refers to %s, which it does not declare under `inputs:`. "
+                        "GitHub renders an undeclared input as the EMPTY STRING and "
+                        "only warns, so the step runs on a value nothing supplied and "
+                        "the log looks clean. Declare it, or stop reading it."
+                        % (name, ", ".join("inputs." + u for u in undeclared)))
 
             for name, p in actions:
                 if not has_selftest(p.read_text(encoding="utf-8")):
@@ -623,6 +692,29 @@ runs:
             claim("and one in an action's env:, which is where it belongs, is fine",
                   la("steps:\n  - env:\n      X: " + EXPR + " inputs.x }" + "}\n"
                      "    run: |\n      echo \"$X\"\n") == [])
+
+            di = declared_inputs
+            man = "name: x\ninputs:\n  command:\n    required: true\n  shard:\n" \
+                  "    default: \"0\"\noutputs:\n  author:\n    value: y\n"
+            claim("an action's declared inputs are read off its inputs: mapping",
+                  di(man) == {"command", "shard"}, di(man))
+            claim("and an OUTPUT of the same name is not one of them, which is "
+                  "the confusion that shipped a dead input for a whole night",
+                  "author" not in di(man))
+            claim("a manifest with no inputs declares none",
+                  di("name: x\nruns:\n  using: composite\n") == set())
+            ref = lambda name: EXPR + " inputs." + name + " }" + "}"
+            claim("a referenced input that is declared is fine",
+                  not ({m for m in USES_INPUT.findall(ref("shard"))} - di(man)))
+            claim("and one that is not is caught",
+                  {m for m in USES_INPUT.findall(ref("author"))} - di(man) == {"author"})
+            claim("a hyphenated input name is matched whole",
+                  USES_INPUT.findall(ref("grammar-out")) == ["grammar-out"])
+            claim("a reference inside a run: block is not a manifest reference, "
+                  "because this suite is full of them as test data",
+                  USES_INPUT.findall(manifest_only(
+                      "inputs:\n  a:\n    default: x\nruns:\n  steps:\n"
+                      "    - run: |\n        print(%r)\n" % ref("nope"))) == [])
 
             claim("a marker comment is not a heredoc",
                   lo("f", "steps:\n  - run: |\n      # <<< ask\n      x\n") == [])
