@@ -1,0 +1,437 @@
+name: goedel-scaffold
+description: >-
+  Turn a blueprint into the first working tree: source, tests, and the handful
+  of commands that say how to build and check it.
+
+# **The gap between a sentence and a repository the loop can run against.**
+#
+# `draft` improves a project that exists. It needs a `goedel.toml` pointing at
+# real commands, a test runner that prints something countable, and at least
+# one passing test to not fall below. None of that exists when the input is
+# "a paste bin with expiring links", and a loop cannot bootstrap itself into
+# existence one milestone at a time: the first milestone has nothing to be
+# judged against.
+#
+# So this produces phase one whole, and is not finished until the result
+# actually runs.
+#
+# **The model does not write `goedel.toml`.** It answers a fixed set of
+# questions about how its code is built and run -- and `genesis` assembles the
+# config from a template with the masks already filled in. That is deliberate:
+# `goedel.toml` names what the machine may write to and what it may never
+# touch, and a machine that gets to write its own masks at birth has no masks.
+# The model chooses a stack; it does not choose its own boundary.
+#
+# What comes back is files plus one block:
+#
+#     <<<FILE src/app.py>>>
+#     ...
+#     <<<END>>>
+#     <<<FILE tests/test_app.py>>>
+#     ...
+#     <<<END>>>
+#     <<<HARNESS>>>
+#     setup: pip install -r requirements.txt
+#     check: python3 -m compileall -q src tests
+#     test: python3 -m pytest -q
+#     verify: bash scripts/verify.sh
+#     claims_re: ^PASSED
+#     suites_re: (\d+) passed
+#     clean: find . -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null; true
+#     <<<END>>>
+#
+# `genesis` then loads the assembled config and runs the harness against the
+# tree, and a scaffold whose tests do not pass, or whose claim count is zero,
+# or whose `verify` does not answer, is not a scaffold. It goes back with the
+# failure attached.
+#
+# This action asks nothing. `draft ask` owns the network.
+
+inputs:
+  command:
+    description: "card | admit | selftest"
+    required: true
+  root:
+    description: "the tree to write into"
+    required: false
+    default: "."
+  blueprint:
+    description: "for card: the blueprint file"
+    required: false
+    default: loop/blueprint.txt
+  phase:
+    description: "for card: which phase to build"
+    required: false
+    default: "1"
+  because:
+    description: "for card: why the last attempt was not accepted"
+    required: false
+    default: ""
+  reply:
+    description: "for admit: the file `draft ask` wrote"
+    required: false
+    default: reply.txt
+  card-out:
+    description: "for card: where to write the question"
+    required: false
+    default: scaffold-card.txt
+  system-out:
+    description: "for card: where to write the rules the answer is held to"
+    required: false
+    default: scaffold-system.txt
+  harness-out:
+    description: "for admit: where to write the harness answers"
+    required: false
+    default: scaffold-harness.json
+
+outputs:
+  files:
+    description: "how many files were written"
+    value: ${{ steps.run.outputs.files }}
+  written:
+    description: "the paths, space separated"
+    value: ${{ steps.run.outputs.written }}
+  why:
+    description: "when the answer was refused, what was wrong with it"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        BLUEPRINT: ${{ inputs.blueprint }}
+        PHASE: ${{ inputs.phase }}
+        BECAUSE: ${{ inputs.because }}
+        REPLY: ${{ inputs.reply }}
+        CARD_OUT: ${{ inputs.card-out }}
+        SYSTEM_OUT: ${{ inputs.system-out }}
+        HARNESS_OUT: ${{ inputs.harness-out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import json, os, posixpath, re, sys, textwrap
+        from pathlib import Path
+
+        FENCE_OPEN = re.compile(r"^<<<FILE (.+?)>>>\s*$")
+        FENCE_CLOSE = "<<<END>>>"
+        HARNESS_OPEN = "<<<HARNESS>>>"
+
+        # The only places a scaffold may write. Fixed here rather than asked
+        # for: these become the `allow` masks, and a machine that picks its own
+        # boundary at birth has none.
+        ROOTS = ("src/", "tests/", "scripts/")
+
+        # `verify` is not in the required set only because a project may
+        # legitimately have none -- but `genesis` turns autonomy on, and
+        # `config` refuses autonomy without it, so in practice it is required
+        # and the card says so.
+        REQUIRED = ("check", "test", "claims_re")
+        OPTIONAL = ("setup", "build", "verify", "clean", "suites_re", "artifact")
+
+        class ScaffoldError(Exception): pass
+
+        def out(k, v):
+            v = str(v).replace("\r", " ").replace("\n", " ")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def safe(path):
+            """A path a scaffold may write to."""
+            if not path or path.startswith(("/", "\\")) or ":" in path.split("/")[0]:
+                return False
+            if any(seg in ("", ".", "..") for seg in path.split("/")):
+                return False
+            if posixpath.normpath(path) != path:
+                return False
+            return path.startswith(ROOTS)
+
+        def parse(reply):
+            """Files and the harness block. Prose between them is ignored."""
+            files, harness, path, body = [], None, None, []
+            in_harness = False
+            for line in reply.split("\n"):
+                s = line.strip()
+                if s == HARNESS_OPEN:
+                    if path is not None:
+                        raise ScaffoldError("the harness block opened inside %s" % path)
+                    if harness is not None:
+                        raise ScaffoldError("two harness blocks is two answers")
+                    in_harness, body = True, []
+                    continue
+                m = FENCE_OPEN.match(line)
+                if m:
+                    if in_harness:
+                        raise ScaffoldError("a file opened inside the harness block")
+                    if path is not None:
+                        raise ScaffoldError("%s opened before %s was closed"
+                                            % (m.group(1), path))
+                    path, body = m.group(1).strip(), []
+                    continue
+                if s == FENCE_CLOSE:
+                    if in_harness:
+                        harness = "\n".join(body)
+                        in_harness = False
+                    elif path is not None:
+                        files.append((path, "\n".join(body).rstrip("\n") + "\n"))
+                        path = None
+                    else:
+                        raise ScaffoldError("a closing fence with nothing open")
+                    continue
+                if path is not None or in_harness:
+                    body.append(line)
+            if path is not None:
+                raise ScaffoldError("the fence for %s was never closed; the reply is "
+                                    "truncated" % path)
+            if in_harness:
+                raise ScaffoldError("the harness block was never closed")
+            return files, harness
+
+        def read_harness(block):
+            if block is None:
+                raise ScaffoldError(
+                    "the reply carries no <<<HARNESS>>> block, so nothing says how to "
+                    "build or test what it wrote")
+            got = {}
+            for line in block.splitlines():
+                if not line.strip():
+                    continue
+                k, sep, v = line.partition(":")
+                if not sep:
+                    raise ScaffoldError("%r in the harness block is not `key: value`"
+                                        % line.strip()[:60])
+                k, v = k.strip(), v.strip()
+                if k not in REQUIRED + OPTIONAL:
+                    raise ScaffoldError("%r is not a harness key this machine has" % k)
+                if k in got:
+                    raise ScaffoldError("%s again in the harness block" % k)
+                got[k] = v
+            missing = [k for k in REQUIRED if not got.get(k)]
+            if missing:
+                raise ScaffoldError("the harness block declares no " + ", ".join(missing))
+            for k in ("claims_re", "suites_re"):
+                if got.get(k):
+                    try:
+                        re.compile(got[k])
+                    except re.error as exc:
+                        raise ScaffoldError("%s is not a regular expression: %s" % (k, exc))
+            return got
+
+        def admit(reply, root):
+            files, block = parse(reply)
+            if not files:
+                raise ScaffoldError("the reply carries no file")
+            harness = read_harness(block)
+
+            paths = [p for p, _ in files]
+            if len(set(paths)) != len(paths):
+                dupes = sorted({p for p in paths if paths.count(p) > 1})
+                raise ScaffoldError("the same file twice: %s" % ", ".join(dupes))
+            bad = [p for p in paths if not safe(p)]
+            if bad:
+                raise ScaffoldError(
+                    "these are outside %s, which is everywhere a scaffold may write: %s"
+                    % (" ".join(ROOTS), ", ".join(bad)))
+            if not any(p.startswith("tests/") for p in paths):
+                raise ScaffoldError(
+                    "no file under tests/. Every kind's J2 is a count of passing tests "
+                    "that may not fall, so a tree with no tests is one nothing can judge "
+                    "and the loop would refuse every night forever.")
+            if not any(p.startswith("src/") for p in paths):
+                raise ScaffoldError("no file under src/, so there is nothing to test")
+
+            written = []
+            for rel, body in files:
+                p = Path(root) / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(body, encoding="utf-8")
+                written.append(rel)
+            return written, harness
+
+        # -- the question ------------------------------------------------
+
+        SYSTEM = textwrap.dedent("""\
+            You write the first working version of a project from its build plan. A
+            machine will run what you write, unattended, and will keep improving it
+            for months without anybody reading this conversation.
+
+            Answer with complete files, then one harness block, and nothing else:
+
+            <<<FILE src/app.py>>>
+            the entire contents of that file
+            <<<END>>>
+            <<<FILE tests/test_app.py>>>
+            the entire contents of that file
+            <<<END>>>
+            <<<HARNESS>>>
+            setup: <command that installs dependencies, or omit this line>
+            check: <a FAST command that fails on broken code -- seconds, not minutes>
+            test: <the command that runs the tests>
+            verify: <a command that exits 0 only when the BUILT THING actually works>
+            claims_re: <a regex matching ONE LINE PER PASSING TEST in the test output>
+            suites_re: <a regex capturing the total, e.g. (\\d+) passed -- or omit>
+            clean: <command removing stale build caches, or omit this line>
+            <<<END>>>
+
+            Rules that are checked mechanically and will refuse your answer:
+            - Only write under src/, tests/ and scripts/. Nothing else.
+            - There must be at least one file under tests/ and one under src/.
+            - Give WHOLE files. No diffs, no excerpts, no ellipsis.
+            - The tests must PASS against what you wrote. They are the floor the
+              machine may never fall below, so a failing test at birth stops
+              everything forever.
+            - `claims_re` must match one line per passing test in your runner's real
+              output. If it matches nothing, the machine has no way to tell progress
+              from regression and will refuse every change anybody ever proposes.
+              Check it against the output your runner actually prints.
+            - `verify` must exercise the built thing end to end -- start it, call it,
+              read the answer -- and must exit non-zero when it is broken. It must
+              need no human and must finish in seconds.
+            - Every file your commands reference must be a file you WROTE. There is
+              no test runner, no script and no config in this repository except the
+              ones in your answer. A command pointing at something that is not
+              there fails, and the whole attempt is thrown away.
+            - Prefer the standard library. Every dependency is something that breaks
+              unattended at 02:17 with nobody watching.
+            - Build ONLY the phase you are given. Later phases are somebody else's
+              night.
+            """)
+
+        def card(blueprint_text, phase, because=""):
+            parts = ["THE PLAN\n" + blueprint_text.strip()]
+            parts.append(
+                "BUILD PHASE %s, AND ONLY THAT PHASE.\nEvery criterion listed under it "
+                "must be true of what you write, and each one will become a test the "
+                "machine re-runs forever." % phase)
+            parts.append("WHERE YOU MAY WRITE\n" + "\n".join("  " + r + "**" for r in ROOTS))
+            if because:
+                parts.append(
+                    "YOUR LAST ANSWER WAS NOT ACCEPTED. Fix exactly this and answer "
+                    "again with the whole files:\n" + because[:4000])
+            return "\n\n".join(parts)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            import tempfile
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except ScaffoldError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            H = ("<<<HARNESS>>>\ncheck: true\ntest: pytest -q\n"
+                 "claims_re: ^PASSED\nverify: curl -sf localhost:8000/\n<<<END>>>")
+            R = ("prose\n<<<FILE src/a.py>>>\nx = 1\n<<<END>>>\n"
+                 "<<<FILE tests/test_a.py>>>\nassert True\n<<<END>>>\n" + H)
+
+            files, block = parse(R)
+            claim("files and the harness block are read", len(files) == 2 and block)
+            claim("prose around them is ignored", files[0][0] == "src/a.py")
+            h = read_harness(block)
+            claim("the harness answers parse", h["test"] == "pytest -q")
+            claim("and an omitted optional key is simply absent", "setup" not in h)
+
+            raises("a reply with no harness block is refused",
+                   lambda: read_harness(None))
+            raises("a harness block missing a required key is refused",
+                   lambda: read_harness("check: true\ntest: t\n"))
+            raises("a harness key nothing knows is refused",
+                   lambda: read_harness("check: t\ntest: t\nclaims_re: x\nvibes: good\n"))
+            raises("a repeated harness key is refused",
+                   lambda: read_harness("check: t\ncheck: u\ntest: t\nclaims_re: x\n"))
+            raises("a line that is not key: value is refused",
+                   lambda: read_harness("check: t\njust prose\n"))
+            raises("a claims_re that is not a regex is refused",
+                   lambda: read_harness("check: t\ntest: t\nclaims_re: (unclosed\n"))
+            raises("an unclosed file fence is refused, not truncated into",
+                   lambda: parse("<<<FILE src/a.py>>>\nhalf"))
+            raises("an unclosed harness block is refused",
+                   lambda: parse("<<<HARNESS>>>\ncheck: t"))
+            raises("two harness blocks is refused", lambda: parse(H + "\n" + H))
+            raises("a file opened inside the harness block is refused",
+                   lambda: parse("<<<HARNESS>>>\n<<<FILE src/a.py>>>\n<<<END>>>"))
+
+            claim("a src path is writable", safe("src/a/b.py"))
+            claim("and a tests path", safe("tests/test_a.py"))
+            claim("and a scripts path", safe("scripts/verify.sh"))
+            claim("the config is not", not safe("goedel.toml"))
+            claim("the machine is not", not safe(".github/workflows/ci.yml"))
+            claim("nor is a path that climbs out", not safe("src/../../etc/passwd"))
+            claim("nor an absolute one", not safe("/etc/passwd"))
+            claim("nor the repository root", not safe("README.md"))
+
+            with tempfile.TemporaryDirectory() as td:
+                written, h = admit(R, td)
+                claim("admission writes the files", sorted(written) ==
+                      ["src/a.py", "tests/test_a.py"])
+                claim("and they are on disk",
+                      (Path(td) / "src/a.py").read_text() == "x = 1\n")
+                raises("a scaffold with no test is refused: nothing could judge it",
+                       lambda: admit("<<<FILE src/a.py>>>\nx\n<<<END>>>\n" + H, td))
+                raises("a scaffold with no source is refused",
+                       lambda: admit("<<<FILE tests/t.py>>>\nx\n<<<END>>>\n" + H, td))
+                raises("a scaffold writing outside its roots is refused",
+                       lambda: admit(R.replace("src/a.py", "goedel.toml"), td))
+                raises("the same file twice is refused",
+                       lambda: admit(R.replace("tests/test_a.py", "src/a.py"), td))
+
+            c = card("[blueprint] v1\nname x\n[phase] 1 first\n  done a thing happens\n", "1")
+            claim("the card carries the plan", "a thing happens" in c)
+            claim("and says which phase to build", "BUILD PHASE 1" in c)
+            claim("and where it may write", "src/**" in c)
+            claim("a retry carries the reason it was refused",
+                  "claims_re matched nothing" in card("x", "1", "claims_re matched nothing"))
+            claim("the rules tell it the tests must pass at birth",
+                  "failing test at birth" in SYSTEM)
+            claim("and that it may only reference what it wrote",
+                  "must be a file you WROTE" in SYSTEM)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+
+        root = os.environ.get("ROOT", ".") or "."
+        try:
+            if cmd == "card":
+                bp = Path(root) / os.environ["BLUEPRINT"]
+                if not bp.is_file():
+                    raise ScaffoldError("no blueprint at %s" % bp)
+                Path(os.environ["CARD_OUT"]).write_text(
+                    card(bp.read_text(encoding="utf-8"), os.environ.get("PHASE", "1"),
+                         os.environ.get("BECAUSE", "")), encoding="utf-8")
+                Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                print("  asked for phase %s" % os.environ.get("PHASE", "1"))
+                out("files", "0"); out("written", ""); out("why", "")
+            elif cmd == "admit":
+                written, harness = admit(
+                    Path(os.environ["REPLY"]).read_text(encoding="utf-8"), root)
+                Path(os.environ["HARNESS_OUT"]).write_text(
+                    json.dumps(harness, indent=2, sort_keys=True), encoding="utf-8")
+                print("  %d file(s):" % len(written))
+                for w in written:
+                    print("    %s" % w)
+                print("  harness: " + ", ".join("%s=%s" % (k, v[:40])
+                                                for k, v in sorted(harness.items())))
+                out("files", str(len(written))); out("written", " ".join(written))
+                out("why", "")
+            else:
+                raise ScaffoldError("no such command: %r" % cmd)
+        except ScaffoldError as exc:
+            print("::notice::scaffold %s: %s" % (cmd, exc))
+            out("files", "0"); out("written", ""); out("why", str(exc)[:500])
+            sys.exit(1)
+        PYEOF

@@ -1,0 +1,188 @@
+name: genesis-build
+
+# One attempt at a tree that runs. Called by `genesis`, up to three times.
+#
+# **The attempt is not the writing, it is the proving.** Anything can emit
+# files. What this does is assemble the config those files imply, load it
+# through the same validation every night uses, run the harness against the
+# tree, and require four things that a project lacking any one of would
+# silently never work:
+#
+#   it builds          -- or nothing downstream means anything
+#   its tests pass     -- the count that may not fall starts AT the floor, so
+#                         a red test at birth makes every future night refuse
+#   the count is > 0   -- `claims_re` matching nothing is the same failure
+#                         wearing a different hat, and it is the commonest one
+#   `verify` answers   -- the product works, not just its units. With nobody
+#                         merging, this is the only thing standing between a
+#                         broken build and everybody who uses it
+#
+# A failure at any of them comes back as `why`, and the next attempt is shown
+# it. Nothing is pushed unless all four hold.
+
+on:
+  workflow_call:
+    inputs:
+      attempt:    { type: string, required: true }
+      name:       { type: string, required: true }
+      autonomous: { type: boolean, required: true }
+      because:    { type: string, required: false, default: "" }
+    outputs:
+      ok:
+        description: "yes when the tree it wrote actually runs"
+        value: ${{ jobs.build.outputs.ok }}
+      why:
+        description: "when it does not, which of the four it failed"
+        value: ${{ jobs.build.outputs.why }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    outputs:
+      ok: ${{ steps.verdict.outputs.ok }}
+      why: ${{ steps.verdict.outputs.why }}
+    env:
+      GOEDEL_INFERENCE_KEY: ${{ secrets.GOEDEL_INFERENCE_KEY }}
+      GOEDEL_INFERENCE_URL: ${{ vars.GOEDEL_INFERENCE_URL }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: loop/main
+          fetch-depth: 0
+
+      - id: card
+        uses: ./.github/actions/scaffold
+        with:
+          command: card
+          blueprint: loop/blueprint.txt
+          phase: "1"
+          because: ${{ inputs.because }}
+          card-out: scaffold-card.txt
+          system-out: scaffold-system.txt
+
+      # There is no config yet, and `ask` only needs the [author] table -- so
+      # it is handed a minimal one written here rather than a chicken-and-egg.
+      - name: The smallest config that can ask a question
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ask.json" <<'JSON'
+          {"author": {"provider": "anthropic", "model": "claude-sonnet-5",
+                      "api_key_env": "GOEDEL_INFERENCE_KEY",
+                      "base_url_env": "GOEDEL_INFERENCE_URL",
+                      "attempts": 1, "temperature": 0.2, "max_tokens": 16000,
+                      "shards": 1, "context": []}}
+          JSON
+
+      - id: ask
+        continue-on-error: true
+        uses: ./.github/actions/draft
+        with:
+          command: ask
+          config: ${{ runner.temp }}/ask.json
+          system: scaffold-system.txt
+          user: scaffold-card.txt
+          out: scaffold-reply.txt
+          seed: ${{ inputs.attempt }}
+
+      - id: admit
+        continue-on-error: true
+        uses: ./.github/actions/scaffold
+        with:
+          command: admit
+          reply: scaffold-reply.txt
+          harness-out: scaffold-harness.json
+
+      - id: assemble
+        continue-on-error: true
+        if: steps.admit.outcome == 'success'
+        uses: ./.github/actions/config
+        with:
+          command: assemble
+          name: ${{ inputs.name }}
+          harness-json: scaffold-harness.json
+          autonomous: ${{ inputs.autonomous }}
+
+      - id: cfg
+        continue-on-error: true
+        if: steps.assemble.outcome == 'success'
+        uses: ./.github/actions/config
+        with: { command: load }
+
+      - id: harness
+        continue-on-error: true
+        if: steps.cfg.outcome == 'success'
+        uses: ./.github/actions/harness
+        with:
+          command: run
+          config: ${{ steps.cfg.outputs.json }}
+          arm: genesis
+          repeats: "1"
+          skip-bench: "true"
+
+      - id: verdict
+        shell: bash
+        env:
+          ASK: ${{ steps.ask.outcome }}
+          ADMIT: ${{ steps.admit.outcome }}
+          ADMIT_WHY: ${{ steps.admit.outputs.why }}
+          ASSEMBLE: ${{ steps.assemble.outcome }}
+          CFG: ${{ steps.cfg.outcome }}
+          BUILT: ${{ steps.harness.outputs.built }}
+          TESTED: ${{ steps.harness.outputs.tested }}
+          VERIFIED: ${{ steps.harness.outputs.verified }}
+          CLAIMS: ${{ steps.harness.outputs.claims }}
+          HWHY: ${{ steps.harness.outputs.why }}
+          WRITTEN: ${{ steps.admit.outputs.written }}
+        run: |
+          set -euo pipefail
+          say () { echo "ok=no" >> "$GITHUB_OUTPUT"; echo "why=$1" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          [ "$ASK" = "success" ]      || say "nothing answered the request for a scaffold"
+          [ "$ADMIT" = "success" ]    || say "the reply was refused: ${ADMIT_WHY:-no reason}"
+          [ "$ASSEMBLE" = "success" ] || say "the harness answers do not make a valid config"
+          [ "$CFG" = "success" ]      || say "the assembled config does not load"
+          [ "$BUILT" = "yes" ]        || say "the tree does not build: ${HWHY:-no reason}"
+          [ "$TESTED" = "yes" ]       || say "the tests do not pass at birth, and the count that may not fall would start at the floor: ${HWHY:-no reason}"
+          # The one that is easy to miss and impossible to recover from later.
+          if [ "${CLAIMS:-0}" = "0" ]; then
+            say "the tests passed and claims_re matched nothing, so nothing can count progress and every future night would be refused for a reason unrelated to the code"
+          fi
+          [ "$VERIFIED" = "yes" ]     || say "the built product does not answer: ${HWHY:-no reason}"
+
+          echo "  attempt ${{ inputs.attempt }}: builds, $CLAIMS claim(s), and it answers"
+          echo "ok=yes" >> "$GITHUB_OUTPUT"
+          echo "why=" >> "$GITHUB_OUTPUT"
+          echo "FILES=$WRITTEN" >> "$GITHUB_ENV"
+
+      - name: File it
+        if: steps.verdict.outputs.ok == 'yes'
+        shell: bash
+        env:
+          NAME: ${{ inputs.name }}
+          CLAIMS: ${{ steps.harness.outputs.claims }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add goedel.toml $FILES
+          git commit -q -m "genesis: $NAME, phase 1 -- builds, $CLAIMS claim(s), verified"
+          git push origin HEAD:refs/heads/loop/main
+
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: genesis-attempt-${{ inputs.attempt }}
+          path: |
+            scaffold-reply.txt
+            scaffold-harness.json
+            goedel.toml
+            harness-genesis.log
+          if-no-files-found: ignore
+          retention-days: 30

@@ -81,6 +81,33 @@ required reviewer.
 
 ---
 
+## If you are running it autonomously
+
+`[loop] autonomous = true` means a night that gets past the judge asks GitHub
+to merge its own pull request. Two settings make that work, and one of them is
+the difference between removing the human and removing the gate.
+
+- **Settings → General → Allow auto-merge.** Without it the loop says so in a
+  warning and the adoption sits in the pull request waiting for somebody.
+- **Keep the required status checks above.** Auto-merge lands the change *when
+  its checks pass*, so `ci` still re-verifies every adoption on a job the loop
+  does not control, and a red one leaves the request open rather than merging
+  it. This is why the loop asks for auto-merge rather than pushing to your
+  default branch directly: a direct push would work and would also walk past
+  every gate you configured.
+
+What is removed is the waiting. What is kept is the checking.
+
+Two further things are worth setting before you walk away:
+
+- **`[harness] verify` must exercise the built thing.** `config` refuses to
+  load with autonomy on and no verify command, because unit tests do not know
+  whether the product still runs — every function in a site that 500s on every
+  route still passes.
+- **`[loop] give_up_after`.** After that many consecutive nights adopting
+  nothing, the loop stands down instead of spending a runner a night forever
+  on a milestone it cannot write. Zero means never.
+
 ## Environment `evaluator`
 
 Only needed once you intend to use the `boundary` lane.

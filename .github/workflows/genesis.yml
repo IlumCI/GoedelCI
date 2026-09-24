@@ -1,0 +1,270 @@
+name: genesis
+
+# **A name and a description, and a repository that runs.**
+#
+# Everything else here improves a project that exists. This makes one. You give
+# it what the thing is called and what it should be; it plans, builds phase
+# one, proves the result actually works, writes the config the nightly loop
+# will run against, and commits. After it, `loop-night` has something to do
+# every night and you have nothing to do at all.
+#
+# **It is not finished until the tree it wrote runs.** A scaffold is accepted
+# only when `config` loads what was assembled for it, the harness builds and
+# tests it, the claim count is above zero, and `verify` answers. Anything less
+# goes back to be written again with the failure attached. Three attempts, and
+# they are separate jobs so that each one starts from a clean checkout rather
+# than from whatever the last one left behind.
+#
+# That gate is the whole design. A loop bootstrapped onto a tree whose tests do
+# not pass can never adopt anything -- the count that may not fall starts at
+# the floor -- and a loop whose `claims_re` matches nothing refuses every night
+# forever for a reason that has nothing to do with the code. Both fail silently
+# months later. Here they fail in four minutes, with the reason printed.
+#
+# Run it once, on an empty repository. Running it again on one that already has
+# a blueprint refuses rather than overwriting the plan the record is built on.
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "what the thing is called"
+        required: true
+      description:
+        description: "what it should be. A paragraph. Say what done looks like."
+        required: true
+      autonomous:
+        description: "promote its own work to the default branch, with no human"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loop-main
+  cancel-in-progress: false
+
+env:
+  GOEDEL_INFERENCE_KEY: ${{ secrets.GOEDEL_INFERENCE_KEY }}
+  GOEDEL_INFERENCE_URL: ${{ vars.GOEDEL_INFERENCE_URL }}
+
+jobs:
+  # --- plan: the description becomes phases with observable criteria -------
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      stack: ${{ steps.admit.outputs.stack }}
+      verify: ${{ steps.admit.outputs.verify }}
+      branch: ${{ steps.branch.outputs.name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+
+      - id: branch
+        name: The loop's branch, and a refusal if this has run before
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          default=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+          test -n "$default" || { echo "::error::cannot tell the default branch"; exit 1; }
+          echo "name=$default" >> "$GITHUB_OUTPUT"
+          if git rev-parse --verify --quiet origin/loop/main >/dev/null; then
+            git checkout -f -B loop/main origin/loop/main
+          else
+            git checkout -f -B loop/main "origin/$default"
+          fi
+          # **Genesis is once.** The blueprint is what every certificate's
+          # milestone was drawn from, so replacing it retroactively detaches
+          # the whole record from the plan it claims to be executing. Revising
+          # the plan is a `boundary` proposal at an epoch edge, not a second
+          # genesis.
+          if [ -f loop/blueprint.txt ]; then
+            echo "::error::this repository already has a plan at loop/blueprint.txt."
+            echo "::error::Genesis runs once. Revising the plan is a boundary proposal,"
+            echo "::error::so that the record stays attached to the plan it executed."
+            exit 1
+          fi
+
+      - id: card
+        uses: ./.github/actions/blueprint
+        with:
+          command: card
+          name: ${{ inputs.name }}
+          description: ${{ inputs.description }}
+          card-out: blueprint-card.txt
+          system-out: blueprint-system.txt
+
+      # No config exists yet, and `ask` needs only the [author] table -- so it
+      # gets a minimal one written here rather than a chicken-and-egg.
+      - name: The smallest config that can ask a question
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ask.json" <<'JSON'
+          {"author": {"provider": "anthropic", "model": "claude-sonnet-5",
+                      "api_key_env": "GOEDEL_INFERENCE_KEY",
+                      "base_url_env": "GOEDEL_INFERENCE_URL",
+                      "attempts": 1, "temperature": 0.0, "max_tokens": 8000,
+                      "shards": 1, "context": []}}
+          JSON
+
+      - id: ask
+        uses: ./.github/actions/draft
+        with:
+          command: ask
+          config: ${{ runner.temp }}/ask.json
+          system: blueprint-system.txt
+          user: blueprint-card.txt
+          out: blueprint-reply.txt
+
+      - id: admit
+        uses: ./.github/actions/blueprint
+        with:
+          command: admit
+          reply: blueprint-reply.txt
+
+      - name: File the plan and the goal
+        shell: bash
+        env:
+          NAME: ${{ inputs.name }}
+          DESCRIPTION: ${{ inputs.description }}
+        run: |
+          set -euo pipefail
+          mkdir -p loop
+          # The goal is the operator's own words, kept verbatim. The blueprint
+          # is a reading of them, and a reading can be wrong -- so the sentence
+          # it was read from stays where a later night can compare.
+          {
+            printf '%s\n\n' "$NAME"
+            printf '%s\n' "$DESCRIPTION"
+          } > loop/goal.txt
+          git add loop
+          git commit -q -m "genesis: a plan for $NAME"
+          git push origin HEAD:refs/heads/loop/main
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: genesis-plan
+          path: |
+            loop/blueprint.txt
+            blueprint-reply.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  # --- build: three attempts at a tree that actually runs ------------------
+  #
+  # Separate jobs rather than one with a retry loop: a composite action cannot
+  # be called in a loop from YAML, and each attempt wants a clean checkout
+  # anyway. Each is skipped if an earlier one worked, and each is handed the
+  # reason the last one did not.
+  build-1:
+    needs: plan
+    uses: ./.github/workflows/genesis-build.yml
+    with:
+      attempt: "1"
+      name: ${{ inputs.name }}
+      autonomous: ${{ inputs.autonomous }}
+      because: ""
+    secrets: inherit
+
+  build-2:
+    needs: [plan, build-1]
+    if: ${{ !cancelled() && needs.build-1.outputs.ok != 'yes' }}
+    uses: ./.github/workflows/genesis-build.yml
+    with:
+      attempt: "2"
+      name: ${{ inputs.name }}
+      autonomous: ${{ inputs.autonomous }}
+      because: ${{ needs.build-1.outputs.why }}
+    secrets: inherit
+
+  build-3:
+    needs: [plan, build-1, build-2]
+    if: ${{ !cancelled() && needs.build-1.outputs.ok != 'yes' && needs.build-2.outputs.ok != 'yes' }}
+    uses: ./.github/workflows/genesis-build.yml
+    with:
+      attempt: "3"
+      name: ${{ inputs.name }}
+      autonomous: ${{ inputs.autonomous }}
+      because: ${{ needs.build-2.outputs.why }}
+    secrets: inherit
+
+  # --- born: say what happened, and what happens next ----------------------
+  born:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [plan, build-1, build-2, build-3]
+    if: always()
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: loop/main
+          fetch-depth: 0
+
+      - id: state
+        shell: bash
+        env:
+          OK1: ${{ needs.build-1.outputs.ok }}
+          OK2: ${{ needs.build-2.outputs.ok }}
+          OK3: ${{ needs.build-3.outputs.ok }}
+          WHY: ${{ needs.build-3.outputs.why || needs.build-2.outputs.why || needs.build-1.outputs.why }}
+        run: |
+          set -euo pipefail
+          if [ "$OK1" = "yes" ] || [ "$OK2" = "yes" ] || [ "$OK3" = "yes" ]; then
+            echo "born=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "born=no" >> "$GITHUB_OUTPUT"
+            echo "::error::three attempts and none of them produced a tree that runs."
+            echo "::error::last reason: $WHY"
+            echo "::error::The plan is on loop/main; nothing was built. Read it, adjust"
+            echo "::error::the description, and run genesis again on a fresh branch."
+          fi
+
+      - if: steps.state.outputs.born == 'yes'
+        uses: ./.github/actions/config
+        with: { command: load }
+
+      - if: steps.state.outputs.born == 'yes'
+        uses: ./.github/actions/blueprint
+        with:
+          command: phase
+          config: ${{ env.GOEDEL_CONFIG }}
+
+      - name: Offer it to the default branch
+        if: steps.state.outputs.born == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT: ${{ needs.plan.outputs.branch }}
+          NAME: ${{ inputs.name }}
+          STACK: ${{ needs.plan.outputs.stack }}
+          AUTONOMOUS: ${{ inputs.autonomous }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          body=$(printf '**%s** is born.\n\n```\n%s\n```\n\nStack: %s\n\nThe plan is in `loop/blueprint.txt`; each criterion under each phase becomes a milestone with that sentence as its witness. `loop-night` works the first open one every night.\n\nAutonomous promotion: **%s**. %s\n\nWhat to do now: merge this, apply the protections in `.github/RULESETS.md`, and run `proof` once by hand.\n' \
+            "$NAME" "$(cat loop/blueprint.txt)" "$STACK" "$AUTONOMOUS" \
+            "$([ "$AUTONOMOUS" = "true" ] \
+               && echo 'Nights that get past the judge push to this branch themselves; the audit pull request becomes a record rather than a gate.' \
+               || echo 'Nights stop at a pull request you merge.')")
+          n=$(gh pr list --head loop/main --base "$DEFAULT" --state open --json number --jq length)
+          if [ "$n" = "0" ]; then
+            gh pr create --head loop/main --base "$DEFAULT" \
+              --title "genesis: $NAME" --body "$body"
+          else
+            num=$(gh pr list --head loop/main --base "$DEFAULT" --state open \
+                    --json number --jq '.[0].number')
+            gh pr edit "$num" --body "$body"
+          fi
+
+      - if: steps.state.outputs.born != 'yes'
+        shell: bash
+        run: exit 1

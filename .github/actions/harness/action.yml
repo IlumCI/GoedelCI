@@ -70,6 +70,9 @@ outputs:
   tested:
     description: "yes | no"
     value: ${{ steps.run.outputs.tested }}
+  verified:
+    description: "yes when the built product still does what it is for"
+    value: ${{ steps.run.outputs.verified }}
   suites:
     description: "how many suites ran"
     value: ${{ steps.run.outputs.suites }}
@@ -215,8 +218,8 @@ runs:
                 code, text = shell(h["clean"], root, timeout)
                 log.append("$ %s\n%s" % (h["clean"], text))
                 if code != 0:
-                    return dict(built=False, tested=False, suites=0, claims=0, checks=0,
-                                rails={}, log="\n".join(log),
+                    return dict(built=False, tested=False, verified=False, suites=0,
+                                claims=0, checks=0, rails={}, log="\n".join(log),
                                 why="the clean command failed: %s" % h["clean"])
 
             for cmd in h["setup"]:
@@ -226,8 +229,8 @@ runs:
                 if code == 0:
                     succeeded += 1
                 else:
-                    return dict(built=False, tested=False, suites=0, claims=0,
-                                checks=succeeded, rails={}, log="\n".join(log),
+                    return dict(built=False, tested=False, verified=False, suites=0,
+                                claims=0, checks=succeeded, rails={}, log="\n".join(log),
                                 why="setup failed: %s" % cmd)
 
             built, warnings = True, 0
@@ -264,7 +267,38 @@ runs:
                 else:
                     why = why or ("the tests did not pass: %d claim(s) printed a pass" % claims)
 
+            # **The product, not the code.** `test` said the units behave;
+            # this says the thing still is the thing. It runs the built
+            # artefact -- serves the site and fetches a page, starts the agent
+            # and puts its evals to it -- and its rail lines are collected like
+            # a benchmark's, so a candidate can be refused for a route that got
+            # slower as well as one that stopped answering.
+            #
+            # It matters most when nobody is merging. `[loop] autonomous`
+            # refuses to switch on without it, because a judge that knows only
+            # unit tests will promote a site that 500s on every route: every
+            # function in it still passes.
+            verified = False
             samples = {}
+            if built and tested and h.get("verify"):
+                attempted += 1
+                code, text = shell(h["verify"], root, timeout)
+                log.append("$ %s\n%s" % (h["verify"], text))
+                if code == 0:
+                    succeeded += 1
+                    verified = True
+                    for name, (value, unit, direction) in rails_in(text).items():
+                        samples[name] = ([value], unit, direction)
+                elif code == 124:
+                    why = why or ("the product did not answer inside %ds" % timeout)
+                else:
+                    tail = " ".join(text.strip().splitlines()[-3:])[:200]
+                    why = why or ("the built product does not work: %s" % (tail or "no output"))
+            elif built and tested:
+                # No verify command is not a failure; it is a project that has
+                # not said what its product does.
+                verified = True
+
             if built and h["bench"] and not skip_bench:
                 for _ in range(max(1, repeats)):
                     attempted += 1
@@ -288,8 +322,9 @@ runs:
                 if p.is_file():
                     samples["cost.artifact_bytes"] = ([float(p.stat().st_size)], "B", "lower")
 
-            return dict(built=built, tested=tested, suites=suites, claims=claims,
-                        checks=succeeded, rails=samples, log="\n".join(log), why=why)
+            return dict(built=built, tested=tested, verified=verified, suites=suites,
+                        claims=claims, checks=succeeded, rails=samples,
+                        log="\n".join(log), why=why)
 
         # ------------------------------------------------------------------
 
@@ -335,7 +370,8 @@ runs:
                 (root / "art.bin").write_bytes(b"x" * 100)
                 def cfg(**over):
                     h = {"setup": [], "build": "", "check": "", "test": "true",
-                         "bench": "", "artifact": "", "timeout": 60, "clean": ""}
+                         "bench": "", "artifact": "", "timeout": 60, "clean": "",
+                         "verify": ""}
                     h.update(D); h.update(over)
                     return {"harness": h}
 
@@ -385,6 +421,23 @@ runs:
                 claim("and the reason says how long it was given",
                       "1s" in r["why"])
 
+                r = measure(root, cfg(verify="echo 'site.ttfb 42 ms lower'"), "a", 1, False)
+                claim("a product that answers is verified", r["verified"])
+                claim("and what it printed becomes a rail",
+                      r["rails"]["site.ttfb"][0] == [42.0])
+                r = measure(root, cfg(verify="echo 'it is down'; exit 1"), "a", 1, False)
+                claim("a product that does not work is refused however its units did",
+                      r["verified"] is False and r["tested"] is True)
+                claim("and the reason quotes it", "it is down" in r["why"])
+                r = measure(root, cfg(verify="sleep 5", timeout=1), "a", 1, False)
+                claim("a product that hangs is refused too",
+                      r["verified"] is False and "did not answer" in r["why"])
+                r = measure(root, cfg(test="exit 1", verify="true"), "a", 1, False)
+                claim("and the product is not consulted when the units already failed",
+                      r["verified"] is False)
+                claim("a project with no verify command is not thereby failing",
+                      measure(root, cfg(), "a", 1, False)["verified"])
+
                 (root / "stale").write_text("x")
                 r = measure(root, cfg(clean="rm -f stale"), "a", 1, False)
                 claim("the clean command runs before anything is built or read",
@@ -420,14 +473,17 @@ runs:
         Path(rails_path).write_text(render(r["rails"]), encoding="utf-8")
         Path("harness-%s.log" % arm).write_text(r["log"], encoding="utf-8")
 
-        print("  arm %s: built=%s tested=%s suites=%d claims=%d checks=%d rails=%d"
-              % (arm, "yes" if r["built"] else "no", "yes" if r["tested"] else "no",
-                 r["suites"], r["claims"], r["checks"], len(r["rails"])))
+        print("  arm %s: built=%s tested=%s verified=%s suites=%d claims=%d checks=%d "
+              "rails=%d" % (arm, "yes" if r["built"] else "no",
+                            "yes" if r["tested"] else "no",
+                            "yes" if r["verified"] else "no",
+                            r["suites"], r["claims"], r["checks"], len(r["rails"])))
         if r["why"]:
             print("  %s" % r["why"])
 
         out("built", "yes" if r["built"] else "no")
         out("tested", "yes" if r["tested"] else "no")
+        out("verified", "yes" if r["verified"] else "no")
         out("suites", str(r["suites"])); out("claims", str(r["claims"]))
         out("checks", str(r["checks"])); out("rails", rails_path)
         out("why", r["why"].replace("\n", " ")[:300])

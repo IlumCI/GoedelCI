@@ -190,7 +190,7 @@ jobs:
     permissions:
       contents: write
     outputs:
-      have: ${{ steps.rung.outputs.have }}
+      have: ${{ steps.patience.outputs.go == 'yes' && steps.rung.outputs.have || 'no' }}
       verb: ${{ steps.rung.outputs.verb }}
       kind: ${{ steps.rung.outputs.kind }}
       target: ${{ steps.rung.outputs.target }}
@@ -226,7 +226,56 @@ jobs:
         uses: ./.github/actions/archive
         with: { command: report }
 
+      # **A loop that cannot get anything past its own judge should stop, not
+      # keep spending.** Unattended, a milestone the drafter cannot write and
+      # the ladder will not retire turns into a runner a night, forever, with
+      # nobody watching the bill. Zero means never stand down.
+      - id: patience
+        shell: bash
+        env:
+          CFGJSON: ${{ steps.cfg.outputs.json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os
+          from pathlib import Path
+          cfg = json.loads(Path(os.environ["CFGJSON"]).read_text(encoding="utf-8"))
+          n = int(cfg["loop"].get("give_up_after", 0))
+          run = 0
+          if n:
+              d = Path("loop/ledger/entries")
+              es = []
+              if d.is_dir():
+                  for p in sorted(d.iterdir()):
+                      if p.suffix != ".cert" or p.name.startswith("."):
+                          continue
+                      f = {}
+                      for line in p.read_text(encoding="utf-8").splitlines():
+                          k, _, v = line.partition(" ")
+                          f[k] = v
+                      es.append(f)
+              es.sort(key=lambda f: int(f["seq"]))
+              for f in reversed(es):
+                  if f["verdict"] not in ("adopt", "refuse", "stale"):
+                      continue
+                  if f["verdict"] == "adopt":
+                      break
+                  run += 1
+          go = "yes" if not n or run < n else "no"
+          if go == "no":
+              print("::warning::%d night(s) in a row adopted nothing, and [loop] "
+                    "give_up_after is %d. Standing down rather than spending another "
+                    "runner. The ladder is in the audit pull request; adjust the goal "
+                    "or retire the milestone." % (run, n))
+          else:
+              print("  %d refused night(s) behind us%s"
+                    % (run, ("; the limit is %d" % n) if n else ""))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("go=%s\n" % go)
+          PYEOF
+
       - id: budget
+        if: steps.patience.outputs.go == 'yes'
         uses: ./.github/actions/budget
         with:
           command: plan
@@ -334,12 +383,31 @@ jobs:
       # carries a copy of the other. A night with no key, or an endpoint having
       # a bad afternoon, stops at the middle step and the rest of the night
       # carries on with whatever is already open.
+      # Which phase of the plan is being built, and what is still open in it.
+      # A night works the next thing rather than any thing.
+      - id: phase
+        continue-on-error: true
+        uses: ./.github/actions/blueprint
+        with:
+          command: phase
+          config: ${{ steps.cfg.outputs.json }}
+          criteria-out: blueprint-criteria.txt
+
+      - name: A finished plan is not a failed night
+        if: steps.phase.outputs.done == 'yes'
+        shell: bash
+        run: |
+          echo "::notice::every phase of the blueprint is met. The loop will keep the"
+          echo "::notice::project green and will propose nothing new until the plan is"
+          echo "::notice::extended -- which is a boundary proposal at an epoch edge."
+
       - id: card
         name: Ask for the next milestone
         uses: ./.github/actions/ladder
         with:
           command: card
           config: ${{ steps.cfg.outputs.json }}
+          criteria: blueprint-criteria.txt
           card-out: ladder-card.txt
           system-out: ladder-system.txt
 
@@ -361,6 +429,7 @@ jobs:
         with:
           command: admit
           config: ${{ steps.cfg.outputs.json }}
+          criteria: blueprint-criteria.txt
           reply: ladder-reply.txt
 
       - name: File the new rung, if there is one
@@ -871,6 +940,77 @@ jobs:
                     --json number --jq '.[0].number')
             gh pr edit "$num" --body "$body"
           fi
+
+  # --- promote: the step where a human used to be -------------------------
+  #
+  # **Auto-merge, not a direct push, and the difference is the whole point.**
+  # Pushing `loop/main` straight onto the default branch would work and would
+  # also walk past branch protection, required checks and anything else the
+  # repository asks of a change. Asking GitHub to merge the pull request WHEN
+  # ITS CHECKS PASS removes the person and keeps every gate: `ci` still
+  # re-verifies the adoption on a job the loop does not control, and a red one
+  # leaves the request sitting open instead of landing.
+  #
+  # So what is removed here is the waiting, not the checking.
+  #
+  # It runs only after an ADOPTION. A refused night has nothing to promote, and
+  # a stale one has nothing that still applies.
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [follow, plan, stage, judge, adopt]
+    if: ${{ !cancelled() && needs.adopt.result == 'success' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+
+      - id: cfg
+        uses: ./.github/actions/config
+        with: { command: load }
+
+      - name: Ask GitHub to merge it when its checks pass
+        if: steps.cfg.outputs.autonomous == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT: ${{ needs.follow.outputs.default }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          num=$(gh pr list --head loop/main --base "$DEFAULT" --state open \
+                  --json number --jq '.[0].number // empty')
+          if [ -z "$num" ]; then
+            echo "::notice::no open audit pull request to promote"
+            exit 0
+          fi
+          if gh pr merge "$num" --auto --merge 2>/tmp/merge.err; then
+            echo "  #$num will merge when its checks pass"
+            exit 0
+          fi
+          # The commonest reason by far, and it is a repository setting rather
+          # than anything about this night: "Allow auto-merge" is off. Say so
+          # precisely instead of going red on a night that worked.
+          err=$(cat /tmp/merge.err)
+          case "$err" in
+            *"not allowed"*|*auto-merge*|*"Protected branch"*)
+              echo "::warning::auto-merge is not enabled for this repository, so the"
+              echo "::warning::adoption is sitting in #$num waiting for somebody."
+              echo "::warning::Settings -> General -> Allow auto-merge turns this on."
+              ;;
+            *) echo "::warning::could not enable auto-merge on #$num: $err" ;;
+          esac
+
+      - name: Or say plainly that it is waiting on you
+        if: steps.cfg.outputs.autonomous != 'yes'
+        shell: bash
+        run: |
+          echo "  [loop] autonomous is off, so tonight's adoption waits for a human."
+          echo "  Turning it on requires a [harness] verify command: with nobody"
+          echo "  merging, the judge is the only thing between a candidate and your"
+          echo "  default branch, and unit tests alone do not know whether the"
+          echo "  product still runs."
 
   # --- no night leaves a candidate ref behind ------------------------------
   #

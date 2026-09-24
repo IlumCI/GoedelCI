@@ -46,9 +46,21 @@ inputs:
     required: false
     default: "."
   command:
-    description: "load | show | selftest"
+    description: "load | show | assemble | selftest"
     required: false
     default: load
+  name:
+    description: "for assemble: what the project is called"
+    required: false
+    default: ""
+  harness-json:
+    description: "for assemble: the commands `scaffold admit` collected"
+    required: false
+    default: scaffold-harness.json
+  autonomous:
+    description: "for assemble: whether the loop promotes its own work"
+    required: false
+    default: "true"
   export:
     description: "write GOEDEL_* into $GITHUB_ENV for the rest of the job"
     required: false
@@ -79,6 +91,12 @@ outputs:
   proof:
     description: "yes when [proof] declares a probe the drills can rehearse"
     value: ${{ steps.run.outputs.proof }}
+  autonomous:
+    description: "yes when the night promotes its own work without a human"
+    value: ${{ steps.run.outputs.autonomous }}
+  blueprint:
+    description: "where the plan lives"
+    value: ${{ steps.run.outputs.blueprint }}
 
 runs:
   using: composite
@@ -89,6 +107,9 @@ runs:
         ROOT: ${{ inputs.root }}
         COMMAND: ${{ inputs.command }}
         EXPORT: ${{ inputs.export }}
+        NAME: ${{ inputs.name }}
+        HARNESS_JSON: ${{ inputs.harness-json }}
+        AUTONOMOUS: ${{ inputs.autonomous }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -236,6 +257,19 @@ runs:
                 "setup": list(h.get("setup", [])),
                 "build": str(h.get("build", "")),
                 "clean": str(h.get("clean", "")),
+                # **What the PRODUCT does, as opposed to what the code does.**
+                # `test` says the units behave; `verify` says the thing you are
+                # building still is the thing. It runs the built artefact --
+                # serves the site and fetches a page, starts the agent and puts
+                # its evals to it, calls the API and reads the answer -- and a
+                # candidate that fails it is refused whatever its unit tests
+                # said.
+                #
+                # It matters most when nobody is merging. Promotion with no
+                # human in it is gated on the judge alone, and a judge that
+                # only knows unit tests will happily promote a site that
+                # returns 500 on every route because each function is fine.
+                "verify": str(h.get("verify", "")),
                 "check": str(h.get("check", "")),
                 "test": str(h.get("test", "")),
                 "bench": str(h.get("bench", "")),
@@ -351,6 +385,26 @@ runs:
                          "pass": {k: str(v) for k, v in good.items()},
                          "fail": {k: str(v) for k, v in bad.items()}}
 
+            # --- [loop]: how much of this runs without anybody ------------
+            l = raw.get("loop", {})
+            loop = {
+                # When true the night pushes its own adoptions to the default
+                # branch instead of waiting on a pull request. The audit PR is
+                # still written; it stops being a gate and becomes a record.
+                "autonomous": bool(l.get("autonomous", False)),
+                # How many consecutive refused nights before it stops promoting
+                # and starts asking. A loop that cannot get anything past its
+                # own judge is not one to leave running.
+                "give_up_after": int(l.get("give_up_after", 0)),
+            }
+            if loop["autonomous"] and not harness["verify"]:
+                raise ConfigError(
+                    "[loop] autonomous is on and [harness] verify is empty. With nobody "
+                    "merging, the judge is the only thing between a candidate and your "
+                    "default branch -- and a judge that knows only unit tests will promote "
+                    "a product that no longer runs, because every function in it still "
+                    "passes. Name a command that exercises the built thing.")
+
             floors = {str(k): float(v) for k, v in raw.get("floors", {}).items()}
             for rail, f in floors.items():
                 if f < 0:
@@ -362,7 +416,8 @@ runs:
                 "allow": list(allow), "evaluator": list(evaluator),
                 "criterion": list(criterion),
                 "harness": harness, "author": author, "judge": judge,
-                "kinds": kinds, "floors": floors, "proof": proof,
+                "kinds": kinds, "floors": floors, "proof": proof, "loop": loop,
+                "blueprint": str(project.get("blueprint", "loop/blueprint.txt")),
             }
 
         def utility_digest(root, criterion):
@@ -454,6 +509,46 @@ runs:
             raises("a negative floor is refused: a floor is a magnitude",
                    bad({"floors": {"host.": -0.1}}))
 
+            H = {"check": "true", "test": "t", "claims_re": "^ok", "verify": "v"}
+            asm = assemble("a paste bin", H, True)
+            claim("an assembled config loads through the same validation",
+                  load(tomllib.loads(asm), ".")["name"] == "a paste bin")
+            claim("and it is autonomous", load(tomllib.loads(asm), ".")["loop"]["autonomous"])
+            claim("and its masks are the machine's, not the project's",
+                  load(tomllib.loads(asm), ".")["allow"] == ["src/**", "tests/**", "scripts/**"])
+            claim("and the project cannot write its own config",
+                  "goedel.toml" in load(tomllib.loads(asm), ".")["evaluator"])
+            claim("an assembled config carries the commands it was given",
+                  load(tomllib.loads(asm), ".")["harness"]["verify"] == "v")
+            claim("a name with a quote in it does not break the file",
+                  load(tomllib.loads(assemble('a "quoted" name', H, True)), ".")["name"]
+                  == 'a "quoted" name')
+            claim("a command with a backslash survives, which every claims_re has",
+                  load(tomllib.loads(assemble("x", dict(H, claims_re=r"^\\s*ok"), True)),
+                       ".")["harness"]["claims_re"] == r"^\\s*ok",
+                  "repr emits a PYTHON literal and TOML reads single quotes as a "
+                  "LITERAL string, so the backslash came back doubled")
+            claim("and so does one with an apostrophe in it",
+                  load(tomllib.loads(assemble("x", dict(H, test="echo it's fine"), True)),
+                       ".")["harness"]["test"] == "echo it's fine")
+            raises("assembling with no verify and autonomy on is refused",
+                   lambda: load(tomllib.loads(
+                       assemble("x", {"check": "c", "test": "t", "claims_re": "o"}, True)), "."))
+            claim("and with autonomy off it is allowed",
+                  load(tomllib.loads(
+                      assemble("x", {"check": "c", "test": "t", "claims_re": "o"}, False)),
+                      ".")["loop"]["autonomous"] is False)
+            raises("assembling a nameless project is refused",
+                   lambda: assemble("  ", H, True))
+
+            claim("a project is not autonomous unless it says so",
+                  load(base, ".")["loop"]["autonomous"] is False)
+            raises("autonomy without a way to check the product is refused",
+                   bad({"loop": {"autonomous": True}}))
+            claim("and with one it is allowed",
+                  load(dict(base, loop={"autonomous": True},
+                            harness={"test": "t", "verify": "v"}), ".")["loop"]["autonomous"])
+
             P = {"kind": "feature", "target": "src/p.py",
                  "pass": {"src/p.py": "a", "tests/t.py": "x"},
                  "fail": {"src/p.py": "b", "tests/t.py": "x"}}
@@ -518,6 +613,140 @@ runs:
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 
+        # -- assembling one ----------------------------------------------
+
+        # `textwrap.dedent` over an indented literal, not a flush-left one: YAML
+        # ends a block scalar at the first line indented less than its first
+        # line, so a template written flush-left inside `run: |` truncates the
+        # program GitHub loads at exactly that point.
+        TEMPLATE = __import__("textwrap").dedent("""\
+            # Written by `genesis`. Everything above [harness] is fixed by the machine
+            # and not by the thing it is building: a loop that picks its own boundary
+            # at birth has no boundary.
+            #
+            # The commands below came from whatever wrote the first version of this
+            # project, and were accepted only after the tree they describe actually
+            # built, tested and answered. Edit them by hand if you like; `ci` will tell
+            # you immediately if they stop being true.
+
+            [project]
+            name = {name}
+            goal = "loop/goal.txt"
+            blueprint = "loop/blueprint.txt"
+
+            # What the machine may write to.
+            allow = ["src/**", "tests/**", "scripts/**"]
+
+            # What it may never write to outside the `boundary` lane: itself, its
+            # config, its record, and anything that decides whether its work was good.
+            evaluator = [".github/**", "goedel.toml", "loop/**"]
+
+            [harness]
+            setup = {setup}
+            check = {check}
+            build = {build}
+            clean = {clean}
+            test = {test}
+            verify = {verify}
+            bench = ""
+            artifact = ""
+            suites_re = {suites_re}
+            claims_re = {claims_re}
+            warnings_re = '^(?:warning|WARN)'
+            timeout = 900
+
+            [judge]
+            epoch_len = 16
+            confidence = 0.95
+            fdr = 0.10
+            repeats = 3
+            min_evidence = 6
+            base_minutes = 30
+            max_level = 3
+            balks = 3
+
+            [loop]
+            # With this on, a night that gets past the judge pushes to the default
+            # branch itself. The audit pull request is still written; it stops being a
+            # gate and becomes a record. `verify` above is then the only thing between
+            # a broken build and everybody who uses this, which is why config refuses
+            # to switch this on without one.
+            autonomous = {autonomous}
+
+            [author]
+            provider = "anthropic"
+            model = "claude-sonnet-5"
+            api_key_env = "GOEDEL_INFERENCE_KEY"
+            base_url_env = "GOEDEL_INFERENCE_URL"
+            attempts = 6
+            temperature = 0.0
+            max_tokens = 8000
+            shards = 4
+            context = []
+
+            [floors]
+            "cost." = 0.0
+
+            [kinds.feature]
+            verb = "create"
+            j1 = "claims"
+            targets = ["src/**", "scripts/**"]
+            allow_rails = ["cost.artifact_bytes"]
+            diff_lines = 400
+            diff_files = 6
+            prompt = "Create what the milestone names, and a test that exercises it. A feature that adds no passing claim is code nothing runs, and it is refused before anything else is looked at."
+
+            [kinds.repair]
+            verb = "edit"
+            j1 = "witness"
+            targets = ["src/**", "scripts/**"]
+            diff_lines = 200
+            diff_files = 4
+            prompt = "Write the failing test FIRST, as its own file, then the smallest change to the source that makes it pass. The test is run against the tree as it stands before your fix: if it passes there, there was nothing to repair."
+            """)
+
+        def toml_str(v):
+            """A TOML string that means what was handed to it.
+
+            **Not `repr`.** Python's repr produces a PYTHON literal, and TOML
+            reads a single-quoted string as a LITERAL string with no escape
+            processing at all -- so repr on a regex containing a backslash
+            emitted a Python escape that TOML read back as two backslashes.
+            Every claims_re worth writing has a backslash in it, so this was
+            wrong for the commonest case and right only for the trivial ones.
+
+            A literal string when the value has no apostrophe and no newline,
+            which is almost always; a basic string with the escapes it needs
+            otherwise.
+            """
+            if "'" not in v and "\n" not in v:
+                return "'" + v + "'"
+            esc = v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+            return '"' + esc + '"'
+
+        def assemble(name, harness, autonomous):
+            """Build a goedel.toml from a fixed template and the answers given.
+
+            The masks, the kinds, the bar and the budgets are the machine's.
+            Only the commands are the project's, and they arrive already
+            demonstrated: `genesis` does not call this until the tree they
+            describe has built, tested and answered.
+            """
+            if not name.strip():
+                raise ConfigError("a project with no name")
+            setup = harness.get("setup", "")
+            return TEMPLATE.format(
+                name=toml_str(name.strip()),
+                setup=("[%s]" % toml_str(setup)) if setup else "[]",
+                check=toml_str(harness.get("check", "")),
+                build=toml_str(harness.get("build", "")),
+                clean=toml_str(harness.get("clean", "")),
+                test=toml_str(harness.get("test", "")),
+                verify=toml_str(harness.get("verify", "")),
+                suites_re=toml_str(harness.get("suites_re", r"(\d+) passed")),
+                claims_re=toml_str(harness.get("claims_re", r"^\s*(?:ok|PASS|PASSED)\b")),
+                autonomous="true" if autonomous else "false")
+
         # ------------------------------------------------------------------
 
         cmd = os.environ.get("COMMAND", "load").strip()
@@ -525,6 +754,23 @@ runs:
         try:
             if cmd == "selftest":
                 sys.exit(selftest())
+            if cmd == "assemble":
+                hj = Path(os.environ.get("HARNESS_JSON", "scaffold-harness.json"))
+                if not hj.is_file():
+                    raise ConfigError("no harness answers at %s" % hj)
+                text = assemble(os.environ.get("NAME", ""),
+                                json.loads(hj.read_text(encoding="utf-8")),
+                                os.environ.get("AUTONOMOUS", "true") == "true")
+                dest = Path(root) / "goedel.toml"
+                dest.write_text(text, encoding="utf-8")
+                # Read straight back through the same validation everything
+                # else goes through. A config this action wrote and cannot
+                # itself load is one the first night would have died on.
+                load(tomllib.loads(text), root)
+                print("  wrote %s, and it loads" % dest)
+                out("json", str(dest))
+                sys.exit(0)
+
             p = Path(root) / "goedel.toml"
             if not p.is_file():
                 raise ConfigError(
@@ -551,6 +797,8 @@ runs:
             out("shard_matrix", json.dumps(list(range(cfg["author"]["shards"]))))
             out("json", str(dest))
             out("proof", "yes" if cfg["proof"] else "no")
+            out("autonomous", "yes" if cfg["loop"]["autonomous"] else "no")
+            out("blueprint", cfg["blueprint"])
             export("GOEDEL_CONFIG", str(dest))
             export("GOEDEL_NAME", cfg["name"])
             export("GOEDEL_UTILITY", digest)

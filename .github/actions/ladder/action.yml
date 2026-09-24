@@ -63,6 +63,15 @@ inputs:
     description: "for admit: the file `draft ask` wrote"
     required: false
     default: reply.txt
+  criteria:
+    description: >-
+      the criteria still open in the blueprint's current phase, one per line,
+      as `blueprint phase` writes them. When this file has lines in it a
+      milestone's witness MUST be one of them, word for word: that is what
+      makes a phase completable rather than a mood, and what stops the loop
+      wandering into work the plan did not ask for.
+    required: false
+    default: ""
   card-out:
     description: "for card: where to write the question"
     required: false
@@ -111,6 +120,7 @@ runs:
         WHY: ${{ inputs.why }}
         EMIT_ENV: ${{ inputs.emit-env }}
         REPLY: ${{ inputs.reply }}
+        CRITERIA: ${{ inputs.criteria }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
       run: |
@@ -300,7 +310,7 @@ runs:
                     return True
             return False
 
-        def admit(fields, cfg, root, rungs, goal):
+        def admit(fields, cfg, root, rungs, goal, criteria=()):
             kinds = cfg["kinds"]
             kind = fields["kind"]
             if kind not in kinds or not kinds[kind]["enabled"]:
@@ -334,6 +344,17 @@ runs:
                 raise LadderError(
                     "a milestone with no witness cannot be judged, so it is not a "
                     "milestone")
+            # **Verbatim, and that is the whole contract with the blueprint.**
+            # `blueprint` decides a phase is met when a rung carrying one of its
+            # criteria was adopted, and it matches on the sentence. A witness
+            # that paraphrases meets nothing, so the phase never completes and
+            # the plan stalls on it for good -- silently, because every
+            # individual night looks like it worked.
+            if criteria and fields["witness"] not in criteria:
+                raise LadderError(
+                    "the witness is not one of the criteria open in this phase. It has "
+                    "to be one of them word for word, or meeting it completes nothing "
+                    "and the plan never moves on. Open:\n  " + "\n  ".join(criteria))
             if not fields["title"]:
                 raise LadderError("a milestone with no title says nothing")
             for k, v in fields.items():
@@ -349,7 +370,7 @@ runs:
                 raise LadderError("this exact milestone is already on the ladder")
             return rung
 
-        def card(cfg, root, rungs, entries, goal_body, balk_limit, goal):
+        def card(cfg, root, rungs, entries, goal_body, balk_limit, goal, criteria=()):
             kinds = ["  %s (%s, judged by %s)" % (k, v["verb"], v["j1"])
                      for k, v in sorted(cfg["kinds"].items()) if v["enabled"]]
             done, gone = [], []
@@ -366,7 +387,16 @@ runs:
                 rel = p.relative_to(root).as_posix()
                 if matches(rel, cfg["allow"]) and not matches(rel, cfg["evaluator"]):
                     tree.append("  " + rel)
-            parts = ["THE GOAL\n" + goal_body,
+            parts = ["THE GOAL\n" + goal_body]
+            if criteria:
+                # The plan, ahead of everything else. A night works the next
+                # thing rather than any thing, and the witness has to be one of
+                # these sentences so that meeting it completes something.
+                parts.append(
+                    "THE PHASE BEING BUILT RIGHT NOW. Your milestone's witness must be "
+                    "ONE of these sentences, copied word for word:\n"
+                    + "\n".join("  " + c for c in criteria))
+            parts += [
                      "THE KINDS OF MILESTONE AVAILABLE\n" + "\n".join(kinds),
                      "THE PATHS YOU MAY AIM AT\n" + "\n".join("  " + m for m in cfg["allow"])]
             if tree:
@@ -500,6 +530,24 @@ runs:
                 raises("a milestone aimed outside its kind's own masks is refused",
                        lambda: admit({"kind": "feature", "target": "tests/t.py",
                                       "title": "t", "witness": "w"}, NARROW, root, [], G))
+                OPEN = ("posting a body to /paste returns an id",
+                        "getting /paste/<id> returns the body that was posted")
+                raises("a witness that paraphrases a criterion is refused",
+                       lambda: admit({"kind": "feature", "target": "src/new.py",
+                                      "title": "t", "witness": "posting returns an id"},
+                                     CFG, root, [], G, OPEN))
+                claim("and one copied word for word is admitted",
+                      admit({"kind": "feature", "target": "src/new.py", "title": "t",
+                             "witness": OPEN[0]}, CFG, root, [], G, OPEN)["witness"]
+                      == OPEN[0])
+                claim("with no phase open, any witness a test could be written for does",
+                      admit({"kind": "feature", "target": "src/new.py", "title": "t",
+                             "witness": "anything observable"}, CFG, root, [], G)["title"]
+                      == "t")
+                c = card(CFG, root, [], [], "a goal", 3, G, OPEN)
+                claim("the card puts the open criteria first", "word for word" in c)
+                claim("and lists them", OPEN[1] in c)
+
                 claim("and one inside them is admitted",
                       admit({"kind": "feature", "target": "src/new.py", "title": "t",
                              "witness": "w"}, NARROW, root, [], G)["kind"] == "feature")
@@ -554,6 +602,11 @@ runs:
         root = os.environ.get("ROOT", ".") or "."
         cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
         limit = int(cfg["judge"].get("balks", 3))
+        criteria = ()
+        cpath = os.environ.get("CRITERIA", "").strip()
+        if cpath and Path(cpath).is_file():
+            criteria = tuple(l.strip() for l in
+                             Path(cpath).read_text(encoding="utf-8").splitlines() if l.strip())
         try:
             body = goal_text(root, cfg)
             if not body:
@@ -618,7 +671,8 @@ runs:
                     out("have", "yes"); out("point", openr["point"]); out("why", "already open")
                     sys.exit(0)
                 Path(os.environ["CARD_OUT"]).write_text(
-                    card(cfg, root, rungs, entries, body, limit, goal), encoding="utf-8")
+                    card(cfg, root, rungs, entries, body, limit, goal, criteria),
+                    encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
                 print("  asked for the next milestone")
                 out("have", "no"); out("why", "a question was written")
@@ -631,7 +685,7 @@ runs:
                 if not f.is_file() or not f.read_text(encoding="utf-8").strip():
                     raise LadderError("no reply to admit")
                 rung = admit(read_proposal(f.read_text(encoding="utf-8")),
-                             cfg, root, rungs, goal)
+                             cfg, root, rungs, goal, criteria)
                 rungs.append(rung)
                 save(root, rungs)
                 print("  a new rung: %s %s -- %s"

@@ -1,0 +1,525 @@
+name: goedel-blueprint
+description: >-
+  Turn a name and a description of a thing into a plan the ladder can walk:
+  a stack, phases, and an observable criterion for each.
+
+# **The layer that was missing between a sentence and a repository.**
+#
+# `ladder` proposes the next milestone from the goal and what already exists.
+# That is enough to improve a project somebody already built; it is not enough
+# to build one. Asked to produce a thing from a description, a one-milestone-
+# at-a-time loop wanders: it has no notion of what order things must happen in,
+# no notion of finished, and no way to tell a detour from progress.
+#
+# A blueprint fixes an order and a definition of done, once, and then holds
+# still. The ladder draws its rungs from the current phase and nothing else, so
+# a night's work is always the next thing rather than any thing.
+#
+#     [blueprint] v1
+#     name       a paste bin with expiring links
+#     stack      python, no framework, sqlite, one process
+#     verify     curl -sf localhost:8000/health
+#     [phase] 1 it stores and returns a paste
+#       done POST /paste with a body returns an id
+#       done GET /paste/<id> returns the body that was posted
+#     [phase] 2 links expire
+#       done a paste created with ttl=1 is gone after two seconds
+#     [end]
+#
+# **Every `done` is a sentence about something observable.** That is the whole
+# contract, and it is what makes a phase completable: the ladder turns each one
+# into a milestone with that sentence as its witness, and a phase is done when
+# its criteria are met. A `done` that reads "the code is clean" produces a
+# milestone nothing can judge, so admission refuses a few of the commonest
+# shapes of that outright.
+#
+# **It holds still within an epoch, and may be revised at a boundary.** Same
+# rule as the evaluator, for the same reason: a plan that moves while it is
+# being executed makes the record of that execution meaningless. Revising it is
+# the `re-plan` command, and `ledger fsck`'s epoch rules are what stop it
+# happening anywhere else.
+#
+# This action asks nothing. `draft ask` owns the network; this owns what a plan
+# means. It writes the question, admits or refuses the answer.
+
+inputs:
+  command:
+    description: "card | admit | phase | show | selftest"
+    required: true
+  root:
+    description: "the tree the blueprint lives in"
+    required: false
+    default: "."
+  config:
+    description: "the validated goedel.toml JSON"
+    required: false
+    default: ""
+  name:
+    description: "for card: what the thing is called"
+    required: false
+    default: ""
+  description:
+    description: "for card: what it should be"
+    required: false
+    default: ""
+  reply:
+    description: "for admit: the file `draft ask` wrote"
+    required: false
+    default: reply.txt
+  card-out:
+    description: "for card: where to write the question"
+    required: false
+    default: blueprint-card.txt
+  system-out:
+    description: "for card: where to write the rules the answer is held to"
+    required: false
+    default: blueprint-system.txt
+  criteria-out:
+    description: >-
+      for phase: where to write the criteria still open, one per line. `ladder`
+      reads this rather than parsing the blueprint itself, so the format lives
+      in one place and a milestone's witness can be required to be one of these
+      sentences verbatim.
+    required: false
+    default: blueprint-criteria.txt
+
+outputs:
+  have:
+    description: "yes when a blueprint exists"
+    value: ${{ steps.run.outputs.have }}
+  phase:
+    description: "the number of the phase now being worked"
+    value: ${{ steps.run.outputs.phase }}
+  title:
+    description: "that phase's title"
+    value: ${{ steps.run.outputs.title }}
+  stack:
+    description: "what the blueprint says to build it in"
+    value: ${{ steps.run.outputs.stack }}
+  verify:
+    description: "the command the blueprint proposes for [harness] verify"
+    value: ${{ steps.run.outputs.verify }}
+  done:
+    description: "yes when every phase's criteria are met"
+    value: ${{ steps.run.outputs.done }}
+  why:
+    description: "one line for the log"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        CONFIG: ${{ inputs.config }}
+        NAME: ${{ inputs.name }}
+        DESCRIPTION: ${{ inputs.description }}
+        REPLY: ${{ inputs.reply }}
+        CARD_OUT: ${{ inputs.card-out }}
+        SYSTEM_OUT: ${{ inputs.system-out }}
+        CRITERIA_OUT: ${{ inputs.criteria-out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import hashlib, json, os, re, sys, textwrap
+        from pathlib import Path
+
+        OPEN, CLOSE = "[blueprint] v1", "[end]"
+        HEAD = ("name", "stack", "verify", "summary")
+        PHASE = re.compile(r"^\[phase\]\s+(\d+)\s+(.+)$")
+        DONE = re.compile(r"^\s*done\s+(.+)$")
+        FENCE = re.compile(r"<<<BLUEPRINT>>>\s*(.*?)\s*<<<END>>>", re.S)
+
+        # Sentences that describe a feeling rather than an observation. Not a
+        # complete list and not meant to be -- it catches the shapes a model
+        # reaches for when it has nothing concrete to say, which is exactly
+        # when a criterion is worthless.
+        VAGUE = ("is clean", "is readable", "is well", "is properly", "is good",
+                 "is robust", "is maintainable", "is idiomatic", "is production",
+                 "best practice", "high quality", "works correctly", "works well",
+                 "is efficient", "is optimized", "is secure enough", "looks good",
+                 "is user friendly", "is user-friendly", "is performant")
+
+        class BlueprintError(Exception): pass
+
+        def out(k, v):
+            v = str(v).replace("\r", " ").replace("\n", " ")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        # -- the file ----------------------------------------------------
+
+        def parse(text):
+            head, phases, cur = {}, [], None
+            seen_open = False
+            for n, line in enumerate(text.splitlines(), 1):
+                s = line.strip()
+                if not s:
+                    continue
+                if s == OPEN:
+                    if seen_open:
+                        raise BlueprintError("line %d: a second blueprint" % n)
+                    seen_open = True
+                    continue
+                if not seen_open:
+                    raise BlueprintError("a blueprint opens with %r" % OPEN)
+                if s == CLOSE:
+                    if cur:
+                        phases.append(cur); cur = None
+                    seen_open = "done"
+                    continue
+                m = PHASE.match(s)
+                if m:
+                    if cur:
+                        phases.append(cur)
+                    cur = {"n": int(m.group(1)), "title": m.group(2).strip(), "done": []}
+                    continue
+                m = DONE.match(line)
+                if m:
+                    if cur is None:
+                        raise BlueprintError("line %d: a criterion outside any phase" % n)
+                    cur["done"].append(m.group(1).strip())
+                    continue
+                k, _, v = s.partition(" ")
+                if cur is not None:
+                    raise BlueprintError("line %d: %r inside a phase" % (n, s))
+                if k not in HEAD:
+                    raise BlueprintError("line %d: %r is not a blueprint field" % (n, k))
+                if k in head:
+                    raise BlueprintError("line %d: %s again" % (n, k))
+                head[k] = v.strip()
+            if seen_open != "done":
+                raise BlueprintError(
+                    "a blueprint closes with %r; without it a truncated transfer reads as "
+                    "a shorter plan, which is a plan that stops early and looks finished"
+                    % CLOSE)
+            return head, phases
+
+        def render(head, phases):
+            lines = [OPEN]
+            for k in HEAD:
+                if head.get(k):
+                    lines.append("%s %s" % (k, head[k]))
+            for p in phases:
+                lines.append("[phase] %d %s" % (p["n"], p["title"]))
+                lines.extend("  done %s" % d for d in p["done"])
+            lines += [CLOSE, ""]
+            return "\n".join(lines)
+
+        def load(root, cfg):
+            p = Path(root) / cfg.get("blueprint", "loop/blueprint.txt")
+            if not p.is_file():
+                return None, None
+            return parse(p.read_text(encoding="utf-8"))
+
+        def save(root, cfg, head, phases):
+            p = Path(root) / cfg.get("blueprint", "loop/blueprint.txt")
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(render(head, phases), encoding="utf-8")
+            return p
+
+        # -- admission ---------------------------------------------------
+
+        def read_reply(reply):
+            found = FENCE.findall(reply)
+            if not found:
+                raise BlueprintError("the reply carries no fenced blueprint")
+            if len(found) > 1:
+                raise BlueprintError("the reply carries %d blueprints; a plan is one"
+                                     % len(found))
+            return found[0]
+
+        def admit(text):
+            head, phases = parse(OPEN + "\n" + text.strip() + "\n" + CLOSE
+                                 if not text.strip().startswith(OPEN) else text)
+            for k in ("name", "stack", "verify"):
+                if not head.get(k):
+                    raise BlueprintError("the blueprint declares no %s" % k)
+            if not phases:
+                raise BlueprintError("a blueprint with no phase is not a plan")
+            if [p["n"] for p in phases] != list(range(1, len(phases) + 1)):
+                raise BlueprintError(
+                    "the phases are numbered %s and should be 1..%d: a plan whose order is "
+                    "ambiguous is one the ladder cannot walk"
+                    % ([p["n"] for p in phases], len(phases)))
+            for p in phases:
+                if not p["title"]:
+                    raise BlueprintError("phase %d has no title" % p["n"])
+                if not p["done"]:
+                    raise BlueprintError(
+                        "phase %d names no criterion, so nothing could ever complete it"
+                        % p["n"])
+                for d in p["done"]:
+                    low = d.lower()
+                    if any(v in low for v in VAGUE):
+                        raise BlueprintError(
+                            "phase %d: %r is a feeling, not an observation. Every criterion "
+                            "becomes a test's witness, and a test cannot be written for "
+                            "this." % (p["n"], d))
+                    if len(d.split()) < 4:
+                        raise BlueprintError(
+                            "phase %d: %r is too short to be a criterion" % (p["n"], d))
+            return head, phases
+
+        # -- where the work is -------------------------------------------
+
+        def met(criterion, rungs, entries):
+            """A criterion is met when a rung carrying it was adopted."""
+            points = {r["point"] for r in rungs if r.get("witness") == criterion}
+            if not points:
+                return False
+            return any(f.get("ladder") in points and f["verdict"] == "adopt"
+                       for f in entries)
+
+        def current(phases, rungs, entries):
+            """The first phase with a criterion still unmet, or None when done."""
+            for p in phases:
+                if not all(met(d, rungs, entries) for d in p["done"]):
+                    return p
+            return None
+
+        # -- the question ------------------------------------------------
+
+        SYSTEM = textwrap.dedent("""\
+            You turn a description of a thing somebody wants into a build plan that a
+            machine will execute without a human in the loop. You answer with exactly
+            one fenced block and nothing else:
+
+            <<<BLUEPRINT>>>
+            name <the thing, in a few words>
+            stack <languages, libraries, storage -- one line, and prefer boring>
+            verify <ONE shell command that exits 0 when the built thing works>
+            summary <one line: what it does>
+            [phase] 1 <title of the first phase>
+              done <something that can be OBSERVED when this phase is finished>
+              done <another>
+            [phase] 2 <title>
+              done <...>
+            <<<END>>>
+
+            Rules that are checked mechanically and will refuse your answer:
+            - Every `done` is an OBSERVATION, not a judgement. "GET /paste/<id>
+              returns the body that was posted" is a criterion. "the code is clean",
+              "it works correctly", "it is production ready" are refused outright.
+            - Phases are numbered from 1 with no gaps, and are ordered so that each
+              one can be built on what the ones before it left behind.
+            - Phase 1 must be buildable from an EMPTY repository.
+            - `verify` must exit 0 on a working build and non-zero otherwise, must
+              need no human, and must finish in seconds. It is the only thing
+              standing between a broken build and everybody who uses this.
+            - Prefer the smallest stack that can do the job. Every dependency is
+              something that will later break unattended at 02:17 with nobody
+              watching.
+            - Four to eight phases. This is a plan, not a backlog.
+            """)
+
+        def card(name, description, cfg=None):
+            parts = ["THE THING\n%s\n\n%s" % (name, description)]
+            if cfg:
+                parts.append("WHERE THE CODE WILL LIVE\n"
+                             + "\n".join("  " + m for m in cfg["allow"]))
+                parts.append("WHAT THE MACHINE MAY NEVER TOUCH\n"
+                             + "\n".join("  " + m for m in cfg["evaluator"]))
+            parts.append(
+                "WHAT HAPPENS TO YOUR ANSWER\n"
+                "Each `done` becomes the witness of a milestone: a machine will write a "
+                "test for it, then write code until that test passes, then measure the "
+                "result against the version before it and keep the change only if nothing "
+                "got worse. A criterion no test can be written for produces a milestone "
+                "that can never complete, and the plan stalls there for good.")
+            return "\n\n".join(parts)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except BlueprintError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            BODY = ("name a paste bin\n"
+                    "stack python, sqlite, one process\n"
+                    "verify curl -sf localhost:8000/health\n"
+                    "summary it stores text and gives back a link\n"
+                    "[phase] 1 it stores and returns a paste\n"
+                    "  done POST /paste with a body returns an id\n"
+                    "  done GET /paste/<id> returns the body that was posted\n"
+                    "[phase] 2 links expire\n"
+                    "  done a paste created with ttl=1 is gone after two seconds\n")
+
+            head, phases = admit(BODY)
+            claim("a blueprint parses into a head and phases",
+                  head["stack"].startswith("python") and len(phases) == 2)
+            claim("and each phase carries its criteria", phases[0]["done"][0].startswith("POST"))
+            claim("it round-trips", admit(render(head, phases))[1] == phases)
+
+            raises("a blueprint with no phase is not a plan",
+                   lambda: admit("name x\nstack y\nverify z\n"))
+            raises("a phase with no criterion is refused",
+                   lambda: admit(BODY + "[phase] 3 a third thing\n"))
+            raises("phases that skip a number are refused",
+                   lambda: admit(BODY.replace("[phase] 2", "[phase] 3")))
+            raises("a blueprint with no verify command is refused",
+                   lambda: admit(BODY.replace("verify curl -sf localhost:8000/health\n", "")))
+            raises("a blueprint with no stack is refused",
+                   lambda: admit(BODY.replace("stack python, sqlite, one process\n", "")))
+            raises("a field nothing knows is refused",
+                   lambda: admit(BODY.replace("summary ", "vibes ")))
+            raises("a criterion outside any phase is refused",
+                   lambda: admit("  done floating\n" + BODY))
+            raises("an unclosed blueprint is refused, not read short",
+                   lambda: parse(OPEN + "\nname x\n"))
+
+            for vague in ("the code is clean", "it works correctly",
+                          "the module is production ready", "the ui looks good"):
+                raises("a criterion that is a feeling is refused: %r" % vague,
+                       lambda v=vague: admit(BODY + "[phase] 3 x\n  done %s\n" % v))
+            raises("and one too short to be a criterion is refused",
+                   lambda: admit(BODY + "[phase] 3 x\n  done it works\n"))
+
+            # -- where the work is ---------------------------------------
+            rungs = [{"point": "p1", "witness": "POST /paste with a body returns an id"},
+                     {"point": "p2", "witness": "GET /paste/<id> returns the body that was posted"}]
+            claim("with nothing adopted the first phase is current",
+                  current(phases, rungs, [])["n"] == 1)
+            one = [{"ladder": "p1", "verdict": "adopt"}]
+            claim("a phase with one criterion left is still current",
+                  current(phases, rungs, one)["n"] == 1)
+            both = one + [{"ladder": "p2", "verdict": "adopt"}]
+            claim("and when its criteria are met the next one is",
+                  current(phases, rungs, both)["n"] == 2)
+            claim("a refused rung does not meet anything",
+                  current(phases, rungs, [{"ladder": "p1", "verdict": "refuse"}])["n"] == 1)
+            all_rungs = rungs + [{"point": "p3",
+                                  "witness": "a paste created with ttl=1 is gone after two seconds"}]
+            claim("and a plan whose every phase is met is finished",
+                  current(phases, all_rungs,
+                          both + [{"ladder": "p3", "verdict": "adopt"}]) is None)
+
+            # -- the fence -----------------------------------------------
+            claim("a fenced reply is read",
+                  read_reply("sure:\n<<<BLUEPRINT>>>\n" + BODY + "<<<END>>>\n").strip()
+                  .startswith("name a paste bin"))
+            raises("a reply with no fence is refused",
+                   lambda: read_reply("I would start by..."))
+            raises("two plans in one reply is refused",
+                   lambda: read_reply("<<<BLUEPRINT>>>\na\n<<<END>>>\n"
+                                      "<<<BLUEPRINT>>>\nb\n<<<END>>>"))
+
+            c = card("a paste bin", "somewhere to put text and get a link back",
+                     {"allow": ["src/**"], "evaluator": [".github/**"]})
+            claim("the card carries the description", "get a link back" in c)
+            claim("and says what happens to each criterion", "witness of a milestone" in c)
+            claim("and what the machine may never touch", ".github/**" in c)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+
+        root = os.environ.get("ROOT", ".") or "."
+        cfg = {}
+        if os.environ.get("CONFIG"):
+            cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+
+        try:
+            if cmd == "card":
+                Path(os.environ["CARD_OUT"]).write_text(
+                    card(os.environ["NAME"], os.environ["DESCRIPTION"], cfg or None),
+                    encoding="utf-8")
+                Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                print("  asked for a plan for: %s" % os.environ["NAME"])
+                out("have", "no"); out("why", "a question was written")
+                sys.exit(0)
+
+            if cmd == "admit":
+                reply = Path(os.environ["REPLY"]).read_text(encoding="utf-8")
+                head, phases = admit(read_reply(reply))
+                p = save(root, cfg or {"blueprint": "loop/blueprint.txt"}, head, phases)
+                print("  %s: %d phase(s), %d criteri%s"
+                      % (head["name"], len(phases),
+                         sum(len(x["done"]) for x in phases),
+                         "on" if sum(len(x["done"]) for x in phases) == 1 else "a"))
+                for x in phases:
+                    print("    %d %s" % (x["n"], x["title"]))
+                    for d in x["done"]:
+                        print("        %s" % d)
+                out("have", "yes"); out("phase", "1"); out("title", phases[0]["title"])
+                out("stack", head["stack"]); out("verify", head["verify"])
+                out("done", "no"); out("why", "wrote " + str(p))
+                sys.exit(0)
+
+            head, phases = load(root, cfg or {"blueprint": "loop/blueprint.txt"})
+            if head is None:
+                print("  no blueprint yet")
+                out("have", "no"); out("done", "no"); out("why", "no blueprint")
+                sys.exit(0 if cmd == "show" else 1)
+
+            if cmd == "show":
+                sys.stdout.write(render(head, phases))
+                out("have", "yes"); out("stack", head.get("stack", ""))
+                out("verify", head.get("verify", "")); out("why", "")
+                sys.exit(0)
+
+            if cmd == "phase":
+                rungs, entries = [], []
+                rp = Path(root) / "loop/ladder/rungs.txt"
+                if rp.is_file():
+                    cur = {}
+                    for line in rp.read_text(encoding="utf-8").splitlines():
+                        s = line.strip()
+                        if s == "[rung] v2":
+                            cur = {}
+                        elif s == "[end]":
+                            rungs.append(cur)
+                        elif s:
+                            k, _, v = s.partition(" ")
+                            cur[k] = v
+                d = Path(root) / "loop/ledger/entries"
+                if d.is_dir():
+                    for f in sorted(d.iterdir()):
+                        if f.suffix == ".cert" and not f.name.startswith("."):
+                            e = {}
+                            for line in f.read_text(encoding="utf-8").splitlines():
+                                k, _, v = line.partition(" ")
+                                e[k] = v
+                            entries.append(e)
+                p = current(phases, rungs, entries)
+                if p is None:
+                    print("  every phase is met; the plan is finished")
+                    Path(os.environ["CRITERIA_OUT"]).write_text("", encoding="utf-8")
+                    out("have", "yes"); out("done", "yes"); out("phase", "0")
+                    out("title", ""); out("why", "the blueprint is complete")
+                    sys.exit(0)
+                left = [d for d in p["done"] if not met(d, rungs, entries)]
+                Path(os.environ["CRITERIA_OUT"]).write_text(
+                    "".join(x + "\n" for x in left), encoding="utf-8")
+                print("  phase %d: %s" % (p["n"], p["title"]))
+                for d in left:
+                    print("    still open: %s" % d)
+                out("have", "yes"); out("done", "no")
+                out("phase", str(p["n"])); out("title", p["title"])
+                out("stack", head.get("stack", "")); out("verify", head.get("verify", ""))
+                out("why", "%d criteri%s left in phase %d"
+                    % (len(left), "on" if len(left) == 1 else "a", p["n"]))
+                sys.exit(0)
+
+            raise BlueprintError("no such command: %r" % cmd)
+        except BlueprintError as exc:
+            print("::notice::blueprint %s: %s" % (cmd, exc))
+            out("have", "no"); out("done", "no"); out("why", str(exc)[:300])
+            sys.exit(1)
+        PYEOF
