@@ -32,6 +32,7 @@ on:
       utility:        { type: string, required: true }
       lineage:        { type: string, required: true }
       operator:       { type: string, required: true }
+      author:         { type: string, required: false, default: "-" }
       rung:           { type: string, required: true }
       axis:           { type: string, required: true }
       corpus:         { type: string, required: true }
@@ -56,6 +57,7 @@ on:
       utility:       { required: true }
       lineage:       { required: true, default: "root" }
       operator:      { required: true, default: "clonal" }
+      author:        { required: false, default: "-" }
       rung:          { required: true, default: "1" }
       axis:          { required: true, default: "none" }
       corpus:        { required: true, default: "00000000" }
@@ -482,6 +484,7 @@ jobs:
             kind=${{ inputs.kind }}
             lane=model
             operator=${{ inputs.operator }}
+            author=${{ inputs.author || '-' }}
             lineage=${{ inputs.lineage }}
             epoch=${{ inputs.epoch }}
             utility=${{ inputs.utility }}

@@ -102,7 +102,8 @@ runs:
         HEADER = "[envelope] v2"
         WITNESS, PATCH, END = "[witness]", "[patch]", "[end]"
         KEYS = ("kind", "verb", "target", "lane", "axis", "rung", "corpus",
-                "parent-tree", "operator", "lineage", "seed", "witness", "title")
+                "parent-tree", "operator", "author", "lineage", "seed",
+                "witness", "title")
         REQUIRED = ("kind", "verb", "target", "lane", "rung", "parent-tree")
 
         class EnvelopeError(Exception): pass

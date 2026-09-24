@@ -365,8 +365,10 @@ runs:
             # Overrides merge onto the defaults, so repinning the weights is
             # two lines rather than seven, and a half-override cannot leave a
             # URL pointing at one file and a digest describing another.
+            raw_local = dict(a.get("local", {}) or {})
+            raw_pool = raw_local.pop("pool", None)
             loc = dict(DEFAULT_LOCAL)
-            for k, v in (a.get("local", {}) or {}).items():
+            for k, v in raw_local.items():
                 if k not in DEFAULT_LOCAL:
                     raise ConfigError(
                         "[author.local] has no %r; it takes %s"
@@ -406,6 +408,65 @@ runs:
                     raise ConfigError(
                         "[author.local] runtime_dir is empty: the directory the tarball "
                         "extracts to is not derivable from the URL")
+            # **The pool: one author per shard, and every one of them named.**
+            #
+            # Each shard is already its own runner, so nothing says they must
+            # all run the same weights -- a second model is a genuinely
+            # different prior, which is not what a second temperature sample
+            # from one model is. Shard N draws with pool[N % len(pool)].
+            #
+            # A name is required and must be unique, because it is what the
+            # certificate records. A portfolio you cannot attribute is a
+            # portfolio you cannot learn from: the ledger already counts
+            # adoptions and refusals, and per-author counts are what make
+            # "which of these is worth a runner" a question with an answer.
+            #
+            # With no pool declared, the single set of weights above IS the
+            # pool, so a config that says nothing behaves exactly as before.
+            pool = []
+            if raw_pool:
+                if not isinstance(raw_pool, list):
+                    raise ConfigError(
+                        "[[author.local.pool]] is a list of authors; write it as "
+                        "[[author.local.pool]] once per model")
+                for n, e in enumerate(raw_pool):
+                    missing = [k for k in ("name", "weights", "weights_sha256",
+                                           "weights_bytes") if not str(e.get(k, "")).strip()]
+                    if missing:
+                        raise ConfigError(
+                            "[[author.local.pool]] entry %d is missing %s. Every author "
+                            "is pinned to the byte like the single one is, and named, "
+                            "because the name is what the certificate records."
+                            % (n, ", ".join(missing)))
+                    d = str(e["weights_sha256"]).strip().lower()
+                    if len(d) != 64 or any(c not in "0123456789abcdef" for c in d):
+                        raise ConfigError(
+                            "[[author.local.pool]] %s: weights_sha256 is not a sha256"
+                            % e["name"])
+                    if "://" not in str(e["weights"]):
+                        raise ConfigError(
+                            "[[author.local.pool]] %s: weights is not a URL" % e["name"])
+                    if int(e["weights_bytes"]) <= 0:
+                        raise ConfigError(
+                            "[[author.local.pool]] %s: weights_bytes must be positive"
+                            % e["name"])
+                    pool.append({"name": str(e["name"]).strip(),
+                                 "weights": str(e["weights"]),
+                                 "weights_sha256": d,
+                                 "weights_bytes": int(e["weights_bytes"])})
+                names = [e["name"] for e in pool]
+                if len(set(names)) != len(names):
+                    raise ConfigError(
+                        "[[author.local.pool]] names must be unique: %s. The name is "
+                        "what every certificate records, so two authors sharing one "
+                        "make the record unreadable." % ", ".join(sorted(names)))
+            else:
+                pool = [{"name": loc["weights"].rstrip("/").rsplit("/", 1)[-1]
+                                 .replace(".gguf", "") or "local",
+                         "weights": loc["weights"],
+                         "weights_sha256": loc["weights_sha256"],
+                         "weights_bytes": loc["weights_bytes"]}]
+            loc["pool"] = pool
             author["local"] = loc
             # `local` is exempt: the server is told which weights to load on
             # its command line, so the name in the request body is a label
@@ -654,6 +715,41 @@ runs:
                    "not derivable from its URL",
                    local(runtime_dir=" "))
             raises("a context of zero is refused", local(context=0))
+            # --- the pool: one author per shard, every one named -----------
+            claim("no pool declared means the single author IS the pool",
+                  [e["name"] for e in cfg["author"]["local"]["pool"]]
+                  == ["Qwen3.8-4B-Q4_K_M"],
+                  cfg["author"]["local"]["pool"])
+            P = [{"name": "a", "weights": "https://x/a.gguf",
+                  "weights_sha256": "a" * 64, "weights_bytes": 1},
+                 {"name": "b", "weights": "https://x/b.gguf",
+                  "weights_sha256": "b" * 64, "weights_bytes": 2}]
+            two = load(dict(base, author={"local": {"pool": P}}), ".")
+            claim("a declared pool is carried in order",
+                  [e["name"] for e in two["author"]["local"]["pool"]] == ["a", "b"])
+            claim("shard N draws with pool[N mod len], so four shards over two "
+                  "authors ask each of them twice",
+                  [two["author"]["local"]["pool"][n % 2]["name"] for n in range(4)]
+                  == ["a", "b", "a", "b"])
+            raises("an author with no name is refused: the name is what the "
+                   "certificate records",
+                   lambda: load(dict(base, author={"local": {"pool": [
+                       {"weights": "https://x/a.gguf", "weights_sha256": "a" * 64,
+                        "weights_bytes": 1}]}}), "."))
+            raises("two authors sharing a name are refused, or the record "
+                   "cannot say which of them drew",
+                   lambda: load(dict(base, author={"local": {"pool": [
+                       P[0], dict(P[1], name="a")]}}), "."))
+            raises("an author with no digest is refused like the single one is",
+                   lambda: load(dict(base, author={"local": {"pool": [
+                       {"name": "a", "weights": "https://x/a.gguf",
+                        "weights_bytes": 1}]}}), "."))
+            raises("and one whose weights are not a URL",
+                   lambda: load(dict(base, author={"local": {"pool": [
+                       dict(P[0], weights="a.gguf")]}}), "."))
+            raises("a pool that is not a list is refused",
+                   lambda: load(dict(base, author={"local": {"pool": P[0]}}), "."))
+
             claim("a hosted lane is not held to any of that, because it fetches nothing",
                   load(dict(base, author={"provider": "anthropic",
                                           "local": {"weights_bytes": 0}}),

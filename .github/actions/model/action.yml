@@ -42,6 +42,10 @@ inputs:
     description: "where the two files live; cached across runs"
     required: false
     default: ""
+  shard:
+    description: "which shard this is; picks pool[shard mod len(pool)]"
+    required: false
+    default: "0"
 
 outputs:
   url:
@@ -50,6 +54,9 @@ outputs:
   ready:
     description: "yes when the server answered /health before the warmup ran out"
     value: ${{ steps.serve.outputs.ready }}
+  author:
+    description: "the name of the author this shard is serving"
+    value: ${{ steps.pins.outputs.author }}
 
 runs:
   using: composite
@@ -64,6 +71,7 @@ runs:
         COMMAND: ${{ inputs.command }}
         CONFIG: ${{ inputs.config }}
         DIR: ${{ inputs.dir }}
+        SHARD: ${{ inputs.shard }}
         RT: ${{ runner.temp }}
       run: |
         set -euo pipefail
@@ -87,6 +95,17 @@ runs:
             out("skip", "yes"); out("key", "none"); out("dir", "none")
             raise SystemExit(0)
         loc = a["local"]
+        # **Which author this shard is.** Each shard is its own runner, so a
+        # pool costs nothing in wall clock: shard N serves pool[N % len], and
+        # a four-shard night over two authors asks each of them twice. The
+        # name goes into the certificate, because a portfolio you cannot
+        # attribute is one you cannot learn from.
+        pool = loc["pool"]
+        try:
+            shard = int(os.environ.get("SHARD", "0") or "0")
+        except ValueError:
+            shard = 0
+        author = pool[shard % len(pool)]
         d = os.environ["DIR"].strip() or os.path.join(os.environ["RT"], "goedel-model")
         # **Keyed on the digests, so repinning either file misses by
         # construction.** A key naming the version would collide the day
@@ -94,15 +113,18 @@ runs:
         # again regardless -- a restore is a transfer too, and this tree does
         # not trust transfers.
         out("key", "goedel-model-%s-%s" % (loc["runtime_sha256"][:16],
-                                           loc["weights_sha256"][:16]))
+                                           author["weights_sha256"][:16]))
         out("dir", d)
         out("skip", "no")
+        out("author", author["name"])
         for k in ("runtime", "runtime_sha256", "runtime_bytes", "runtime_dir",
-                  "weights", "weights_sha256", "weights_bytes",
                   "context", "slots", "threads", "port", "warmup_seconds"):
             out(k.replace("_", "-"), loc[k])
-        print("  %s, served from %s"
-              % (os.path.basename(loc["weights"]), d))
+        for k in ("weights", "weights_sha256", "weights_bytes"):
+            out(k.replace("_", "-"), author[k])
+        print("  shard %d of %d author(s): %s (%s), served from %s"
+              % (shard, len(pool), author["name"],
+                 os.path.basename(author["weights"]), d))
         PYEOF
 
     - if: inputs.command == 'start' && steps.pins.outputs.skip != 'yes'
@@ -316,6 +338,23 @@ runs:
         claim("a full transfer of the wrong bytes is called a wrong file",
               verifies(20, 20, a, b) == "wrong file")
         claim("and the right file passes", verifies(20, 20, a, a) == "ok")
+
+        # One author per shard, wrapping. Four shards over two authors ask
+        # each of them twice; one author is every shard, which is what a
+        # config that declares no pool gets.
+        def pick(pool, shard):
+            return pool[shard % len(pool)]
+
+        names = ["a", "b", "c"]
+        claim("shard 0 takes the first author", pick(names, 0) == "a")
+        claim("and the pool wraps rather than running out",
+              [pick(names, n) for n in range(5)] == ["a", "b", "c", "a", "b"])
+        claim("a single author serves every shard, so a config with no pool "
+              "behaves exactly as it did",
+              [pick(["only"], n) for n in range(4)] == ["only"] * 4)
+        claim("the cache key follows the AUTHOR's digest, not the pool's, or "
+              "two authors would evict each other under one key",
+              key(a, b) != key(a, c))
 
         # The URL handed to draft is a base, not an endpoint: draft appends
         # /chat/completions to it.

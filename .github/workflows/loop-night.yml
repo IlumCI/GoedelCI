@@ -565,11 +565,13 @@ jobs:
       # **The author, running in this job.** No credential: two pinned files
       # with digests, a llama.cpp server on loopback, and the URL written
       # into $GITHUB_ENV where `draft` reads it. See `.github/actions/model`.
-      - name: The author it will ask
+      - id: author
+        name: The author it will ask
         uses: ./.github/actions/model
         with:
           command: start
           config: ${{ steps.cfg.outputs.json }}
+          shard: ${{ matrix.shard }}
 
       - id: draw
         continue-on-error: true
@@ -580,6 +582,7 @@ jobs:
           config: ${{ steps.cfg.outputs.json }}
           seed: ${{ matrix.shard == 0 && '' || matrix.shard }}
           lineage: ${{ needs.plan.outputs.lineage }}
+          author: ${{ steps.author.outputs.author }}
           out: envelope.env
 
       # **A shard that got no answer is not a draw.** Three balks retire a
@@ -639,6 +642,7 @@ jobs:
       baseline: ${{ steps.refs.outputs.baseline }}
       candidate: ${{ steps.push.outputs.candidate }}
       operator: ${{ steps.pick.outputs.operator }}
+      author: ${{ steps.pick.outputs.author }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -704,6 +708,7 @@ jobs:
           echo "point=$point" >> "$GITHUB_OUTPUT"
           echo "balked=0" >> "$GITHUB_OUTPUT"
           echo "operator=$(sed -n 's/^operator //p' envelope.env)" >> "$GITHUB_OUTPUT"
+          echo "author=$(sed -n 's/^author //p' envelope.env)" >> "$GITHUB_OUTPUT"
           echo "  shard $(cat "$took/n") drew ${point:0:16}"
 
       # A milestone every shard refused is a fact about the milestone rather
@@ -829,6 +834,7 @@ jobs:
       utility: ${{ needs.plan.outputs.utility }}
       lineage: ${{ needs.plan.outputs.lineage }}
       operator: ${{ needs.stage.outputs.operator }}
+      author: ${{ needs.stage.outputs.author }}
       rung: "1"
       axis: ${{ needs.plan.outputs.target }}
       corpus: "00000000"

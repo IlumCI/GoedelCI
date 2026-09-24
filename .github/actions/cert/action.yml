@@ -94,7 +94,10 @@ runs:
         import hashlib, os, re, sys
         from pathlib import Path
 
-        VERSION = "2"
+        # 3 adds `author`: which model drew the candidate. Bumped rather than
+        # defaulted quietly, because a v2 certificate genuinely does not know
+        # and a reader should not be told `-` as though somebody had looked.
+        VERSION = "3"
         # `restore` rather than `rollback`: the archive may move to any adopted
         # state, including a cousin lineage, and "rollback" names only half of
         # what that is.
@@ -135,6 +138,15 @@ runs:
           ("kind",           is_free),
           ("lane",           lambda v: v in LANES),
           ("operator",       lambda v: v in OPERATORS),
+          # **Which model drew this.** Each shard is its own runner, so a
+          # night can fan out over several authors rather than several
+          # temperatures of one. That is only worth doing if the record says
+          # which of them drew what: the ledger already counts adoptions and
+          # refusals, and per-author counts are what turn "is this model
+          # worth a runner" into a question with an answer. `-` is a draw
+          # nobody attributed, which is a different fact from a draw by an
+          # author called nothing.
+          ("author",         is_free),
           ("lineage",        lambda v: v == "root" or bool(NAME16.match(v))),
           ("epoch",          is_int),
           ("utility",        lambda v: bool(HEX64.match(v))),
@@ -171,7 +183,8 @@ runs:
         # What a field means when nothing measured it. `emit` fills these in,
         # so a caller naming only what it knows still renders a whole file.
         DEFAULTS = {
-          "version": VERSION, "lane": "event", "operator": "-", "lineage": "root",
+          "version": VERSION, "lane": "event", "operator": "-", "author": "-",
+          "lineage": "root",
           "axis": "none", "ladder": "-", "parent-tree": "-", "candidate-tree": "-",
           "rail": "none", "corpus": "00000000", "alpha-k": "0", "bar": "-",
           "fdr": "-", "minutes": "0", "half": "extend", "level": "0", "trials": "0",

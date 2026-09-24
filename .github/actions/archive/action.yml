@@ -220,6 +220,40 @@ runs:
                 return "\n".join("  ".join(c.ljust(x) for c, x in zip(r, w)).rstrip()
                                  for r in rows)
 
+        def authors(entries):
+            """Adoptions and trials per author, and the same posterior mean.
+
+            **The portfolio's own scoreboard.** A night can fan out over
+            several models rather than several temperatures of one, and each
+            shard is its own runner, so that costs nothing in wall clock. It
+            is only worth doing if the record says which of them drew what --
+            which is what the certificate's `author` field is for.
+
+            Priced under Beta(1, 1) exactly as a clade is, and for the same
+            reason: a one-of-one author is not evidence that it is perfect,
+            and the uniform prior is what stops a single lucky draw sorting
+            above a model with a long record. Events are not trials.
+            """
+            tally = {}
+            for _, f in entries:
+                a = (f.get("author") or "-").strip()
+                if not a or a == "-" or f.get("lane") == "event":
+                    continue
+                s, t = tally.get(a, (0, 0))
+                tally[a] = (s + (1 if f.get("verdict") == "adopt" else 0), t + 1)
+            return {a: (s, t, (s + 1.0) / (t + 2.0)) for a, (s, t) in tally.items()}
+
+        def authors_report(tally):
+            if not tally:
+                return "  no author has been attributed a trial yet"
+            rows = [("author", "adopted", "trials", "cmp")]
+            for a in sorted(tally, key=lambda k: (-tally[k][2], k)):
+                s, t, c = tally[a]
+                rows.append((a, str(s), str(t), "%.3f" % c))
+            w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+            return "\n".join("  " + "  ".join(c.ljust(x) for c, x in zip(r, w)).rstrip()
+                              for r in rows)
+
         def build(entries):
             """`entries` is a list of plain field mappings, in seq order."""
             nodes = {ROOT: Node(ROOT, 0, "-", "", 0)}
@@ -390,6 +424,27 @@ runs:
             over = [o for o in side if o[0] == "move" and cz.distance(cz.tip(), o[3]) == -1]
             claim("and a move to one says it went up and back down",
                   not over or "back down" in over[0][4] or "down into" in over[0][4])
+            # -- the portfolio's scoreboard --------------------------------
+            def E(author, verdict, lane="model"):
+                return ("x", {"author": author, "verdict": verdict, "lane": lane})
+            
+            t = authors([E("a", "adopt"), E("a", "refuse"), E("b", "adopt")])
+            claim("an author's adoptions and trials are counted",
+                  t["a"][:2] == (1, 2) and t["b"][:2] == (1, 1), t)
+            claim("and priced under the same uniform prior a clade is, so a "
+                  "one-of-one author does not read as certainty",
+                  t["b"][2] == 2 / 3)
+            claim("a one-of-one author does not outrank a longer record it ties",
+                  authors([E("a", "adopt")] * 6)["a"][2] > t["b"][2])
+            claim("an unattributed draw is not counted against anybody",
+                  "-" not in authors([E("-", "refuse"), E("a", "adopt")]))
+            claim("an event is not a trial, here as everywhere else",
+                  authors([E("a", "superseded", "event")]) == {})
+            claim("the report sorts the portfolio best first",
+                  authors_report(t).splitlines()[1].split()[0] == "b")
+            claim("and says so plainly when nothing has been attributed yet",
+                  "no author" in authors_report({}))
+
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 
@@ -402,10 +457,18 @@ runs:
         root = os.environ.get("ROOT", ".") or "."
         seed = os.environ.get("SEED", "")
         explore = os.environ.get("HALF", "explore") != "extend"
-        archive = build(load(root))
+        entries = load(root)
+        archive = build(entries)
 
         if cmd == "report":
             print(archive.report())
+            # The portfolio, under the lineage tree. An operator checking in
+            # wants to know which of the models they are paying a runner for
+            # is earning it, and that is not a question the clade table can
+            # answer -- a clade is where a change came FROM, an author is
+            # who wrote it.
+            print("\n  the portfolio, best first")
+            print(authors_report(authors(entries)))
             node = archive.tip()
             decision, tree, steps, why = "stay", archive.nodes[node].tree, 0, "reported only"
         elif cmd == "select":

@@ -204,6 +204,42 @@ port = 8080
 # every check available and cannot answer anything yet.
 warmup_seconds = 300
 
+# **More than one author, one per shard.** Each shard is already its own
+# runner with its own four vCPU, so nothing says they must all run the same
+# weights. Uncomment a second entry and shard 1 draws with a different model
+# than shard 0 -- a genuinely different prior, which is not the same thing as
+# a second temperature sample from one.
+#
+# Shard N draws with pool[N % len(pool)], so four shards over two authors ask
+# each of them twice. Every certificate records which one drew it, because a
+# portfolio you cannot attribute is a portfolio you cannot learn from.
+#
+# The RUNTIME is shared: one llama.cpp build serves any GGUF, so only the
+# weights differ and the pool costs bytes rather than complexity.
+#
+# **The cache is the ceiling.** GitHub gives a repository 10 GB of Actions
+# cache, evicted least-recently-used, so three 2.78 GB authors fit and four
+# do not. Over the limit nothing breaks -- a miss is a 55-second download on
+# a runner that was going to spend thirty minutes anyway -- but a pool that
+# thrashes pays that on every shard of every night. Mixing sizes is the way
+# to spend it: a 4B and a 1.7B cost less together than two 4Bs and disagree
+# more.
+#
+# With no pool at all, the weights above are the only author and everything
+# behaves as it did.
+#
+# [[author.local.pool]]
+# name = "qwen38-4b"
+# weights = "https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF/resolve/main/Qwen3.8-4B-Q4_K_M.gguf"
+# weights_sha256 = "dec96e8cf2e11b613bb46513dec485377f9ca5a351e71712ee0e244f287c6790"
+# weights_bytes = 2783446304
+#
+# [[author.local.pool]]
+# name = "qwen38-4b-q8"
+# weights = "https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF/resolve/main/Qwen3.8-4B-Q8_0.gguf"
+# weights_sha256 = "770b780d6754a4954d1caf395c9239eaeb394f15c7a7ea34039883377c93c9c3"
+# weights_bytes = 4610579744
+
 [floors]
 # A movement inside its floor is not a movement. Prefixes, longest match wins.
 # Measure them with the `floors` workflow; change them with a `boundary`

@@ -65,6 +65,10 @@ inputs:
     description: "the validated goedel.toml JSON"
     required: false
     default: ""
+  author:
+    description: "for draft: the name of the model that is answering"
+    required: false
+    default: ""
   grammar:
     description: "for ask: a GBNF file whose shape the reply must take"
     required: false
@@ -121,6 +125,7 @@ runs:
         LINEAGE: ${{ inputs.lineage }}
         OUT: ${{ inputs.out }}
         GRAMMAR_FILE: ${{ inputs.grammar }}
+        AUTHOR: ${{ inputs.author }}
         SYSTEM_FILE: ${{ inputs.system }}
         USER_FILE: ${{ inputs.user }}
       run: |
@@ -649,7 +654,7 @@ runs:
                 return False
             return m(path, cfg["allow"]) and not m(path, cfg["evaluator"])
 
-        def envelope(rung, cfg, ev, wpatch, patch, parent, seed, lineage):
+        def envelope(rung, cfg, ev, wpatch, patch, parent, seed, lineage, author="-"):
             head = [
                 "[envelope] v2",
                 "kind " + rung["kind"],
@@ -661,6 +666,10 @@ runs:
                 "corpus " + rung.get("corpus", "00000000"),
                 "parent-tree " + parent,
                 "operator " + ev["operator"],
+                # Which model drew this. It travels envelope -> stage ->
+                # adopt -> certificate, the same road `operator` takes, so
+                # the record can say which author earned its runner.
+                "author " + (author or "-"),
                 "lineage " + lineage,
                 "seed " + (str(seed) if seed is not None else "-"),
                 "witness " + rung.get("witness", "-"),
@@ -822,6 +831,14 @@ runs:
             env = envelope(rung, CFG, {"operator": "clonal", "text": ""}, "",
                            "diff --git a/src/new.py b/src/new.py\n", "c"*40, 3, "root")
             claim("the envelope records which operator drew it", "operator clonal" in env)
+            claim("and which author drew it, because a portfolio you cannot "
+                  "attribute is one you cannot learn from",
+                  "author -" in env)
+            claim("a named author is the name that is recorded",
+                  "author qwen38-4b" in envelope(
+                      rung, CFG, {"operator": "clonal", "text": ""}, "",
+                      "diff --git a/src/new.py b/src/new.py\n", "c"*40, 3, "root",
+                      "qwen38-4b"))
             claim("and the seed that drew it", "seed 3" in env)
             claim("and closes", env.rstrip().endswith("[end]"))
             wenv = envelope(dict(rung, kind="repair"), CFG, {"operator": "clonal", "text": ""},
@@ -957,7 +974,8 @@ runs:
             parent = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root,
                                     capture_output=True, text=True, check=True).stdout.strip()
             ev, wpatch, patch, attempts = draft(root, rung, cfg, seed, lineage)
-            text = envelope(rung, cfg, ev, wpatch, patch, parent, seed, lineage)
+            text = envelope(rung, cfg, ev, wpatch, patch, parent, seed, lineage,
+                            os.environ.get("AUTHOR", "-").strip() or "-")
             Path(os.environ["OUT"]).write_text(text, encoding="utf-8")
             import hashlib
             point = hashlib.sha256(text.encode("utf-8")).hexdigest()

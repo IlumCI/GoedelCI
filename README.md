@@ -196,7 +196,7 @@ Then enable the `loop-night` schedule.
 | `boundary-judge` | Epoch, Moves, Honest, Remembers |
 | `survey` | what is left: stubs, swallowed failures, unsafe patterns |
 | `directions` | complete alternative plans, for you to pick between |
-| `model` | the author, running in the job: two pinned files and a server |
+| `model` | the authors, running in the job: pinned files and a server, one per shard |
 | `template-check` | the machine checked against itself |
 | `selftest-all` | runs every suite from disk, for the one gate that needs it |
 
@@ -237,6 +237,56 @@ as none, which is refused for having no fence, fed back, refused again, and
 filed as a balk. Three balks retire a milestone the model was never allowed to
 see. `draft` asks for the same thing per request, so neither half depends on
 the other being there.
+
+### Several models, one per shard
+
+A night fans out over N shards, and each shard is already its own runner with
+its own four vCPU. Nothing says they must all run the same weights. Declare a
+pool and shard N draws with `pool[N % len(pool)]`:
+
+```toml
+[[author.local.pool]]
+name = "qwen38-4b"
+weights = "…/Qwen3.8-4B-Q4_K_M.gguf"
+weights_sha256 = "dec96e8c…"
+weights_bytes = 2783446304
+
+[[author.local.pool]]
+name = "qwen38-4b-q8"
+…
+```
+
+This is a **portfolio, not a conversation.** The models never see each other's
+work; each draws independently and one judge decides. That is the point — a
+second model is a genuinely different prior, which is not the same thing as a
+second temperature sample from one, and the fan-out already exists to buy
+exactly that. It costs nothing in wall clock, because the shards were running
+in parallel anyway.
+
+Every certificate records **which author drew it**, and `archive report` prices
+each one under the same Beta(1,1) the clades use:
+
+```
+  the portfolio, best first
+  author        adopted  trials  cmp
+  qwen38-4b-q8  4        7       0.556
+  qwen38-4b     3        9       0.364
+```
+
+A portfolio you cannot attribute is one you cannot learn from. With the counts
+recorded, "is this model worth a runner" stops being a matter of taste.
+
+**The cache is the ceiling.** GitHub gives a repository 10 GB of Actions cache,
+evicted least-recently-used, so three 2.78 GB authors fit and four do not. Over
+the limit nothing breaks — a miss is a 55-second download on a runner about to
+spend thirty minutes — but a pool that thrashes pays that on every shard of
+every night. Mixing sizes is how to spend it: a 4B and a 1.7B cost less
+together than two 4Bs and disagree more.
+
+**What this deliberately is not** is models reviewing each other. The judge is
+code, and `[project] evaluator` exists so that nothing the loop proposes can
+touch what judges it. An LLM reviewer would be a judge the machine could argue
+with, which is the one thing this whole arrangement is built to prevent.
 
 ### It cannot edit its own judge
 
