@@ -177,9 +177,12 @@ jobs:
           set -euo pipefail
           newest=$(ls -1 loop/evidence/floors/*.tsv 2>/dev/null | sort | tail -1 || true)
           if [ -z "$newest" ]; then
-            echo "::error::a floors change with no measured spread to cite."
-            echo "::error::run the `floors` workflow first; a floor nobody measured is a"
-            echo "::error::number somebody typed."
+            # Single quotes: backticks inside a double-quoted string are
+            # command substitution, so this line ran `floors` as a command and
+            # printed its 'not found' into the middle of an error message.
+            echo '::error::a floors change with no measured spread to cite.'
+            echo '::error::run the floors workflow first; a floor nobody measured'
+            echo '::error::is a number somebody typed.'
             exit 1
           fi
           python3 - "$newest" <<'PYEOF'
@@ -265,13 +268,20 @@ jobs:
       - name: A branch and a pull request, for the second human decision
         shell: bash
         env:
-          DEFAULT: ${{ github.event.repository.default_branch }}
+          FROM_EVENT: ${{ github.event.repository.default_branch }}
           DECLARES: ${{ needs.judge.outputs.declares }}
           MOVES: ${{ needs.judge.outputs.moves }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Asked of git when the event does not carry it; see the same note in
+          # loop-night.yml.
+          DEFAULT="${FROM_EVENT:-}"
+          if [ -z "$DEFAULT" ]; then
+            DEFAULT=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+          fi
+          test -n "$DEFAULT" || { echo "::error::cannot tell which branch is the default"; exit 1; }
           name=$(sha256sum "$PROPOSAL" | cut -c1-16)
           git fetch origin "$DEFAULT"
           git checkout -q -b "boundary/$name" "origin/$DEFAULT"

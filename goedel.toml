@@ -122,7 +122,17 @@ context = []
 # Cost rails are exact by construction -- one tree, one toolchain -- so their
 # floor is zero and one byte larger really is larger.
 "cost." = 0.0
-"bench." = 0.05
+
+# **0.25, and the number is measured rather than chosen.** This started at 0.05
+# and a rehearsal on a shared runner moved `bench.total_ms` by 12.3% between
+# two arms differing by one added module -- so at 5% every night would have
+# refused on the benchmark, for the runner rather than for the code.
+#
+# A wall-clock benchmark on a hosted runner is mostly measuring the neighbours.
+# Replace this with what the `floors` workflow measures on the runner class
+# that will actually judge you, and change it through a `boundary` proposal
+# that cites the measurement.
+"bench." = 0.25
 
 # --- the kinds ------------------------------------------------------------
 #
@@ -142,6 +152,18 @@ targets = ["src/**"]
 # is deliberately not allowed: a feature that adds warnings has added code
 # nothing exercises, which is what J1 already refuses.
 allow_rails = ["cost.artifact_bytes"]
+
+# **Reported, and explicitly not attributed to the change.** Adding a module
+# moves every function after it, which on a hot loop is an alignment and
+# instruction-cache effect that nothing in this repository controls for. A
+# timing rail has no control group here, so a movement in it is the change's
+# logic or its layout and there is no instrument that can say which.
+#
+# `adrift` prints the movement and records it, and declines to veto on it. The
+# rails that CAN be attributed -- the cost rails, and anything your benchmark
+# measures deterministically -- still refuse, and so does the claim count.
+# Delete this line once you have a benchmark with a control.
+adrift_rails = ["bench.total_ms", "bench.push_ns"]
 diff_lines = 400
 diff_files = 6
 prompt = """

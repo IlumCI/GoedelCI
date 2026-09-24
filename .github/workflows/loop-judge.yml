@@ -101,6 +101,39 @@ jobs:
         uses: ./.github/actions/config
         with: { command: load }
 
+      # **What this kind is, read from the config rather than spelled out
+      # here.** The witness arm was gated on `env.KIND == 'repair' || == 'test'`
+      # -- two names this file had no business knowing. A project that calls its
+      # witnessed kind `bugfix` got no witness arm and every one of its
+      # candidates was refused for "the witness arm was never run", which is a
+      # sentence about a step that was skipped by a string comparison.
+      #
+      # The rail is read the same way, and for a worse reason: nothing passed
+      # one, so a `rail` kind's claimed measurement never reached the
+      # comparison, `moved` came back `-`, and every rail kind refused forever.
+      - id: kind
+        shell: bash
+        env:
+          CFG: ${{ steps.cfg.outputs.json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os
+          from pathlib import Path
+          cfg = json.loads(Path(os.environ["CFG"]).read_text(encoding="utf-8"))
+          name = os.environ["KIND"]
+          if name not in cfg["kinds"]:
+              print("::error::%r is not a kind this project has" % name)
+              raise SystemExit(1)
+          k = cfg["kinds"][name]
+          rail = k["rail"] if k["j1"] == "rail" else os.environ.get("RAIL", "none")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("j1=%s\n" % k["j1"])
+              fh.write("witness=%s\n" % ("yes" if k["j1"] == "witness" else "no"))
+              fh.write("rail=%s\n" % (rail or "none"))
+          print("  kind %s: j1 %s, rail %s" % (name, k["j1"], rail or "none"))
+          PYEOF
+
       # The envelope is already on the branch -- the marker was committed
       # before the trial, by construction -- and it is re-admitted here even
       # though propose admitted it, because this job is about to RUN what it
@@ -201,7 +234,7 @@ jobs:
       # bugfix without this is a diff with a story; recording fail-then-pass is
       # what makes it a certificate.
       - id: wtree
-        if: env.KIND == 'repair' || env.KIND == 'test'
+        if: steps.kind.outputs.witness == 'yes'
         uses: ./.github/actions/envelope
         with:
           command: derive
@@ -210,7 +243,7 @@ jobs:
           witness-only: "true"
 
       - name: Become the witness arm
-        if: env.KIND == 'repair' || env.KIND == 'test'
+        if: steps.kind.outputs.witness == 'yes'
         shell: bash
         env:
           WTREE: ${{ steps.wtree.outputs.tree }}
@@ -220,7 +253,7 @@ jobs:
           git checkout -f --detach "$c"
 
       - id: witness-run
-        if: env.KIND == 'repair' || env.KIND == 'test'
+        if: steps.kind.outputs.witness == 'yes'
         continue-on-error: true
         uses: ./.github/actions/harness
         with:
@@ -231,7 +264,7 @@ jobs:
           skip-bench: "true"
 
       - name: The witness must have failed, and failed the right way
-        if: env.KIND == 'repair' || env.KIND == 'test'
+        if: steps.kind.outputs.witness == 'yes'
         shell: bash
         env:
           BUILT: ${{ steps.witness-run.outputs.built }}
@@ -293,7 +326,7 @@ jobs:
           after: rails-b.txt
           again-before: ${{ fromJSON(inputs.level) >= 1 && 'rails-a2.txt' || '' }}
           again-after: ${{ fromJSON(inputs.level) >= 1 && 'rails-b2.txt' || '' }}
-          claims: ${{ inputs.rail }}
+          claims: ${{ steps.kind.outputs.rail }}
           kind: ${{ inputs.kind }}
           config: ${{ steps.cfg.outputs.json }}
           seed: ${{ inputs.point }}
@@ -318,6 +351,7 @@ jobs:
           UNSTABLE: ${{ steps.rails.outputs.unstable }}
           MOVED: ${{ steps.rails.outputs.moved }}
           RAIL_WHY: ${{ steps.rails.outputs.why }}
+          CLAIMED: ${{ steps.kind.outputs.rail }}
           EFFECT: ${{ steps.rails.outputs.effect }}
           INTERVAL: ${{ steps.rails.outputs.interval }}
           QVAL: ${{ steps.rails.outputs.q }}
@@ -422,7 +456,7 @@ jobs:
                     "regressed" % (b["claims"] - a["claims"]))
 
           if j1 in ("rail", "cost"):
-              want = kind["rail"] if j1 == "rail" else env("RAIL")
+              want = env("CLAIMED", "none")
               moved = env("MOVED", "-")
               if moved == "absent":
                   refuse("nothing measured %s, so its claim cannot be judged" % want)
@@ -453,7 +487,7 @@ jobs:
             ladder=${{ inputs.ladder || '-' }}
             parent-tree=${{ env.PARENT_TREE }}
             candidate-tree=${{ env.CAND_TREE }}
-            rail=${{ inputs.rail }}
+            rail=${{ steps.kind.outputs.rail }}
             corpus=${{ inputs.corpus }}
             alpha-k=${{ inputs.alpha_k }}
             minutes=${{ inputs.minutes }}

@@ -72,8 +72,36 @@ jobs:
         uses: ./.github/actions/config
         with: { command: load }
 
+      # **The drills exercise the shipped example, and say so.** The candidate
+      # they write is a Python module under `src/`, which is what this
+      # repository's own `goedel.toml` allows. An adopter who has repointed the
+      # masks at their own tree has a machine these drills cannot rehearse, and
+      # a red X there would mean nothing except that the example is gone.
+      #
+      # Run `proof` before you repoint the masks. After that, `ci` and a
+      # `dry_run` night are what tell you the wiring is right.
+      - id: applicable
+        shell: bash
+        env:
+          CFG: ${{ steps.cfg.outputs.json }}
+        run: |
+          set -euo pipefail
+          ok=yes
+          python3 -c "
+          import json, sys
+          cfg = json.load(open('$CFG'))
+          sys.exit(0 if 'src/**' in cfg['allow'] and 'feature' in cfg['kinds'] else 1)
+          " || ok=no
+          if [ "$ok" = "no" ]; then
+            echo "::notice::the masks in goedel.toml are not the example's, so these"
+            echo "::notice::drills have nothing to rehearse. That is expected once you"
+            echo "::notice::have adopted the template; ci and a dry_run night cover you."
+          fi
+          echo "run=$ok" >> "$GITHUB_OUTPUT"
+
       - name: A candidate, as draft would have written one
         id: write
+        if: steps.applicable.outputs.run == 'yes'
         shell: bash
         env:
           BODY: ${{ matrix.body }}
@@ -84,27 +112,32 @@ jobs:
           echo "PARENT=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_ENV"
 
           mkdir -p src tests
+          # Standalone on purpose: the drill must not depend on anything else
+          # in the example, so that deleting one file of it does not turn a
+          # wiring test into a red X about an import.
           cat > src/proof_spread.py <<PYEOF
-          """The spread of a window: its largest value minus its smallest."""
-
-          from src.window import Window
+          """The spread of a sequence: its largest value minus its smallest."""
 
 
-          def spread(window: Window) -> float:
-              values = window.values
+          def spread(values):
               if not values:
-                  raise ValueError("an empty window has no spread")
+                  raise ValueError("an empty sequence has no spread")
               $BODY
           PYEOF
           cat > tests/test_proof_spread.py <<'PYEOF'
           from src.proof_spread import spread
-          from src.window import Window
 
 
           def test_the_spread_is_the_distance_between_the_extremes():
-              w = Window(4)
-              w.extend([3, 9, 5])
-              assert spread(w) == 6.0, spread(w)
+              assert spread([3, 9, 5]) == 6, spread([3, 9, 5])
+
+
+          def test_an_empty_sequence_has_no_spread():
+              try:
+                  spread([])
+              except ValueError:
+                  return
+              raise AssertionError("it answered for an empty sequence")
           PYEOF
 
           # `add -N` so the new files appear in `git diff` without being
@@ -140,12 +173,14 @@ jobs:
       # Admission is the gate that runs before a runner is spent, so a drill
       # that skipped it would be proving a path no night takes.
       - uses: ./.github/actions/envelope
+        if: steps.applicable.outputs.run == 'yes'
         with:
           command: admit
           file: envelope.env
           config: ${{ steps.cfg.outputs.json }}
 
       - name: Mark it tried, exactly as stage does
+        if: steps.applicable.outputs.run == 'yes'
         shell: bash
         run: |
           set -euo pipefail
@@ -156,6 +191,7 @@ jobs:
           echo "MARKED=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_ENV"
 
       - id: derive
+        if: steps.applicable.outputs.run == 'yes'
         uses: ./.github/actions/envelope
         with:
           command: derive
@@ -166,6 +202,7 @@ jobs:
       # deriving twice from the same tree gives the same tree. If it does not,
       # nothing downstream means anything.
       - id: rederive
+        if: steps.applicable.outputs.run == 'yes'
         uses: ./.github/actions/envelope
         with:
           command: derive
@@ -173,6 +210,7 @@ jobs:
           parent: ${{ env.MARKED }}
 
       - name: The candidate is reproducible from the envelope alone
+        if: steps.applicable.outputs.run == 'yes'
         shell: bash
         env:
           A: ${{ steps.derive.outputs.tree }}
@@ -185,6 +223,7 @@ jobs:
           echo "  ${A:0:12}, twice"
 
       - id: base
+        if: steps.applicable.outputs.run == 'yes'
         uses: ./.github/actions/harness
         with:
           command: run
@@ -193,6 +232,7 @@ jobs:
           repeats: "1"
 
       - name: Become the candidate
+        if: steps.applicable.outputs.run == 'yes'
         shell: bash
         run: |
           set -euo pipefail
@@ -202,6 +242,7 @@ jobs:
           test -f src/proof_spread.py || { echo "::error::the candidate tree is missing the module"; exit 1; }
 
       - id: cand
+        if: steps.applicable.outputs.run == 'yes'
         continue-on-error: true
         uses: ./.github/actions/harness
         with:
@@ -211,6 +252,7 @@ jobs:
           repeats: "1"
 
       - id: rails
+        if: steps.applicable.outputs.run == 'yes'
         uses: ./.github/actions/rails
         with:
           command: judge
@@ -222,6 +264,7 @@ jobs:
           seed: ${{ env.POINT }}
 
       - id: verdict
+        if: steps.applicable.outputs.run == 'yes'
         shell: bash
         env:
           A_CLAIMS: ${{ steps.base.outputs.claims }}
@@ -255,6 +298,7 @@ jobs:
       # and the counts otherwise. `cert emit` checks its own output, so a
       # combination the ledger would refuse cannot be rendered here either.
       - id: cert
+        if: steps.applicable.outputs.run == 'yes'
         uses: ./.github/actions/cert
         with:
           command: emit
@@ -281,11 +325,13 @@ jobs:
             runner=${{ github.run_id }}/${{ github.run_attempt }}
 
       - uses: ./.github/actions/cert
+        if: steps.applicable.outputs.run == 'yes'
         with:
           command: check
           file: certificate.cert
 
       - id: decide
+        if: steps.applicable.outputs.run == 'yes'
         uses: ./.github/actions/adopt-decide
         with:
           command: decide
@@ -293,6 +339,7 @@ jobs:
           live: ${{ env.MARKED }}
 
       - name: The drill must have ended the way it was written to
+        if: steps.applicable.outputs.run == 'yes'
         shell: bash
         env:
           GOT: ${{ steps.verdict.outputs.verdict }}
@@ -330,6 +377,7 @@ jobs:
       # trees -- so it is asserted here against the same certificate rather
       # than given a drill of its own.
       - id: stale
+        if: steps.applicable.outputs.run == 'yes'
         uses: ./.github/actions/adopt-decide
         with:
           command: decide
@@ -337,6 +385,7 @@ jobs:
           live: "0000000000000000000000000000000000000000"
 
       - name: And a tip that moved is stale, whatever the verdict said
+        if: steps.applicable.outputs.run == 'yes'
         shell: bash
         env:
           V: ${{ steps.stale.outputs.verdict }}

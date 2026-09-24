@@ -51,9 +51,30 @@ jobs:
       contents: write
     outputs:
       tip: ${{ steps.tip.outputs.tip }}
+      default: ${{ steps.default.outputs.branch }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      # **Asked of git, not of the event.** `github.event.repository` is not
+      # guaranteed to be populated on a `schedule` event, and the night runs on
+      # a schedule -- so a default branch read from the payload is empty on
+      # exactly the runs nobody is watching, and `origin/` is not a ref.
+      - id: default
+        name: Which branch is the human authority
+        shell: bash
+        env:
+          FROM_EVENT: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          b="${FROM_EVENT:-}"
+          if [ -z "$b" ]; then
+            b=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+          fi
+          test -n "$b" || { echo "::error::cannot tell which branch is the default"; exit 1; }
+          echo "  $b"
+          echo "branch=$b" >> "$GITHUB_OUTPUT"
+          echo "DEFAULT=$b" >> "$GITHUB_ENV"
 
       - name: The loop's branch, made if it is not there
         shell: bash
@@ -64,8 +85,8 @@ jobs:
           if git rev-parse --verify --quiet origin/loop/main >/dev/null; then
             git checkout -f -B loop/main origin/loop/main
           else
-            echo "::notice::first night: loop/main starts from main"
-            git checkout -f -B loop/main "origin/${{ github.event.repository.default_branch }}"
+            echo "::notice::first night: loop/main starts from $DEFAULT"
+            git checkout -f -B loop/main "origin/$DEFAULT"
             mkdir -p loop/ledger/entries loop/ledger/tried loop/ladder loop/anchors
             git push origin HEAD:refs/heads/loop/main
           fi
@@ -92,8 +113,6 @@ jobs:
       - name: Follow main, and record what it overrode
         id: follow
         shell: bash
-        env:
-          DEFAULT: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           git fetch origin "$DEFAULT"
@@ -305,12 +324,8 @@ jobs:
       # refused proposal is the ordinary outcome and not a failure: the fence
       # contract is strict on purpose, and a night with no new rung still has
       # whatever is already open.
-      - name: Keep the ladder stocked
-        shell: bash
-        run: |
-          echo "  asking for a milestone if none is open"
-
       - id: propose
+        name: Keep the ladder stocked
         uses: ./.github/actions/ladder
         with:
           command: propose
@@ -619,7 +634,7 @@ jobs:
   adopt:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [plan, stage, judge]
+    needs: [follow, plan, stage, judge]
     if: ${{ !cancelled() && needs.judge.result == 'success' && needs.stage.outputs.have == 'yes' && !inputs.dry_run }}
     permissions:
       contents: write
@@ -717,7 +732,6 @@ jobs:
         shell: bash
         env:
           POINT: ${{ needs.stage.outputs.point }}
-          RAIL: ${{ needs.plan.outputs.target }}
         run: |
           set -euo pipefail
           a=judge/rails-a.txt; b=judge/rails-b.txt
@@ -763,7 +777,7 @@ jobs:
       - name: The rolling audit pull request
         env:
           GH_TOKEN: ${{ github.token }}
-          DEFAULT: ${{ github.event.repository.default_branch }}
+          DEFAULT: ${{ needs.follow.outputs.default }}
         shell: bash
         run: |
           set -euo pipefail
