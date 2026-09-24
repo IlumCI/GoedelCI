@@ -121,11 +121,25 @@ max_level = 3
 balks = 3
 
 [author]
-# `anthropic` or `openai` (which covers any OpenAI-compatible endpoint,
-# including a local llama.cpp server). Neither the key nor the URL is written
-# here -- only the names of the variables they arrive in.
-provider = "anthropic"
+# **`local` runs the model ON THE RUNNER, and needs no credential at all.**
+#
+# That is the default and it is the point. A hosted endpoint is somebody
+# else's product decision: the original of this machine was built against
+# GitHub Models, which retired mid-loop -- `HTTP 410
+# github_models_retirement_brownout` -- and took the loop with it. A pinned
+# tarball and a pinned GGUF are two files with digests. Files do not get
+# retired, do not rotate keys, and do not bill.
+#
+# `anthropic` and `openai` remain for anyone who wants to point this
+# somewhere else; both want a credential and neither is the default.
+provider = "local"
+
+# Ignored when provider is `local` -- the server is told which weights to
+# load, so the name in the request is a label. Used verbatim by the other two.
 model = "claude-sonnet-5"
+
+# Only the NAMES of the variables, never the values. `local` needs neither:
+# the model action writes the URL into $GITHUB_ENV itself.
 api_key_env = "GOEDEL_INFERENCE_KEY"
 base_url_env = "GOEDEL_INFERENCE_URL"
 
@@ -144,6 +158,51 @@ shards = 4
 
 # Files every card carries besides the target, for house style and idiom.
 context = []
+
+[author.local]
+# Two files, two digests, re-checked on every restore. A cache hit is a
+# transfer too, and this tree does not trust transfers.
+runtime = "https://github.com/ggml-org/llama.cpp/releases/download/b11166/llama-b11166-bin-ubuntu-x64.tar.gz"
+runtime_sha256 = "79dccaacf907665a278a9507f583027c294c97f0e93f372364086d9a246e38a5"
+# Checked BEFORE the digest, because it is free and a short transfer is the
+# likely failure. A truncated tarball is a `llama-server` that is not there;
+# a truncated GGUF is a server that starts and answers nonsense.
+runtime_bytes = 17013191
+# The directory the tarball extracts to, which is not derivable from the URL.
+runtime_dir = "llama-b11166"
+
+# Q4_K_M rather than a smaller quantisation. Q2_0 has no x86 kernel and runs
+# scalar -- 2.18 t/s prefill against 17.33 for a quantisation with one -- so
+# the cheaper file is not the faster one. This costs 2.78 GB and roughly
+# twice the bytes per token of a 2-bit file, and CPU decode is memory
+# bandwidth bound. The fan-out pays for it: every shard gets its own runner,
+# so the night's wall clock is one shard's however many there are.
+weights = "https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF/resolve/main/Qwen3.8-4B-Q4_K_M.gguf"
+weights_sha256 = "dec96e8cf2e11b613bb46513dec485377f9ca5a351e71712ee0e244f287c6790"
+weights_bytes = 2783446304
+
+# The int8 rung, pinned without being fetched so the swap is one line rather
+# than another trip to somebody's API. 4.6 GB against 2.8, and CPU decode is
+# memory-bandwidth bound, so about 1.7x the time per token. Try it against
+# the measured attempts-to-compile rather than on the grounds that more bits
+# are better.
+#   weights = ".../Qwen3.8-4B-Q8_0.gguf"
+#   weights_sha256 = "770b780d6754a4954d1caf395c9239eaeb394f15c7a7ea34039883377c93c9c3"
+#   weights_bytes = 4610579744
+
+# 16384 because a retry card carries the compiler's last refusal on top of a
+# full answer budget, and running out of context mid-file is a truncation
+# nothing downstream can see. `slots = 1` because nothing here asks twice at
+# once, and one slot is the whole context rather than a share of it.
+context = 16384
+slots = 1
+threads = 4
+port = 8080
+# How long to wait for the weights to load. The server is NOT started with
+# --no-warmup: that defers the load to the first request, so /health answers
+# in four seconds and the completion then times out -- a server that is up by
+# every check available and cannot answer anything yet.
+warmup_seconds = 300
 
 [floors]
 # A movement inside its floor is not a movement. Prefixes, longest match wins.

@@ -67,18 +67,22 @@ jobs:
           system-out: scaffold-system.txt
 
       # There is no config yet, and `ask` only needs the [author] table -- so
-      # it is handed a minimal one written here rather than a chicken-and-egg.
-      - name: The smallest config that can ask a question
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/ask.json" <<'JSON'
-          {"author": {"provider": "anthropic", "model": "claude-sonnet-5",
-                      "api_key_env": "GOEDEL_INFERENCE_KEY",
-                      "base_url_env": "GOEDEL_INFERENCE_URL",
-                      "attempts": 1, "temperature": 0.2, "max_tokens": 16000,
-                      "shards": 1, "context": []}}
-          JSON
+      # it is handed one built from the same defaults the night uses, rather
+      # than an inline table hardcoded to a hosted provider.
+      - id: askcfg
+        uses: ./.github/actions/config
+        with:
+          command: author
+          out: ${{ runner.temp }}/ask.json
+          max-tokens: "16000"
+          temperature: "0.2"
+
+      # The author, running in this job. See `.github/actions/model`.
+      - name: The author it will ask
+        uses: ./.github/actions/model
+        with:
+          command: start
+          config: ${{ runner.temp }}/ask.json
 
       - id: ask
         continue-on-error: true

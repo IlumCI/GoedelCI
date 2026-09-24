@@ -83,6 +83,15 @@ jobs:
         uses: ./.github/actions/config
         with: { command: load }
 
+      # **The author, running in this job.** No credential: two pinned files
+      # with digests, a llama.cpp server on loopback, and the URL written
+      # into $GITHUB_ENV where `draft` reads it. See `.github/actions/model`.
+      - name: The author it will ask
+        uses: ./.github/actions/model
+        with:
+          command: start
+          config: ${{ steps.cfg.outputs.json }}
+
       - id: phase
         continue-on-error: true
         uses: ./.github/actions/blueprint
