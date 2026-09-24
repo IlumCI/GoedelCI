@@ -120,6 +120,22 @@ runs:
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
+        # **A compiled artifact keyed on mtime and size can outlive the source
+        # it was compiled from.** The two arms of a comparison are built in ONE
+        # workspace with a `git checkout` between them; checkout sets every
+        # file's mtime to now, so two versions of a file written in the same
+        # second with the same byte length are indistinguishable to CPython's
+        # cache validator -- and the candidate arm runs the BASELINE's
+        # bytecode. Observed directly, on two files differing by one character:
+        # both arms reported the same result and the judge would have adopted a
+        # broken candidate on the strength of the baseline's tests.
+        #
+        # Two defences, because either alone leaves a hole. This stops new
+        # bytecode being written; `harness.clean` removes whatever was already
+        # in the checkout, and is the only place a project can say what its own
+        # stale-artifact hazard looks like.
+        ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+
         def shell(cmd, root, timeout):
             """Run one configured command. stdout and stderr are one stream:
             a test runner that prints its failures to stderr and its tally to
@@ -138,7 +154,7 @@ runs:
                 return None
             try:
                 r = subprocess.run(cmd, cwd=root, shell=True, capture_output=True,
-                                   text=True, timeout=timeout)
+                                   text=True, timeout=timeout, env=ENV)
             except subprocess.TimeoutExpired as exc:
                 got = ""
                 for half in (exc.stdout, exc.stderr):
@@ -192,6 +208,16 @@ runs:
             log = []
             attempted = succeeded = 0
             why = ""
+
+            # First, before anything is built or read. A stale artifact is only
+            # dangerous because it is trusted.
+            if h.get("clean"):
+                code, text = shell(h["clean"], root, timeout)
+                log.append("$ %s\n%s" % (h["clean"], text))
+                if code != 0:
+                    return dict(built=False, tested=False, suites=0, claims=0, checks=0,
+                                rails={}, log="\n".join(log),
+                                why="the clean command failed: %s" % h["clean"])
 
             for cmd in h["setup"]:
                 attempted += 1
@@ -309,7 +335,7 @@ runs:
                 (root / "art.bin").write_bytes(b"x" * 100)
                 def cfg(**over):
                     h = {"setup": [], "build": "", "check": "", "test": "true",
-                         "bench": "", "artifact": "", "timeout": 60}
+                         "bench": "", "artifact": "", "timeout": 60, "clean": ""}
                     h.update(D); h.update(over)
                     return {"harness": h}
 
@@ -358,6 +384,16 @@ runs:
                 claim("and a build that hangs is too", r["built"] is False)
                 claim("and the reason says how long it was given",
                       "1s" in r["why"])
+
+                (root / "stale").write_text("x")
+                r = measure(root, cfg(clean="rm -f stale"), "a", 1, False)
+                claim("the clean command runs before anything is built or read",
+                      not (root / "stale").exists())
+                r = measure(root, cfg(clean="exit 1", build="true"), "a", 1, False)
+                claim("and a clean that fails stops the arm rather than being ignored",
+                      r["built"] is False and "clean command failed" in r["why"])
+                claim("bytecode writing is off for everything the harness runs",
+                      ENV.get("PYTHONDONTWRITEBYTECODE") == "1")
 
                 r = measure(root, cfg(setup=["exit 1"], build="true"), "a", 1, False)
                 claim("a setup that fails stops before the build", r["built"] is False)

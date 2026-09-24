@@ -54,121 +54,94 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arm: adopted
+          - arm: pass
             want: adopt
-            body: "return max(values) - min(values)"
-          - arm: refused
+          - arm: fail
             want: refuse
-            # Syntactically fine, so `check` passes and the draft would have
-            # been let through; wrong, so the test fails in the candidate arm.
-            # A drill whose candidate fails to PARSE would only prove that the
-            # fast gate works, which is a different claim.
-            body: "return max(values) + min(values)"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }
 
       - id: cfg
         uses: ./.github/actions/config
         with: { command: load }
 
-      # **The drills exercise the shipped example, and say so.** The candidate
-      # they write is a Python module under `src/`, which is what this
-      # repository's own `goedel.toml` allows. An adopter who has repointed the
-      # masks at their own tree has a machine these drills cannot rehearse, and
-      # a red X there would mean nothing except that the example is gone.
-      #
-      # Run `proof` before you repoint the masks. After that, `ci` and a
-      # `dry_run` night are what tell you the wiring is right.
+      # **The probe comes out of `goedel.toml`, so the drills survive
+      # adoption.** They used to write a Python module under `src/` -- this
+      # repository's own masks -- and skip once an adopter repointed them,
+      # which lost the only test that exercises the seams exactly when the
+      # machine started being used for something. `[proof]` declares two
+      # variants of the same change, and `config` refuses a pair that differs
+      # in anything but what the code does.
       - id: applicable
         shell: bash
         env:
-          CFG: ${{ steps.cfg.outputs.json }}
+          HAVE: ${{ steps.cfg.outputs.proof }}
         run: |
           set -euo pipefail
-          ok=yes
-          python3 -c "
-          import json, sys
-          cfg = json.load(open('$CFG'))
-          sys.exit(0 if 'src/**' in cfg['allow'] and 'feature' in cfg['kinds'] else 1)
-          " || ok=no
-          if [ "$ok" = "no" ]; then
-            echo "::notice::the masks in goedel.toml are not the example's, so these"
-            echo "::notice::drills have nothing to rehearse. That is expected once you"
-            echo "::notice::have adopted the template; ci and a dry_run night cover you."
+          if [ "$HAVE" != "yes" ]; then
+            echo "::notice::goedel.toml declares no [proof] probe, so there is nothing to"
+            echo "::notice::rehearse. Adding one is twenty lines and it is the only test"
+            echo "::notice::that covers the seams between the actions."
           fi
-          echo "run=$ok" >> "$GITHUB_OUTPUT"
+          echo "run=$HAVE" >> "$GITHUB_OUTPUT"
 
       - name: A candidate, as draft would have written one
         id: write
         if: steps.applicable.outputs.run == 'yes'
         shell: bash
         env:
-          BODY: ${{ matrix.body }}
           ARM: ${{ matrix.arm }}
+          CFG: ${{ steps.cfg.outputs.json }}
         run: |
           set -euo pipefail
           git config user.name "proof"; git config user.email "proof@local"
           echo "PARENT=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_ENV"
 
-          mkdir -p src tests
-          # Standalone on purpose: the drill must not depend on anything else
-          # in the example, so that deleting one file of it does not turn a
-          # wiring test into a red X about an import.
-          cat > src/proof_spread.py <<PYEOF
-          """The spread of a sequence: its largest value minus its smallest."""
+          python3 - <<'PYEOF'
+          import json, os, subprocess
+          from pathlib import Path
 
+          cfg = json.loads(Path(os.environ["CFG"]).read_text(encoding="utf-8"))
+          probe = cfg["proof"]
+          files = probe[os.environ["ARM"]]
 
-          def spread(values):
-              if not values:
-                  raise ValueError("an empty sequence has no spread")
-              $BODY
-          PYEOF
-          cat > tests/test_proof_spread.py <<'PYEOF'
-          from src.proof_spread import spread
+          for rel, body in sorted(files.items()):
+              p = Path(rel)
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(body.lstrip("\n"), encoding="utf-8")
 
-
-          def test_the_spread_is_the_distance_between_the_extremes():
-              assert spread([3, 9, 5]) == 6, spread([3, 9, 5])
-
-
-          def test_an_empty_sequence_has_no_spread():
-              try:
-                  spread([])
-              except ValueError:
-                  return
-              raise AssertionError("it answered for an empty sequence")
-          PYEOF
-
+          paths = sorted(files)
           # `add -N` so the new files appear in `git diff` without being
           # staged. The patch a real draft produces comes from exactly this.
-          git add -N src/proof_spread.py tests/test_proof_spread.py
-          git diff -- src/proof_spread.py tests/test_proof_spread.py > /tmp/patch
-          git reset -q
-          rm -f src/proof_spread.py tests/test_proof_spread.py
+          subprocess.run(["git", "add", "-N", "--"] + paths, check=True)
+          patch = subprocess.run(["git", "diff", "--"] + paths, check=True,
+                                 capture_output=True, text=True).stdout
+          subprocess.run(["git", "reset", "-q"], check=True)
+          for rel in paths:
+              Path(rel).unlink(missing_ok=True)
 
-          {
-            echo "[envelope] v2"
-            echo "kind feature"
-            echo "verb create"
-            echo "target src/proof_spread.py"
-            echo "lane model"
-            echo "axis src/proof_spread.py"
-            echo "rung 1"
-            echo "corpus 00000000"
-            echo "parent-tree $(git rev-parse 'HEAD^{tree}')"
-            echo "operator clonal"
-            echo "lineage root"
-            echo "seed 0"
-            echo "witness -"
-            echo "title the spread of a window ($ARM drill)"
-            echo "[patch]"
-            cat /tmp/patch
-            echo "[end]"
-          } > envelope.env
-          point=$(sha256sum envelope.env | cut -d' ' -f1)
-          echo "POINT=$point" >> "$GITHUB_ENV"
-          echo "  point ${point:0:16}"
+          parent = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+          kind = cfg["kinds"][probe["kind"]]
+          head = [
+              "[envelope] v2", "kind " + probe["kind"], "verb " + kind["verb"],
+              "target " + probe["target"], "lane model", "axis " + probe["target"],
+              "rung 1", "corpus 00000000", "parent-tree " + parent,
+              "operator clonal", "lineage root", "seed 0", "witness -",
+              "title the %s drill" % os.environ["ARM"],
+          ]
+          text = "\n".join(head + ["[patch]", patch.rstrip("\n"), "[end]", ""])
+          Path("envelope.env").write_text(text, encoding="utf-8")
+
+          import hashlib
+          point = hashlib.sha256(text.encode("utf-8")).hexdigest()
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              fh.write("POINT=%s\n" % point)
+              fh.write("PROBE_KIND=%s\n" % probe["kind"])
+              fh.write("PROBE_TARGET=%s\n" % probe["target"])
+          print("  %s: %d file(s), point %s" % (os.environ["ARM"], len(paths), point[:16]))
+          PYEOF
 
       # Admission is the gate that runs before a runner is spent, so a drill
       # that skipped it would be proving a path no night takes.
@@ -239,7 +212,8 @@ jobs:
           c=$(git commit-tree "$CAND_TREE" -p HEAD -m "proof: candidate")
           git checkout -qf --detach "$c"
           echo "CAND_REF=$c" >> "$GITHUB_ENV"
-          test -f src/proof_spread.py || { echo "::error::the candidate tree is missing the module"; exit 1; }
+          test -f "$PROBE_TARGET" \
+            || { echo "::error::the candidate tree is missing $PROBE_TARGET"; exit 1; }
 
       - id: cand
         if: steps.applicable.outputs.run == 'yes'
@@ -259,7 +233,7 @@ jobs:
           before: rails-a.txt
           after: rails-b.txt
           claims: "none"
-          kind: feature
+          kind: ${{ env.PROBE_KIND }}
           config: ${{ steps.cfg.outputs.json }}
           seed: ${{ env.POINT }}
 
@@ -307,14 +281,14 @@ jobs:
             seq=1
             utc=${{ env.NOW }}
             point=${{ env.POINT }}
-            kind=feature
+            kind=${{ env.PROBE_KIND }}
             lane=model
             operator=clonal
             lineage=root
             epoch=0
             utility=${{ steps.cfg.outputs.utility }}
             rung=1
-            axis=src/proof_spread.py
+            axis=${{ env.PROBE_TARGET }}
             parent-tree=${{ env.MARKED }}
             candidate-tree=${{ env.CAND_TREE }}
             rail=none
@@ -396,7 +370,7 @@ jobs:
           echo "  a moved tip is stale, and this drill's verdict was $WANT"
 
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: proof-${{ matrix.arm }}
           path: |

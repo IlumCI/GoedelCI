@@ -65,6 +65,9 @@ outputs:
   json:
     description: "the path the whole validated config was written to"
     value: ${{ steps.run.outputs.json }}
+  proof:
+    description: "yes when [proof] declares a probe the drills can rehearse"
+    value: ${{ steps.run.outputs.proof }}
 
 runs:
   using: composite
@@ -198,6 +201,7 @@ runs:
             harness = {
                 "setup": list(h.get("setup", [])),
                 "build": str(h.get("build", "")),
+                "clean": str(h.get("clean", "")),
                 "check": str(h.get("check", "")),
                 "test": str(h.get("test", "")),
                 "bench": str(h.get("bench", "")),
@@ -266,6 +270,53 @@ runs:
             if not any(k["enabled"] for k in kinds.values()):
                 raise ConfigError("[kinds] has no enabled row")
 
+            # **[proof]: the end-to-end drill's probe.** Optional, and a project
+            # without one loses the only test that exercises the seams between
+            # the actions rather than each action on its own. Every bug that
+            # has actually shipped here lived in a seam, so this is worth the
+            # fifteen lines it costs.
+            proof = {}
+            praw = raw.get("proof", {})
+            if praw:
+                kind = str(praw.get("kind", ""))
+                target = str(praw.get("target", ""))
+                if kind not in kinds:
+                    raise ConfigError("[proof] kind %r is not a kind this project has" % kind)
+                if not kinds[kind]["enabled"]:
+                    raise ConfigError("[proof] kind %r is disabled" % kind)
+                if not target:
+                    raise ConfigError("[proof] names no target")
+                if matches(target, evaluator) or not matches(target, allow):
+                    raise ConfigError(
+                        "[proof] target %s is not somewhere the machine may write, so the "
+                        "drill would be rehearsing a path no night can take" % target)
+                good = dict(praw.get("pass", {}))
+                bad = dict(praw.get("fail", {}))
+                if not good or not bad:
+                    raise ConfigError(
+                        "[proof] needs both a `pass` and a `fail` variant: the drill that "
+                        "matters is the refused one, and a refusal with nothing to compare "
+                        "it against proves only that the machine can say yes")
+                if set(good) != set(bad):
+                    raise ConfigError(
+                        "[proof] the two variants write different files (%s); they must "
+                        "differ only in what the code DOES, or the drill is comparing two "
+                        "shapes of change rather than two outcomes"
+                        % ", ".join(sorted(set(good) ^ set(bad))))
+                if target not in good:
+                    raise ConfigError("[proof] target %s is not one of the files it writes"
+                                      % target)
+                for path in good:
+                    if matches(path, evaluator) or not matches(path, allow):
+                        raise ConfigError("[proof] writes %s, which is not writable" % path)
+                if good == bad:
+                    raise ConfigError(
+                        "[proof] the two variants are identical, so one of the two drills "
+                        "is asserting the opposite of what it will observe")
+                proof = {"kind": kind, "target": target,
+                         "pass": {k: str(v) for k, v in good.items()},
+                         "fail": {k: str(v) for k, v in bad.items()}}
+
             floors = {str(k): float(v) for k, v in raw.get("floors", {}).items()}
             for rail, f in floors.items():
                 if f < 0:
@@ -276,7 +327,7 @@ runs:
                 "goal": str(project.get("goal", "loop/goal.txt")),
                 "allow": list(allow), "evaluator": list(evaluator),
                 "harness": harness, "author": author, "judge": judge,
-                "kinds": kinds, "floors": floors,
+                "kinds": kinds, "floors": floors, "proof": proof,
             }
 
         def utility_digest(root, evaluator):
@@ -368,6 +419,29 @@ runs:
             raises("a negative floor is refused: a floor is a magnitude",
                    bad({"floors": {"host.": -0.1}}))
 
+            P = {"kind": "feature", "target": "src/p.py",
+                 "pass": {"src/p.py": "a", "tests/t.py": "x"},
+                 "fail": {"src/p.py": "b", "tests/t.py": "x"}}
+            ALLOW2 = {"allow": ["src/**", "tests/**"], "evaluator": [".github/**"]}
+            def pf(over):
+                d = json.loads(json.dumps(base)); d["project"] = ALLOW2
+                d["proof"] = dict(P); d["proof"].update(over)
+                return lambda: load(d, ".")
+            claim("a well-formed proof probe is admitted", bool(pf({})()["proof"]))
+            claim("and a config without one simply has none", load(base, ".")["proof"] == {})
+            raises("a proof aimed at a kind this project lacks is refused",
+                   pf({"kind": "mystery"}))
+            raises("a proof aimed outside the writable paths is refused",
+                   pf({"target": "README.md"}))
+            raises("a proof with only one variant is refused",
+                   pf({"fail": {}}))
+            raises("a proof whose variants write different files is refused",
+                   pf({"fail": {"src/p.py": "b"}}))
+            raises("a proof whose two variants are identical is refused",
+                   pf({"fail": {"src/p.py": "a", "tests/t.py": "x"}}))
+            raises("a proof whose target is not among its own files is refused",
+                   pf({"target": "src/other.py"}))
+
             import tempfile
             with tempfile.TemporaryDirectory() as td:
                 r = Path(td); (r / ".github").mkdir()
@@ -418,6 +492,7 @@ runs:
             out("shards", str(cfg["author"]["shards"]))
             out("shard_matrix", json.dumps(list(range(cfg["author"]["shards"]))))
             out("json", str(dest))
+            out("proof", "yes" if cfg["proof"] else "no")
             export("GOEDEL_CONFIG", str(dest))
             export("GOEDEL_NAME", cfg["name"])
             export("GOEDEL_UTILITY", digest)

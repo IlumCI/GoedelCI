@@ -122,11 +122,16 @@ runs:
                 raise PairError("git %s: %s" % (" ".join(a), (r.stderr or r.stdout).strip()))
             return r.stdout.strip()
 
+        # See the long note in harness/action.yml: this checks out a different
+        # tree between every reading, which is exactly the situation where a
+        # cache keyed on mtime and size hands one arm the other's artifact.
+        ENV = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+
         def bench(cmd, timeout):
             """One reading. A round that will not run is not half a round."""
             try:
                 r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                   timeout=timeout)
+                                   timeout=timeout, env=ENV)
             except subprocess.TimeoutExpired:
                 return None, "the benchmark did not finish inside %ds" % timeout
             if r.returncode:
@@ -187,6 +192,8 @@ runs:
                 except PairError:
                     claim("a file that is not a rail file is refused", True)
 
+            claim("bytecode writing is off for every reading it takes",
+                  ENV.get("PYTHONDONTWRITEBYTECODE") == "1")
             found, why = bench("echo 'host.q 41.2 ms lower'; echo noise", 10)
             claim("a reading is the rail lines and nothing else",
                   found == {"host.q": (41.2, "ms", "lower")})
@@ -215,6 +222,7 @@ runs:
 
         cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
         cmd = cfg["harness"]["bench"]
+        clean = cfg["harness"].get("clean", "")
         timeout = cfg["harness"]["timeout"]
         rounds = max(1, int(os.environ.get("ROUNDS", "3") or "3"))
         base_ref, cand_ref = os.environ["BASE_REF"], os.environ["CAND_REF"]
@@ -231,6 +239,8 @@ runs:
             for r in range(1, rounds + 1):
                 for ref, into in ((base_ref, before), (cand_ref, after)):
                     git("checkout", "-qf", "--detach", ref)
+                    if clean:
+                        subprocess.run(clean, shell=True, capture_output=True, env=ENV)
                     found, err = bench(cmd, timeout)
                     if found is None:
                         why = "round %d: %s" % (r, err)

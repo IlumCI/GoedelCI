@@ -46,7 +46,7 @@ jobs:
       declares: ${{ steps.proposal.outputs.declares }}
       moves: ${{ steps.verdict.outputs.moves }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: loop/main
           fetch-depth: 0
@@ -236,7 +236,7 @@ jobs:
           epoch-len: ${{ steps.cfg.outputs.epoch-len }}
 
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: boundary-${{ github.run_id }}
           path: |
@@ -259,7 +259,7 @@ jobs:
       PROPOSAL: ${{ inputs.proposal }}
       EVALUATOR_TOKEN: ${{ secrets.EVALUATOR_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: loop/main
           fetch-depth: 0

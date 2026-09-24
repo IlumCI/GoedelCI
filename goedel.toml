@@ -41,6 +41,19 @@ check = "python3 -m compileall -q src tests"
 # step simply has nothing here, and `cost.warnings` is not measured.
 build = ""
 
+# **What to delete before measuring, so that nothing compiled from the other
+# arm survives into this one.** The two arms are built in one workspace with a
+# `git checkout` between them, and a cache keyed on modification time and file
+# size cannot tell two same-length edits written in the same second apart -- so
+# the candidate runs the baseline's bytecode and both arms report the same
+# result. Observed here, on files differing by one character.
+#
+# The machine also runs everything with PYTHONDONTWRITEBYTECODE, which stops
+# NEW caches; this removes whatever a checkout brought with it. Point it at
+# your own language's equivalent: __pycache__, .tsbuildinfo, incremental
+# compiler state, anything the build trusts without re-reading the source.
+clean = "find . -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null; true"
+
 # **The only required line in this file.** Every kind's J2 is a count that may
 # not fall, and nothing can count without this.
 test = "python3 tools/testrun.py tests"
@@ -135,6 +148,75 @@ context = []
 # the floor can be what a floor should be: a little above the noise that
 # remains.
 "bench." = 0.05
+
+# --- the drill's probe ------------------------------------------------------
+#
+# `proof` runs a whole night against a candidate written by hand -- no model,
+# no pushes -- and it is the only test that exercises the SEAMS between the
+# actions rather than each action on its own. Every bug that has actually
+# shipped here lived in a seam, so keeping this working after you adopt the
+# template is worth the twenty lines it costs.
+#
+# Two variants, identical in shape and different in what the code DOES. The
+# `pass` one must make your test suite gain a claim; the `fail` one must make
+# it lose one or fail outright. The refused drill is the one that matters: it
+# is what checks that a refusal builds on the live tree rather than filing the
+# code it just refused.
+#
+# Delete this section and `proof` skips with a notice rather than failing.
+
+[proof]
+kind = "feature"
+target = "src/_goedel_probe.py"
+
+[proof.pass]
+"src/_goedel_probe.py" = """
+def spread(values):
+    if not values:
+        raise ValueError("an empty sequence has no spread")
+    return max(values) - min(values)
+"""
+"tests/test_goedel_probe.py" = """
+from src._goedel_probe import spread
+
+
+def test_the_spread_is_the_distance_between_the_extremes():
+    assert spread([3, 9, 5]) == 6, spread([3, 9, 5])
+
+
+def test_an_empty_sequence_has_no_spread():
+    try:
+        spread([])
+    except ValueError:
+        return
+    raise AssertionError("it answered for an empty sequence")
+"""
+
+[proof.fail]
+# Syntactically fine, so the fast check passes and a real draft would have been
+# let through. Wrong, so the tests refuse it. A probe that fails to PARSE would
+# only prove that `harness.check` works, which is a different claim.
+"src/_goedel_probe.py" = """
+def spread(values):
+    if not values:
+        raise ValueError("an empty sequence has no spread")
+    return max(values) + min(values)
+"""
+"tests/test_goedel_probe.py" = """
+from src._goedel_probe import spread
+
+
+def test_the_spread_is_the_distance_between_the_extremes():
+    assert spread([3, 9, 5]) == 6, spread([3, 9, 5])
+
+
+def test_an_empty_sequence_has_no_spread():
+    try:
+        spread([])
+    except ValueError:
+        return
+    raise AssertionError("it answered for an empty sequence")
+"""
 
 # --- the kinds ------------------------------------------------------------
 #

@@ -80,6 +80,10 @@ runs:
         ITEM = re.compile(r"^(\s*)-(\s|$)")
         BLOCK = re.compile(r":\s*[|>][+-]?\d*\s*$")
         USES = re.compile(r"^\s*(?:-\s+)?uses:\s*['\"]?(\./[^\s'\"]+)")
+        # Anything not beginning with `./` is somebody else's code, running
+        # with this repository's token.
+        FOREIGN = re.compile(r"^\s*(?:-\s+)?uses:\s*['\"]?(?!\./)([^\s'\"]+)")
+        PINNED = re.compile(r"@[0-9a-f]{40}$")
         # `(?<![<])` so that `# <<< ask` -- a marker comment, not a redirection
         # -- does not read as `<< ask`.
         HEREDOC = re.compile(r"(?<![<])<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s*$")
@@ -115,7 +119,7 @@ runs:
             literals inside its selftest, and reported them as unresolved
             local actions.
             """
-            bad, uses = [], []
+            bad, uses, foreign = [], [], []
             lines = text.split("\n")
             # (indent, {keys seen}) for each open mapping, outermost first.
             stack = [(-1, set())]
@@ -127,6 +131,10 @@ runs:
                 u = USES.match(line)
                 if u:
                     uses.append(u.group(1))
+                else:
+                    f = FOREIGN.match(line)
+                    if f:
+                        foreign.append((i + 1, f.group(1)))
                 if "\t" in line[: len(line) - len(line.lstrip())]:
                     bad.append("line %d: a tab in the indentation; YAML forbids it" % (i + 1))
                     i += 1; continue
@@ -206,6 +214,13 @@ runs:
                         "outright." % (i + 1, key))
                 seen.add(key)
                 i += 1
+            for n, ref in foreign:
+                if not PINNED.search(ref):
+                    bad.append(
+                        "line %d: %s is not pinned to a commit. A tag is a moving pointer "
+                        "somebody else controls, and this one runs with a token that can "
+                        "write to your branches. Pin it: owner/repo@<40 hex> # v4"
+                        % (n, ref))
             return bad, uses
 
         def has_selftest(text):
@@ -346,7 +361,18 @@ runs:
 
             claim("a local uses is found", us("      - uses: ./.github/actions/cert\n")
                   == ["./.github/actions/cert"])
-            claim("a marketplace one is not", us("      - uses: actions/checkout@v4\n") == [])
+            claim("a marketplace one is not", us("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n") == [])
+            claim("an unpinned third-party action is caught",
+                  len(lo("f", "steps:\n  - uses: actions/checkout@v4\n")) == 1)
+            claim("and the message says a tag is somebody else's moving pointer",
+                  "moving pointer" in lo("f", "steps:\n  - uses: actions/checkout@v4\n")[0])
+            claim("a pinned one is fine",
+                  lo("f", "steps:\n  - uses: actions/checkout@" + "a"*40 + " # v4\n") == [])
+            claim("and a local action needs no pin, being this repository's own",
+                  lo("f", "steps:\n  - uses: ./.github/actions/cert\n") == [])
+            claim("a reusable workflow of our own needs no pin either",
+                  lo("f", "jobs:\n  j:\n    uses: ./.github/workflows/x.yml\n") == [])
+
             claim("a reusable workflow is used by file, not by directory",
                   us("    uses: ./.github/workflows/loop-judge.yml\n")
                   == ["./.github/workflows/loop-judge.yml"])

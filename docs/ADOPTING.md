@@ -49,10 +49,31 @@ cannot slip through by not existing yet.
 [harness]
 check = "…"     # seconds. a draft is re-asked with its output on failure
 build = "…"     # optional
+clean = "…"     # optional, and read the warning below
 test  = "…"     # required
 bench = "…"     # optional
 artifact = "…"  # optional; its size becomes cost.artifact_bytes
 ```
+
+**`clean` is the one that will bite you if you skip it.** Both arms of a
+comparison are built in one workspace with a `git checkout` between them.
+A cache keyed on modification time and file size — CPython's `__pycache__`,
+a TypeScript `.tsbuildinfo`, incremental compiler state — cannot tell two
+same-length edits written in the same second apart, so the candidate arm runs
+the *baseline's* artifact and both arms report the same result. That was live
+here and it was found by two probe files differing by one character.
+
+The machine runs everything with `PYTHONDONTWRITEBYTECODE=1`, which stops new
+Python caches being written. `clean` removes whatever the checkout brought with
+it, and is the only place your project can say what its own version of this
+hazard looks like:
+
+| project | `clean` |
+|---|---|
+| Python | `find . -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null; true` |
+| TypeScript | `rm -f tsconfig.tsbuildinfo` |
+| Rust | *(not needed — cargo fingerprints on content)* |
+| Go | *(not needed — the build cache is content-addressed)* |
 
 `check` is the single highest-leverage line in the file. It runs up to six times
 inside one draw and its refusals are what the next attempt is shown, so it is
@@ -103,6 +124,37 @@ Known-good starting points:
 If your runner prints no total, leave `suites_re` matching nothing. `suites` will
 be `0` in both arms, which never falls and therefore never vetoes — the claim
 count carries the invariant on its own.
+
+## 4b. Declare the drill's probe
+
+`proof` runs a whole night against a candidate written by hand — no model, no
+pushes — and it is the only test that covers the *seams* between the actions
+rather than each action alone. Every bug that has actually shipped here lived
+in a seam, so it is worth keeping after you adopt the template.
+
+```toml
+[proof]
+kind = "feature"
+target = "src/_goedel_probe.py"
+
+[proof.pass]
+"src/_goedel_probe.py" = """…code that works…"""
+"tests/test_goedel_probe.py" = """…a test of it…"""
+
+[proof.fail]
+"src/_goedel_probe.py" = """…the same code, wrong…"""
+"tests/test_goedel_probe.py" = """…the same test…"""
+```
+
+The two variants must write the same files and differ only in what the code
+*does*; `config` refuses a pair that does not. The `fail` one should be
+syntactically valid — a probe that will not parse only proves that
+`harness.check` works, which is a different claim.
+
+The refused drill is the one that matters. It is what checks that a refusal
+builds on the live tree rather than filing the code it has just refused.
+
+Delete the section and `proof` skips with a notice instead of failing.
 
 ## 5. Write the goal
 
@@ -205,6 +257,7 @@ every night forever.
 | `ci` fails with "nothing counted a single claim" | `claims_re` matches nothing |
 | every night refuses with "adds no claim" | the drafter is not writing tests — put an example in `[kinds.*] prompt` |
 | every night is `unstable` | your benchmark is noisier than its floor; run `floors` |
+| both arms report identical results | a stale artifact survived the checkout — set `[harness] clean` |
 | nothing is ever proposed | `loop/goal.txt` is too vague to decompose, or every milestone is retired |
 | `config` refuses to load | an `allow` mask admits an `evaluator` path; the error names it |
 | the audit PR step fails alone | the Actions setting in step 7 |
