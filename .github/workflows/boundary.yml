@@ -137,35 +137,26 @@ jobs:
 
       # --- Sane: the patched evaluator still proves itself ----------------
       #
-      # Every claim suite, with the change applied. A proposal that breaks a
-      # check does not get to argue that the check was wrong -- that argument
-      # is a separate proposal, made against the check.
-      - uses: ./.github/actions/template-check
-        with: { command: check }
-      - uses: ./.github/actions/cert
-        with: { command: selftest }
-      - uses: ./.github/actions/ledger
-        with: { command: selftest }
-      - uses: ./.github/actions/config
-        with: { command: selftest }
-      - uses: ./.github/actions/envelope
-        with: { command: selftest }
-      - uses: ./.github/actions/rails
-        with: { command: selftest }
-      - uses: ./.github/actions/archive
-        with: { command: selftest }
-      - uses: ./.github/actions/ladder
-        with: { command: selftest }
-      - uses: ./.github/actions/draft
-        with: { command: selftest }
-      - uses: ./.github/actions/harness
-        with: { command: selftest }
-      - uses: ./.github/actions/budget
-        with: { command: selftest }
-      - uses: ./.github/actions/adopt-decide
-        with: { command: selftest }
-      - uses: ./.github/actions/boundary-judge
-        with: { command: selftest }
+      # **Not `uses:`, and the reason is the whole correctness of this gate.**
+      # The runner prepares local `uses:` actions when the JOB starts, before
+      # any step has run -- so a `uses: ./.github/actions/rails` after the
+      # `git apply` above may run rails as it was BEFORE the patch. The gate
+      # would then be checking the evaluator this proposal is replacing, and
+      # reading green either way.
+      #
+      # `selftest-all` reads each action.yml off disk at the moment it runs, so
+      # what it checks is what is in the workspace now. `ci` still runs the
+      # suites the ordinary way, because that path is the one a night takes and
+      # is worth exercising; here the ordinary way would be wrong.
+      #
+      # A proposal that breaks a check does not get to argue that the check was
+      # wrong. That argument is a separate proposal, made against the check.
+      - name: Every claim the PATCHED evaluator makes, from the tree on disk
+        uses: ./.github/actions/selftest-all
+        with:
+          command: run
+          root: "."
+          structure: "true"
 
       # A floors change must cite a measurement, and the measurement must be
       # one this runner class produced. A number somebody typed is what the

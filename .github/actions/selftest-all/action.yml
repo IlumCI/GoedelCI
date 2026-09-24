@@ -1,0 +1,218 @@
+name: goedel-selftest-all
+description: >-
+  Run every action's claim suite by reading the files off disk, so that a tree
+  which was patched during this job is the tree that gets checked.
+
+# **This exists for one gate and it is a correctness fix, not a convenience.**
+#
+# `ci` runs the suites the ordinary way, one `uses:` step per action, and that
+# is right: it exercises the real invocation path, which is what a night
+# actually takes. `boundary` cannot use that path. It applies a proposed change
+# to the evaluator IN THE MIDDLE of a job and then asks whether the patched
+# evaluator still holds together -- and the runner prepares local `uses:`
+# actions when the job starts, before any step has run. A `uses:` step after a
+# `git apply` may therefore run the action as it was BEFORE the patch, which
+# would make the Sane gate a check on the thing it is not checking, reading
+# green either way.
+#
+# So this reads each `action.yml` at the moment it runs, pulls out the program
+# inside its `run:` block, and executes it with `COMMAND=selftest`. That is
+# what the runner does, minus the caching that is the problem.
+#
+# **It also enforces the shape the rest of the template assumes.** Every action
+# here is a single `python3 - <<'PYEOF'` heredoc inside one `run: |` block, and
+# YAML ends a block scalar at the first line indented less than its first line.
+# An action whose program is written flush-left is truncated at that point --
+# silently, with no error from GitHub. This refuses such a file rather than
+# running half of it, which is the same claim `template-check` makes statically
+# and worth making again where the program is actually about to be run.
+
+inputs:
+  command:
+    description: "run | selftest"
+    required: false
+    default: run
+  root:
+    description: "the tree whose actions to check"
+    required: false
+    default: "."
+  skip:
+    description: "action names to leave out, space separated"
+    required: false
+    default: ""
+  structure:
+    description: >-
+      also run template-check's own `check` from disk. Same reason the suites
+      are run this way: a `uses:` of template-check after a patch may run the
+      copy that was prepared before it, and a proposal that breaks the
+      structural check is exactly the kind that must not pass.
+    required: false
+    default: "false"
+
+outputs:
+  checked:
+    description: "how many suites ran"
+    value: ${{ steps.run.outputs.checked }}
+  failed:
+    description: "how many did not hold"
+    value: ${{ steps.run.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        SKIP: ${{ inputs.skip }}
+        STRUCTURE: ${{ inputs.structure }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import os, re, subprocess, sys, tempfile
+        from pathlib import Path
+
+        BLOCK = re.compile(r"python3 - <<'PYEOF'\n(.*?)\n[ \t]*PYEOF", re.S)
+
+        class ShapeError(Exception): pass
+
+        def out(k, v):
+            v = str(v).replace("\r", " ").replace("\n", " ")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def program(path):
+            """The action's inline program, dedented the way YAML dedents it."""
+            text = Path(path).read_text(encoding="utf-8")
+            blocks = BLOCK.findall(text)
+            if not blocks:
+                raise ShapeError("no `python3 - <<'PYEOF'` program to run")
+            if len(blocks) > 1:
+                raise ShapeError(
+                    "%d programs in one action; this runs the suite and cannot tell which "
+                    "of them is it" % len(blocks))
+            lines = blocks[0].split("\n")
+            indent = len(lines[0]) - len(lines[0].lstrip())
+            for n, line in enumerate(lines, 1):
+                if line.strip() and len(line) - len(line.lstrip()) < indent:
+                    raise ShapeError(
+                        "line %d is indented %d where the block is %d. YAML ends a block "
+                        "scalar at the first line indented less than its first line, so "
+                        "GitHub loads a TRUNCATED program here."
+                        % (n, len(line) - len(line.lstrip()), indent))
+            return "\n".join(l[indent:] if len(l) >= indent else l for l in lines)
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+            def raises(s, text):
+                with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as f:
+                    f.write(text); path = f.name
+                try:
+                    program(path)
+                except ShapeError:
+                    return claim(s, True)
+                except Exception as exc:
+                    return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            good = "    run: |\n      python3 - <<'PYEOF'\n      print(1)\n      PYEOF\n"
+            with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as f:
+                f.write(good); path = f.name
+            claim("a program is extracted and dedented to column zero",
+                  program(path) == "print(1)")
+            raises("an action with no program is refused",
+                   "    run: |\n      echo hello\n")
+            raises("an action with two programs is refused",
+                   good + good)
+            raises("a program with a flush-left line is refused, not half-run",
+                   "    run: |\n      python3 - <<'PYEOF'\n      x = 1\nflush = 2\n      PYEOF\n")
+            claim("a blank line inside a program is not a flush-left line",
+                  program(_write("    run: |\n      python3 - <<'PYEOF'\n      a = 1\n\n"
+                                 "      b = 2\n      PYEOF\n")) == "a = 1\n\nb = 2")
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        def _write(text):
+            with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as f:
+                f.write(text)
+                return f.name
+
+        # ------------------------------------------------------------------
+
+        if os.environ.get("COMMAND", "run").strip() == "selftest":
+            sys.exit(selftest())
+
+        root = Path(os.environ.get("ROOT", ".") or ".")
+        skip = set(os.environ.get("SKIP", "").split())
+        actions = sorted(d for d in (root / ".github/actions").iterdir() if d.is_dir())
+        if not actions:
+            print("::error::no actions under %s/.github/actions" % root)
+            sys.exit(1)
+
+        checked = failed = 0
+        for d in actions:
+            if d.name in skip or d.name == "selftest-all":
+                continue
+            path = d / "action.yml"
+            if not path.is_file():
+                path = d / "action.yaml"
+            if not path.is_file():
+                print("::error::%s has no action.yml" % d.name)
+                failed += 1
+                continue
+            print("[%s]" % d.name)
+            try:
+                body = program(path)
+            except ShapeError as exc:
+                print("::error::%s: %s" % (d.name, exc))
+                failed += 1
+                continue
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+                f.write(body)
+                prog = f.name
+            env = dict(os.environ, COMMAND="selftest")
+            # Its own output file: an action's selftest writes outputs, and
+            # letting a dozen of them append to this step's would set whatever
+            # the last one happened to write.
+            with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as f:
+                env["GITHUB_OUTPUT"] = f.name
+            env["GITHUB_ENV"] = env["GITHUB_OUTPUT"] + ".env"
+            Path(env["GITHUB_ENV"]).touch()
+            r = subprocess.run([sys.executable, prog], env=env)
+            checked += 1
+            if r.returncode:
+                print("::error::%s: its claims do not hold" % d.name)
+                failed += 1
+
+        if os.environ.get("STRUCTURE", "false") == "true":
+            print("[template-check: the structure of the patched tree]")
+            tc = root / ".github/actions/template-check/action.yml"
+            try:
+                body = program(tc)
+            except ShapeError as exc:
+                print("::error::template-check: %s" % exc)
+                failed += 1
+            else:
+                with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+                    f.write(body)
+                    prog = f.name
+                with tempfile.NamedTemporaryFile("w", suffix=".out", delete=False) as f:
+                    o = f.name
+                Path(o + ".env").touch()
+                env = dict(os.environ, COMMAND="check", ROOT=str(root),
+                           GITHUB_OUTPUT=o, GITHUB_ENV=o + ".env")
+                if subprocess.run([sys.executable, prog], env=env).returncode:
+                    failed += 1
+                checked += 1
+
+        print("\n%d suite(s) run, %d did not hold" % (checked, failed))
+        out("checked", str(checked))
+        out("failed", str(failed))
+        sys.exit(1 if failed else 0)
+        PYEOF

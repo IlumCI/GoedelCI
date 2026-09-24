@@ -9,7 +9,7 @@ files a signed record of what it decided and why. Improvements accumulate on a
 branch you merge when you feel like it. Nothing reaches your default branch
 without you.
 
-It is fourteen composite actions and six workflows. There is no package to
+It is fifteen composite actions and six workflows. There is no package to
 install, no service to run, and nothing outside `.github/` except one config
 file. It runs on GitHub's free hosted runners.
 
@@ -124,6 +124,7 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `adopt-decide` | which tree a commit is built on, as a pure function |
 | `boundary-judge` | Epoch, Moves, Honest, Remembers |
 | `template-check` | the machine checked against itself |
+| `selftest-all` | runs every suite from disk, for the one gate that needs it |
 
 Every action answers `command: selftest` and `ci` runs all thirteen. An action
 that cannot prove itself is refused by `template-check`, because that is how a
