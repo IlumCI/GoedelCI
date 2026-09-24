@@ -44,6 +44,11 @@ evaluator = [".github/**", "goedel.toml", "loop/**", "tools/**", "bench/**"]
 # criterion = [".github/**", "goedel.toml", "tools/**", "bench/**"]
 
 [harness]
+# What has to happen before anything else can run: installing dependencies,
+# fetching a toolchain, generating code. Every job that builds or drafts runs
+# these first. The example needs nothing, so it is empty.
+setup = []
+
 # The fast gate a draft is held to between attempts. Seconds, not minutes: it
 # runs up to six times inside one draw, and its refusals are what the next
 # attempt is shown. A typecheck, a lint, a `cargo check` -- whatever answers

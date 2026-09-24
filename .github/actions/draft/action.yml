@@ -409,6 +409,36 @@ runs:
                 raise DraftError("git %s: %s" % (" ".join(a), (r.stderr or r.stdout).strip()))
             return r.stdout
 
+        def stage(root, files):
+            """Write `files` into the checkout. Answers how to take them out.
+
+            Separated from the draw so that the taking-out can be claimed: it
+            is the one part of this action that can leave somebody else's
+            workspace changed, and it runs in a `finally` where a mistake is
+            silent.
+            """
+            paths = [rel for rel, _ in files]
+            existed = {rel: (Path(root) / rel).is_file() for rel in paths}
+            for rel, body in files:
+                p = Path(root) / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(body, encoding="utf-8")
+            return paths, existed
+
+        def unstage(root, paths, existed):
+            """Precisely, and in both directions.
+
+            A file that was there goes back to what git has; one that was not
+            is removed. `git checkout -- .` would also revert anything else in
+            the workspace, and this action is not entitled to decide that.
+            """
+            git(root, "reset", "-q", "--", *paths, check=False)
+            for rel in paths:
+                if existed[rel]:
+                    git(root, "checkout", "-q", "--", rel, check=False)
+                else:
+                    (Path(root) / rel).unlink(missing_ok=True)
+
         def run_check(root, command, timeout):
             """The project's fast gate, over one attempt's staged tree.
 
@@ -434,6 +464,17 @@ runs:
             es = entries(root)
             ev = evidence_for(es, rung, lineage)
             kind = cfg["kinds"][rung["kind"]]
+
+            # **Whatever the project needs installed before its own check can
+            # run.** The draft job is a fresh checkout and the check is the
+            # only feedback a draw gets; without this it fails on a missing
+            # dependency every time, six times, and reports that as the model
+            # being unable to write the milestone.
+            for cmd in cfg["harness"].get("setup", []):
+                ok, err = run_check(root, cmd, cfg["harness"]["timeout"])
+                if not ok:
+                    raise NoAnswer("setup failed, so no draw could be checked: %s"
+                                   % err[:300])
             is_witness = kind["j1"] == "witness"
             last_error, attempts = "", 0
 
@@ -464,37 +505,32 @@ runs:
                                   "you answered with one.")
                     continue
 
-                # Stage it in a scratch worktree so `check` sees a real tree and
-                # the repository the night is running in is never mutated.
-                with tempfile.TemporaryDirectory() as td:
-                    stage = Path(td) / "w"
-                    git(root, "worktree", "add", "--detach", "-q", str(stage), "HEAD")
-                    try:
-                        for rel, body in files:
-                            p = stage / rel
-                            p.parent.mkdir(parents=True, exist_ok=True)
-                            p.write_text(body, encoding="utf-8")
-                        ok, err = run_check(stage, cfg["harness"]["check"],
-                                            cfg["harness"]["timeout"])
-                        if not ok:
-                            last_error = err[-4000:]
-                            continue
-                        witness_paths = ([p for p, _ in files if p != rung["target"]]
-                                         if is_witness else [])
-                        patch = git(stage, "diff", "--", *[p for p, _ in files
-                                                           if p not in witness_paths])
-                        wpatch = git(stage, "diff", "--", *witness_paths) if witness_paths else ""
-                        # A file the tree did not have shows in `diff` only once
-                        # it is tracked. Adding intent is enough and stages
-                        # nothing.
-                        if not patch.strip():
-                            git(stage, "add", "-N", "--", *[p for p, _ in files])
-                            patch = git(stage, "diff", "--", *[p for p, _ in files
-                                                               if p not in witness_paths])
-                            if witness_paths:
-                                wpatch = git(stage, "diff", "--", *witness_paths)
-                    finally:
-                        git(root, "worktree", "remove", "--force", str(stage), check=False)
+                # **Written into the checkout itself, and taken back out.**
+                # A scratch `git worktree` was cleaner and did not work: a
+                # worktree holds the tracked files and nothing else, so
+                # `node_modules`, a virtualenv, a `target/` -- everything the
+                # project's own check needs and does not commit -- is absent,
+                # and every attempt failed on a missing dependency rather than
+                # on the code. The workspace a draft job runs in is disposable
+                # and the paths written are known exactly, so restoring them is
+                # deterministic and costs nothing.
+                paths, existed = stage(root, files)
+                try:
+                    ok, err = run_check(root, cfg["harness"]["check"],
+                                        cfg["harness"]["timeout"])
+                    if not ok:
+                        last_error = err[-4000:]
+                        continue
+                    witness_paths = ([p for p, _ in files if p != rung["target"]]
+                                     if is_witness else [])
+                    fix_paths = [p for p in paths if p not in witness_paths]
+                    # A file the tree did not have shows in `diff` only once it
+                    # is tracked. Adding intent is enough and stages nothing.
+                    git(root, "add", "-N", "--", *paths)
+                    patch = git(root, "diff", "--", *fix_paths)
+                    wpatch = git(root, "diff", "--", *witness_paths) if witness_paths else ""
+                finally:
+                    unstage(root, paths, existed)
 
                 if not patch.strip():
                     last_error = "Your answer is byte-identical to the file that is already there."
@@ -661,6 +697,46 @@ runs:
             claim("but a refusal from this same lineage is not cross-lineage",
                   evidence_for([e("a"*16, 1, "root", "refuse", ladder="p"*64)],
                                rung2, "a"*16)["operator"] != "cross-lineage")
+
+            # -- staging, against a real repository ------------------------
+            with tf.TemporaryDirectory() as td:
+                r = Path(td)
+                def g(*a):
+                    return subprocess.run(["git"] + list(a), cwd=r, capture_output=True,
+                                          text=True, check=True).stdout.strip()
+                g("init", "-q", "-b", "main")
+                g("config", "user.email", "t@t"); g("config", "user.name", "t")
+                (r / "src").mkdir()
+                (r / "src/there.py").write_text("original\n")
+                (r / "untracked.txt").write_text("somebody else's\n")
+                g("add", "src/there.py"); g("commit", "-qm", "base")
+
+                files = [("src/there.py", "changed\n"), ("src/new.py", "created\n")]
+                paths, existed = stage(r, files)
+                claim("staging writes an edit into the checkout",
+                      (r / "src/there.py").read_text() == "changed\n")
+                claim("and creates a file that was not there",
+                      (r / "src/new.py").read_text() == "created\n")
+                claim("and records which of the two each path was",
+                      existed == {"src/there.py": True, "src/new.py": False})
+
+                g("add", "-N", "--", *paths)
+                patch = g("diff", "--", *paths)
+                claim("the patch is taken before anything is put back",
+                      "changed" in patch and "created" in patch)
+
+                unstage(r, paths, existed)
+                claim("an edited file goes back to what git has",
+                      (r / "src/there.py").read_text() == "original\n")
+                claim("a created file is removed", not (r / "src/new.py").exists())
+                claim("and nothing else in the workspace is touched",
+                      (r / "untracked.txt").read_text() == "somebody else's\n",
+                      "git checkout -- . would have left this alone too, but it would "
+                      "also have reverted every other edit in the tree")
+                claim("the index is left clean",
+                      g("status", "--porcelain") == "?? untracked.txt")
+                claim("unstaging twice is not an error",
+                      (unstage(r, paths, existed), True)[1])
 
             # -- the envelope ---------------------------------------------
             env = envelope(rung, CFG, {"operator": "clonal", "text": ""}, "",

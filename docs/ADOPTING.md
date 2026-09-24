@@ -80,6 +80,11 @@ inside one draw and its refusals are what the next attempt is shown, so it is
 the only feedback loop the drafter has. Make it fast and make it right about
 whether code is broken.
 
+`setup` is what has to happen before `check` can run at all — `npm ci`, `pip
+install -e .`, whatever installs your dependencies. The drafting job is a fresh
+checkout, so without it every attempt fails on a missing dependency, six times,
+and the run reports that as the model being unable to write the milestone.
+
 | project | `check` | `test` |
 |---|---|---|
 | Python | `ruff check src && python -m mypy src` | `pytest -q` |
@@ -254,6 +259,7 @@ every night forever.
 
 | symptom | cause |
 |---|---|
+| every draw fails on a missing module or binary | `[harness] setup` is empty and the check needs dependencies |
 | `ci` fails with "nothing counted a single claim" | `claims_re` matches nothing |
 | every night refuses with "adds no claim" | the drafter is not writing tests — put an example in `[kinds.*] prompt` |
 | every night is `unstable` | your benchmark is noisier than its floor; run `floors` |
