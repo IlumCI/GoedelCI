@@ -443,6 +443,7 @@ jobs:
           survey: survey.txt
           card-out: ladder-card.txt
           system-out: ladder-system.txt
+          grammar-out: ladder.gbnf
 
       - id: reply
         if: steps.card.outputs.have != 'yes'
@@ -453,6 +454,7 @@ jobs:
           config: ${{ steps.cfg.outputs.json }}
           system: ladder-system.txt
           user: ladder-card.txt
+          grammar: ladder.gbnf
           out: ladder-reply.txt
 
       # **A missing credential is not a quiet night.** Without it nothing can

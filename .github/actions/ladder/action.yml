@@ -84,6 +84,10 @@ inputs:
     description: "for card: where to write the question"
     required: false
     default: ladder-card.txt
+  grammar-out:
+    description: "for card: where to write the GBNF the reply must take"
+    required: false
+    default: ""
   system-out:
     description: "for card: where to write the rules the answer is held to"
     required: false
@@ -132,6 +136,7 @@ runs:
         SURVEY: ${{ inputs.survey }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
+        GRAMMAR_OUT: ${{ inputs.grammar-out }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -259,6 +264,40 @@ runs:
             return None
 
         # -- proposing ---------------------------------------------------
+
+        # **The shape, as a grammar rather than as a request.**
+
+        #
+
+        # Measured against the runner's own author: asked for a milestone in
+
+        # the block below, a 4B wrote six thousand characters of `src/window.py`
+
+        # -- it pattern-matched the coding task and never saw the meta-task --
+
+        # and `admit` refused it for carrying no fenced rung. That is a balk,
+
+        # and three balks retire a milestone the model was never allowed to
+
+        # propose. Constrained, the same question answered correctly in 22
+
+        # seconds rather than four and a half minutes, because the grammar
+
+        # stops generation at the closing sentinel instead of letting it write
+
+        # an essay around the answer.
+
+        #
+
+        # The SYSTEM text stays and says the same thing in prose: a hosted
+
+        # provider is sent no grammar, and the two must not disagree.
+
+        GRAMMAR = (
+            'root ::= "<<<RUNG>>>\\nkind: " line "\\ntarget: " line '
+            '"\\ntitle: " line "\\nwitness: " line "\\n<<<END>>>"\n'
+            'line ::= [^\\n]+\n'
+        )
 
         SYSTEM = __import__("textwrap").dedent("""\
             You decompose a project's goal into the single next milestone that would
@@ -645,6 +684,21 @@ runs:
                   "empty" in progress([], [], G, 3))
             claim("and a populated one as a table",
                   "retired" in progress([r1], [cert("refuse", r1["point"])] * 3, G, 3))
+            # -- the grammar, which is the shape as a constraint ----------
+            claim("the grammar names the same four fields the parser requires",
+                  all(("\\n%s: " % k) in GRAMMAR or ('"<<<RUNG>>>\\n%s: "' % k) in GRAMMAR
+                      for k in DECLARED),
+                  GRAMMAR)
+            claim("and it opens and closes on the sentinels admit looks for",
+                  "<<<RUNG>>>" in GRAMMAR and "<<<END>>>" in GRAMMAR)
+            claim("a field is one line, so a milestone cannot run into the next",
+                  "line ::= [^" in GRAMMAR and GRAMMAR.rstrip().endswith("]+"))
+            claim("the block the grammar forces is one admit reads",
+                  read_proposal("<<<RUNG>>>\nkind: feature\ntarget: src/a.py\n"
+                                "title: t\nwitness: w\n<<<END>>>")["witness"] == "w",
+                  "a grammar that produced something the parser refuses would be "
+                  "two contracts disagreeing, and the model would obey the wrong one")
+
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 
@@ -733,6 +787,8 @@ runs:
                     card(cfg, root, rungs, entries, body, limit, goal, criteria, survey),
                     encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                if os.environ.get("GRAMMAR_OUT", "").strip():
+                    Path(os.environ["GRAMMAR_OUT"]).write_text(GRAMMAR, encoding="utf-8")
                 print("  asked for the next milestone")
                 out("have", "no"); out("why", "a question was written")
             elif cmd == "admit":
