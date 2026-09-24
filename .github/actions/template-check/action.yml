@@ -29,9 +29,16 @@ description: >-
 #               at the exact point where the rest of the file stops existing.
 #
 #   provable    every action under .github/actions/ accepts `command:
-#               selftest`. An action that cannot prove itself is one nothing
-#               downstream should trust, and it is how a check gets deleted:
+#               selftest`, AND `ci` actually runs every one of them. An action
+#               that cannot prove itself is one nothing downstream should
+#               trust; an action whose suite exists and is never run is worse,
+#               because it reads as covered. Both are how a check gets deleted:
 #               not by argument, by nobody noticing it went.
+#
+#               `ci` lists the suites one line each rather than looping,
+#               because a composite action cannot be called in a loop from
+#               YAML. That list is therefore a thing that can silently fall
+#               behind the directory, which is what this compares.
 #
 #   resolvable  every `uses: ./.github/actions/X` names a directory that is
 #               there. A local `uses:` that does not resolve fails at run time,
@@ -284,6 +291,22 @@ runs:
                         "%s has no selftest command. An action that cannot prove itself is "
                         "one nothing downstream should trust." % name)
 
+            ci = root / ".github/workflows/ci.yml"
+            if ci.is_file():
+                text = ci.read_text(encoding="utf-8")
+                ran = set(re.findall(
+                    r"uses:\s*\./\.github/actions/([a-z0-9-]+)\s*\n\s*with:\s*\{\s*"
+                    r"command:\s*selftest\s*\}", text))
+                ran |= set(re.findall(
+                    r"uses:\s*\./\.github/actions/([a-z0-9-]+)\s*\n(?:\s+\w[\w-]*:.*\n)*?"
+                    r"\s+command:\s*selftest\s*\n", text))
+                missing = sorted({n for n, _ in actions} - ran)
+                if missing:
+                    problems.append(
+                        "ci does not run the claim suite of: %s. The suite exists and "
+                        "nothing runs it, which reads as covered and is not."
+                        % ", ".join(missing))
+
             talkers = [name for name, p in actions
                        if NETWORK.search(p.read_text(encoding="utf-8"))]
             if len(talkers) > 1:
@@ -401,6 +424,19 @@ runs:
             claim("the marker's own comment line is not part of the block",
                   block("# >>> ask -- draft says this\nBODY\n# <<< ask", "ask")
                   == block("# >>> ask -- ladder says that\nBODY\n# <<< ask", "ask"))
+
+            claim("a ci list that covers every action is fine",
+                  not [n for n in ("cert", "ledger")
+                       if n not in set(re.findall(
+                           r"uses:\s*\./\.github/actions/([a-z0-9-]+)\s*\n\s*with:\s*\{\s*"
+                           r"command:\s*selftest\s*\}",
+                           "      - uses: ./.github/actions/cert\n        with: { command: selftest }\n"
+                           "      - uses: ./.github/actions/ledger\n        with: { command: selftest }\n"))])
+            claim("and one that misses an action is noticed",
+                  "ledger" not in set(re.findall(
+                      r"uses:\s*\./\.github/actions/([a-z0-9-]+)\s*\n\s*with:\s*\{\s*"
+                      r"command:\s*selftest\s*\}",
+                      "      - uses: ./.github/actions/cert\n        with: { command: selftest }\n")))
 
             claim("an action without a selftest is noticed",
                   not has_selftest("inputs:\n  command:\n    description: run\n"))
