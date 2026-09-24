@@ -382,6 +382,23 @@ runs:
                               "arms being two different artifacts")
             return rows
 
+        def spread_table(rails):
+            """One artifact read N times: how far apart the readings are.
+
+            Every sample is of the same tree, so the spread is the machine and
+            the day and nothing else. The p95 is taken over |deviation from the
+            median|, which is what a declared floor has to clear.
+            """
+            rows = ["rail\tn\tmedian\tp95_rel"]
+            for name in sorted(rails):
+                r = rails[name]
+                med = r.value
+                devs = sorted(abs(rel(med, x)) for x in r.samples)
+                p95 = devs[min(len(devs) - 1, int(0.95 * len(devs)))]
+                rows.append("%s\t%d\t%s\t%.6f"
+                            % (name, len(r.samples), num(med), p95))
+            return "\n".join(rows) + "\n"
+
         def table(rows, seed):
             head = "[compare] %d rail(s), seed %s" % (len(rows), (seed or "-")[:12])
             return "\n".join([head] + [r.line() for r in rows]) + "\n"
@@ -513,6 +530,25 @@ runs:
             claim("a regression survives any FDR level, because a diluted veto is not one",
                   v(compare(R("x.a", [100, 100.2, 99.8], "n"), R("x.a", [140, 140.2, 139.8], "n"),
                             zero, fdr=0.0001, seed="t"), "x.a") == WORSE)
+            # --- spread: the evidence floors.yml files ---------------------
+            sp = spread_table(R("b.t", [100, 104, 96, 100], "ms"))
+            lines = sp.strip().split("\n")
+            claim("spread answers a header and one row per rail",
+                  lines[0].split("\t") == ["rail", "n", "median", "p95_rel"]
+                  and len(lines) == 2, lines)
+            claim("and the row carries the sample count it was taken over",
+                  lines[1].split("\t")[1] == "4", lines[1])
+            claim("a spread over identical readings is zero",
+                  float(spread_table(R("b.t", [7, 7, 7], "ms"))
+                        .strip().split("\n")[1].split("\t")[3]) == 0.0)
+            claim("and a wider set of readings answers a wider spread",
+                  float(spread_table(R("b.t", [90, 100, 110], "ms"))
+                        .strip().split("\n")[1].split("\t")[3])
+                  > float(spread_table(R("b.t", [99, 100, 101], "ms"))
+                          .strip().split("\n")[1].split("\t")[3]))
+            claim("it ends in a newline, because it is written to a file and not "
+                  "only printed", sp.endswith("\n"))
+
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 
@@ -591,14 +627,13 @@ runs:
 
             if cmd == "spread":
                 # The between-run spread of one artifact, for evidence-floors.
-                rails = read(os.environ["BEFORE"])
-                print("rail\tn\tmedian\tp95_rel")
-                for name in sorted(rails):
-                    r = rails[name]
-                    med = r.value
-                    devs = sorted(abs(rel(med, s)) for s in r.samples)
-                    p95 = devs[min(len(devs) - 1, int(0.95 * len(devs)))]
-                    print("%s\t%d\t%s\t%.6f" % (name, len(r.samples), num(med), p95))
+                # Written to OUT and THEN echoed, the same way `compare`,
+                # `judge` and `anchors` do it. It used to print only: the
+                # table appeared in the log, looked right, and `floors.yml`
+                # died two steps later reading a file nothing had written.
+                text = spread_table(read(os.environ["BEFORE"]))
+                Path(os.environ["OUT"]).write_text(text, encoding="utf-8")
+                sys.stdout.write(text)
                 sys.exit(0)
 
             kind = cfg.get("kinds", {}).get(os.environ.get("KIND", "").strip(), {})

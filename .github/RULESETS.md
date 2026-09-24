@@ -113,8 +113,10 @@ Two further things are worth setting before you walk away:
 `directions` opens competing pull requests carrying that label, and
 `decided.yml` closes the losers when one is merged. Two things make it work:
 
-- **Create the label** (`gh label create direction`) or the first run fails
-  when it tries to apply one.
+- **The label makes itself.** `directions` creates it if it is not there,
+  before it pushes anything, because `gh pr create --label` fails on a missing
+  label *after* the branch exists -- which leaves orphan branches and half a
+  set of alternatives. Nothing to do here.
 - **Do not add `direction` to any auto-merge rule.** The promotion job already
   refuses to touch them — it merges only the audit pull request, selected by
   head branch — but a repository-level automerge rule would go around that and

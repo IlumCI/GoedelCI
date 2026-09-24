@@ -53,6 +53,10 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # Labels are the issues API, not the pull requests one, and this job
+      # creates the `direction` label rather than requiring somebody to have
+      # made it first.
+      issues: write
     steps:
       # Not `ref: loop/main`. A repository that has never run a night does
       # not have that branch, and the checkout answers "A branch or tag with
@@ -166,6 +170,17 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           default=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
           git fetch origin "$default"
+          # Before the loop, not inside it. `gh pr create --label` fails on a
+          # label that does not exist, and it fails AFTER the branch has been
+          # pushed -- so a missing label left orphan branches and a half-opened
+          # set of alternatives, which is the state this workflow is least able
+          # to recover from. Asked rather than forced, so a label somebody
+          # recoloured keeps its colour.
+          if ! gh label list --json name --jq '.[].name' | grep -qxF direction; then
+            gh label create direction --color BFD4F2 \
+              --description "a complete alternative plan; merging one closes the rest"
+            echo "  created the direction label"
+          fi
           opened=0
           for s in $SLUGS; do
             title=$(cat "directions/$s/title.txt")

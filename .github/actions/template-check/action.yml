@@ -146,7 +146,12 @@ runs:
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
-        def loadable(path, text):
+        # The opening of a GitHub expression, assembled rather than written,
+        # because this program may not contain one -- which is the rule it is
+        # here to enforce. Writing it out is how this check first failed.
+        EXPR = "$" + "{" + "{"
+
+        def loadable(path, text, is_action=False):
             """Everything a structural read can say about one file.
 
             Returns (problems, uses). The `uses:` values are collected HERE,
@@ -158,6 +163,7 @@ runs:
             """
             bad, uses, foreign = [], [], []
             lines = text.split("\n")
+            key_of = {}
             # (indent, {keys seen}) for each open mapping, outermost first.
             stack = [(-1, set())]
             i = 0
@@ -177,6 +183,8 @@ runs:
                     i += 1; continue
 
                 if BLOCK.search(line):
+                    opener = KEY.match(line)
+                    opener = opener.group(3) if opener else ""
                     # Skip the scalar. YAML ends it at the first non-empty line
                     # indented less than its first line, and that is legal --
                     # it is how `run:` gives way to the next key. What is NOT
@@ -253,6 +261,18 @@ runs:
                                 "string whose continuation lines sit at column zero is "
                                 "the usual cause; write the text to a file and pass "
                                 "--body-file." % (j + 1, t[:60], i + 1))
+                    if is_action and opener == "run":
+                        for n, b in enumerate(body):
+                            if EXPR in b:
+                                bad.append(
+                                    "line %d: a GitHub expression inside an action's "
+                                    "run: block. The runner SUBSTITUTES it before bash "
+                                    "ever sees the program -- and a composite action "
+                                    "has no matrix or event context, so the whole "
+                                    "manifest fails to load with 'Unexpected symbol'. "
+                                    "Pass the value in through env: instead; a mention "
+                                    "of one in a comment has to be assembled."
+                                    % (i + 1 + n + 1))
                     i = j; continue
 
                 m = KEY.match(line)
@@ -310,8 +330,8 @@ runs:
         def rendered_names(text):
             """(workflow name, [job name patterns]) read structurally.
 
-            `${{ ... }}` becomes `*`, so a matrix-derived name matches what it
-            could render as without this having to expand the matrix.
+            A GitHub expression becomes `*`, so a matrix-derived name matches
+            what it could render as without this having to expand the matrix.
             """
             wf, jobs, in_jobs, job_indent = None, [], False, None
             pend, prop_indent = None, None
@@ -394,6 +414,7 @@ runs:
                 print("::warning::no yaml module here; the structural pass is "
                       "the only reader")
 
+            action_paths = {p for _, p in actions}
             for p in files:
                 if yaml is not None:
                     try:
@@ -402,7 +423,8 @@ runs:
                         problems.append(
                             "%s: a real parser cannot load this file: %s"
                             % (p.relative_to(root), str(e).replace("\n", " ")))
-                bad, uses = loadable(p, p.read_text(encoding="utf-8"))
+                bad, uses = loadable(p, p.read_text(encoding="utf-8"),
+                                     is_action=p in action_paths)
                 for b in bad:
                     problems.append("%s: %s" % (p.relative_to(root), b))
                 for u in uses:
@@ -588,11 +610,29 @@ runs:
             claim("a block that runs to the end of the file is fine",
                   lo("f", "steps:\n  - run: |\n      x\n      y\n") == [])
 
+            la = lambda s: loadable("f", s, is_action=True)[0]
+            expr = "steps:\n  - run: |\n      echo " + EXPR + " inputs.x }" + "}\n"
+            claim("a GitHub expression in an action's run: block is caught",
+                  len(la(expr)) == 1, la(expr))
+            claim("and the message says the runner substitutes it first",
+                  "SUBSTITUTES" in la(expr)[0])
+            claim("the same line in a workflow is legal and is not flagged",
+                  lo("f", expr) == [])
+            claim("an action's run: block with no expression is fine",
+                  la("steps:\n  - run: |\n      echo hello\n") == [])
+            claim("and one in an action's env:, which is where it belongs, is fine",
+                  la("steps:\n  - env:\n      X: " + EXPR + " inputs.x }" + "}\n"
+                     "    run: |\n      echo \"$X\"\n") == [])
+
             claim("a marker comment is not a heredoc",
                   lo("f", "steps:\n  - run: |\n      # <<< ask\n      x\n") == [])
 
+            # Assembled rather than written out: a literal GitHub expression
+            # in this program is substituted by the runner before bash sees
+            # it, which is the rule two checks below.
+            ARM = EXPR + " matrix.arm }" + "}"
             wfx = ("name: proof\njobs:\n  ledger:\n    runs-on: x\n  drill:\n"
-                   "    name: drill (${{ matrix.arm }})\n    runs-on: x\n")
+                   "    name: drill (" + ARM + ")\n    runs-on: x\n")
             claim("a workflow's name and its jobs are read out of it",
                   rendered_names(wfx) == ("proof", ["ledger", "drill (*)"]),
                   rendered_names(wfx))
