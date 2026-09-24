@@ -280,11 +280,14 @@ jobs:
           git add -A
           git commit -q -m "boundary: $DECLARES ($name)"
           git push origin "boundary/$name"
+          printf '%s\n' \
+            "A change to the evaluator itself, cross-judged at an epoch boundary." \
+            "" \
+            "The run's log carries Sane, Moves, Honest and Remembers; it moves on $MOVES archived anchor(s) and disagrees with none of their ground truth. Merging is the second human decision." \
+            "" \
+            "Nothing in this branch has been through the ordinary judge, because the ordinary judge is what it changes." \
+            > "$RUNNER_TEMP/boundary-body.md"
           GH_TOKEN="$EVALUATOR_TOKEN" gh pr create \
             --head "boundary/$name" --base "$DEFAULT" --label evaluator \
             --title "boundary: $DECLARES ($name)" \
-            --body "A change to the evaluator itself, cross-judged at an epoch boundary.
-
-The run's log carries Sane, Moves, Honest and Remembers; it moves on $MOVES archived anchor(s) and disagrees with none of their ground truth. Merging is the second human decision.
-
-Nothing in this branch has been through the ordinary judge, because the ordinary judge is what it changes."
+            --body-file "$RUNNER_TEMP/boundary-body.md"

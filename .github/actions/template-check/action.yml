@@ -14,9 +14,15 @@ description: >-
 #
 # It survived a YAML sweep that printed `ok`, because a permissive loader keeps
 # the LAST of a duplicate pair -- agreeing with a file the real parser rejects,
-# and keeping the wrong half of it. So this does not use a YAML library. It
-# reads the files the way the failure mode requires: structurally, and refusing
-# what a library would quietly resolve.
+# and keeping the wrong half of it. So a library is not the check here. The
+# structural pass is, and it refuses what a library would quietly resolve.
+#
+# A library is still a second opinion worth having, because it is the same
+# parser class GitHub uses and it says out loud that a file cannot be loaded
+# at all. So `check` runs `yaml.safe_load` over every file as well, where the
+# runner has the module, and adds what it says to the same list. The two
+# readers are independent and neither is allowed to excuse the other: a file
+# has to satisfy both.
 #
 # The four checks:
 #
@@ -27,6 +33,22 @@ description: >-
 #               indented less than its first line. A prompt written flush-left
 #               inside one truncates the program GitHub loads -- with no error,
 #               at the exact point where the rest of the file stops existing.
+#
+#               A dedent is also how `run:` legally gives way to the next key,
+#               so the dedent alone says nothing -- but the line it lands on
+#               must be a key, a list item, a comment or a document marker.
+#               Prose at column zero is none of those, and that is exactly
+#               what a multi-line shell string looks like when its
+#               continuation lines were never indented:
+#
+#                   gh pr comment "$n" --body "one was merged instead.
+#
+#                   Nothing is wrong with this one."
+#
+#               Two workflows shipped in that shape. Both produced a zero-job
+#               run on every push, named after the path, with a scanning error
+#               about a line two hundred down the file. The heredoc rule did
+#               not see them because there was no heredoc.
 #
 #   provable    every action under .github/actions/ accepts `command:
 #               selftest`, AND `ci` actually runs every one of them. An action
@@ -192,6 +214,37 @@ runs:
                                 "run: block. YAML ended the block at line %d, so the shell "
                                 "is handed a TRUNCATED program and GitHub reports nothing "
                                 "wrong." % (i + 1 + n + 1, term, j + 1))
+                    # And what ENDED the block has to be something YAML can go
+                    # on to read. A dedent is how `run:` legally gives way to
+                    # the next key, so the dedent itself says nothing -- but
+                    # the line it lands on must be a key, a list item, a
+                    # comment or a document marker. Prose at column zero is
+                    # none of those, and that is precisely the shape of a
+                    # multi-line shell string whose continuation lines were
+                    # never indented:
+                    #
+                    #     gh pr comment "$n" --body "one was merged instead.
+                    #
+                    #     Nothing is wrong with this one."     <- column zero
+                    #
+                    # The scalar ends at the blank line, the quote never
+                    # closes, and GitHub answers with a scanning error about a
+                    # line hundreds down the file. The heredoc rule above does
+                    # not see it because there is no heredoc.
+                    if j < len(lines):
+                        endr = lines[j]
+                        t = endr.strip()
+                        if not (KEY.match(endr) or ITEM.match(endr)
+                                or t.startswith("#") or t.startswith("---")
+                                or t.startswith("...")):
+                            bad.append(
+                                "line %d: %r is at a lower indent than the block scalar "
+                                "opened at line %d, so YAML ENDS THE BLOCK HERE -- and "
+                                "this line is not a key, a list item or a comment, so the "
+                                "file stops being loadable at all. A multi-line shell "
+                                "string whose continuation lines sit at column zero is "
+                                "the usual cause; write the text to a file and pass "
+                                "--body-file." % (j + 1, t[:60], i + 1))
                     i = j; continue
 
                 m = KEY.match(line)
@@ -261,7 +314,26 @@ runs:
             n_actions = len(actions)
             files += [p for _, p in actions]
 
+            # A second opinion, where the runner has one. It agrees with a
+            # duplicate key and with a schema this action rejects, so it is
+            # not the check -- but it is the same parser class GitHub uses,
+            # and it says out loud that a file cannot be loaded at all. When
+            # the two disagree the structural pass is the one that refuses.
+            try:
+                import yaml  # noqa: F401
+            except ImportError:
+                yaml = None
+                print("::warning::no yaml module here; the structural pass is "
+                      "the only reader")
+
             for p in files:
+                if yaml is not None:
+                    try:
+                        yaml.safe_load(p.read_text(encoding="utf-8"))
+                    except Exception as e:
+                        problems.append(
+                            "%s: a real parser cannot load this file: %s"
+                            % (p.relative_to(root), str(e).replace("\n", " ")))
                 bad, uses = loadable(p, p.read_text(encoding="utf-8"))
                 for b in bad:
                     problems.append("%s: %s" % (p.relative_to(root), b))
@@ -380,7 +452,10 @@ runs:
                      "prompt at column zero\n\"\"\"\n      PY\n")
             claim("a line at column zero inside a block ends it, and the heredoc "
                   "terminator is stranded",
-                  len(lo("f", flush)) == 1)
+                  any("TRUNCATED" in b for b in lo("f", flush)))
+            claim("and the flush-left line is reported in its own right, because "
+                  "it breaks the file whether or not a heredoc was open",
+                  any("ENDS THE BLOCK HERE" in b for b in lo("f", flush)))
 
             claim("a local uses is found", us("      - uses: ./.github/actions/cert\n")
                   == ["./.github/actions/cert"])
@@ -406,6 +481,22 @@ runs:
             claim("a dotted local path survives being resolved",
                   ("./.github/actions/cert")[2:] == ".github/actions/cert",
                   "lstrip('./') would have eaten the leading dot of .github")
+            prose = ('steps:\n  - run: |\n      gh pr comment --body "one won.\n'
+                     '\n'
+                     'Nothing is wrong with this one."\n')
+            claim("a flush-left continuation of a shell string is caught",
+                  len(lo("f", prose)) == 1, lo("f", prose))
+            claim("and the message says YAML ends the block there",
+                  "ENDS THE BLOCK HERE" in lo("f", prose)[0])
+            claim("a block that gives way to a sibling key is still fine",
+                  lo("f", "steps:\n  - run: |\n      x\n    name: y\n") == [])
+            claim("a block that gives way to the next list item is fine",
+                  lo("f", "steps:\n  - run: |\n      x\n  - run: y\n") == [])
+            claim("a block that gives way to a comment is fine",
+                  lo("f", "steps:\n  - run: |\n      x\n# a note\njobs: {}\n") == [])
+            claim("a block that runs to the end of the file is fine",
+                  lo("f", "steps:\n  - run: |\n      x\n      y\n") == [])
+
             claim("a marker comment is not a heredoc",
                   lo("f", "steps:\n  - run: |\n      # <<< ask\n      x\n") == [])
 

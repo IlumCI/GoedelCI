@@ -59,13 +59,17 @@ jobs:
         run: |
           set -euo pipefail
           closed=0
+          won_url=$(gh pr view "$WON" --json url --jq .url)
           for n in $(gh pr list --label direction --state open --json number --jq '.[].number'); do
             if [ "$n" = "$WON" ]; then continue; fi
-            gh pr comment "$n" --body "Closed because [#$WON]($(gh pr view "$WON" --json url --jq .url)) was merged instead: **$TITLE**.
-
-Nothing is wrong with this one. It was an alternative, and one alternative was taken. The branch is left in place and this body is the record of the option that was not chosen.
-
-The next set of directions is proposed once the new plan is finished."
+            printf '%s\n' \
+              "Closed because [#$WON]($won_url) was merged instead: **$TITLE**." \
+              "" \
+              "Nothing is wrong with this one. It was an alternative, and one alternative was taken. The branch is left in place and this body is the record of the option that was not chosen." \
+              "" \
+              "The next set of directions is proposed once the new plan is finished." \
+              > "$RUNNER_TEMP/closed-body.md"
+            gh pr comment "$n" --body-file "$RUNNER_TEMP/closed-body.md"
             gh pr close "$n"
             closed=$((closed + 1))
             echo "  closed #$n"
