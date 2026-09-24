@@ -30,6 +30,19 @@ allow = ["src/**", "tests/**"]
 # thing that COUNTS the tests is not.
 evaluator = [".github/**", "goedel.toml", "loop/**", "tools/**", "bench/**"]
 
+# **What the judge IS, as opposed to what the machine may not write to.** Every
+# certificate carries a digest of these files, and `ledger fsck` requires every
+# entry in one epoch to carry the same one -- that is what makes "these two
+# verdicts came from the same machine" checkable rather than assumed.
+#
+# It defaults to `evaluator` with the record removed, which is almost always
+# what you want, so this line is here to be read rather than edited. The record
+# has to be in `evaluator` (the machine must not rewrite its own history) and
+# must NOT be in `criterion` (it changes every night, so a criterion covering
+# it would make every entry in an epoch disagree about which judge decided it).
+#
+# criterion = [".github/**", "goedel.toml", "tools/**", "bench/**"]
+
 [harness]
 # The fast gate a draft is held to between attempts. Seconds, not minutes: it
 # runs up to six times inside one draw, and its refusals are what the next

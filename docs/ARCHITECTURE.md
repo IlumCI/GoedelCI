@@ -121,7 +121,10 @@ it, and checks what the *directory* claims about itself:
 - every `lineage` names an earlier entry that was **adopted** — a tree that was
   never adopted is not a state anything could have been built from;
 - entries within one epoch carry one `utility` digest, epochs advance by
-  exactly one, and only at a multiple of `epoch_len`;
+  exactly one, and only at a multiple of `epoch_len`. The digest covers the
+  `criterion` masks — the judge — and deliberately not the record, which
+  changes every night and would otherwise make every entry in an epoch
+  disagree about which judge decided it;
 - every tried marker hashes to the point it is named for.
 
 Per-field validity is delegated to `cert check-dir`, so the field table exists

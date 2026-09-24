@@ -47,6 +47,152 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # --- the claims no single night can make -------------------------------
+  #
+  # The epoch rules are claims about a SEQUENCE of certificates: that entries
+  # within one epoch agree about which judge decided them, that the epoch
+  # advances by exactly one, and that it does so only at a boundary. No night
+  # can check any of those, because each night writes one entry. So this files
+  # a whole run of them the way `adopt` does and asks `fsck`.
+  #
+  # It earns its place: the digest a certificate carried was computed over the
+  # masks that say what the machine may not WRITE, which include the record --
+  # so it changed every night, every entry in an epoch disagreed, and the
+  # second night the loop ever had would have turned the branch red with a
+  # corrupt ledger. Nothing else here could have found that.
+  ledger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: File a run of nights, across three epochs
+        shell: bash
+        env:
+          EPOCH_LEN: "4"
+          NIGHTS: "10"
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import hashlib, os
+          from pathlib import Path
+
+          FIELDS = ("version seq utc point kind lane operator lineage epoch utility rung "
+                    "axis ladder parent-tree candidate-tree rail corpus alpha-k bar fdr "
+                    "minutes half level trials queries suites claims checks witness moved "
+                    "effect interval q why verdict runner").split()
+
+          length = int(os.environ["EPOCH_LEN"])
+          nights = int(os.environ["NIGHTS"])
+          root = Path("proof-ledger")
+          entries = root / "loop/ledger/entries"
+          entries.mkdir(parents=True)
+
+          utility, lineage, tree = "b" * 64, "root", "c" * 40
+
+          def file_one(n, **over):
+              epoch = n // length
+              f = dict(version="2", seq=str(n + 1), utc="2026-09-%02dT00:00:00Z" % (n + 2),
+                       point=hashlib.sha256(b"p%d" % n).hexdigest(), kind="feature",
+                       lane="model", operator="clonal", lineage=lineage, epoch=str(epoch),
+                       utility=utility, rung="1", axis="src/a.py", ladder="-",
+                       rail="none", corpus="0123abcd", bar="-", fdr="-", minutes="30",
+                       half="extend", level="0", trials="3", queries="0", suites="-",
+                       checks="-", witness="-", moved="-", effect="-", interval="-",
+                       q="-", why="a night", runner="1/1")
+              f["parent-tree"] = tree
+              f["alpha-k"] = "0"
+              f.update(over)
+              text = "\n".join("%s %s" % (k, f[k]) for k in FIELDS) + "\n"
+              name = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+              (entries / (name + ".cert")).write_text(text, encoding="utf-8")
+              return name, f
+
+          for i in range(nights):
+              n = len(list(entries.glob("*.cert")))
+              # The evaluator may change ONLY at a boundary. Everywhere else in
+              # this machine that is enforced; here it is exercised.
+              if n and n % length == 0:
+                  utility = hashlib.sha256(b"judge-%d" % (n // length)).hexdigest()
+              adopt = i % 3 != 0
+              cand = hashlib.sha256(b"t%d" % i).hexdigest()[:40] if adopt else "-"
+              name, f = file_one(n, verdict="adopt" if adopt else "refuse",
+                                 claims="6/7" if adopt else "6/6",
+                                 **{"candidate-tree": cand})
+              if adopt:
+                  lineage, tree = name, cand
+          print("  %d certificate(s) filed across %d epoch(s)"
+                % (nights, (nights - 1) // length + 1))
+          PYEOF
+
+      - uses: ./.github/actions/cert
+        with:
+          command: check-dir
+          dir: proof-ledger/loop/ledger/entries
+
+      - name: And the record holds together
+        uses: ./.github/actions/ledger
+        with:
+          command: fsck
+          root: proof-ledger
+          epoch-len: "4"
+
+      - uses: ./.github/actions/archive
+        with:
+          command: report
+          root: proof-ledger
+
+      # **The negative, because a gate that has never refused is not known to
+      # be one.** Moving a single entry's digest inside its epoch is exactly
+      # the shape the real bug had, and fsck must refuse it by name.
+      - name: A judge that changed mid-epoch is refused
+        shell: bash
+        run: |
+          set -euo pipefail
+          # **A REFUSED entry in the first epoch, and the choice is not
+          # incidental.** Editing an entry changes its digest, so it has to be
+          # renamed -- and renaming an ADOPTED one dangles the lineage of
+          # everything descended from it, so fsck refuses for that instead and
+          # the drill passes without ever reaching the rule it is about. A
+          # refusal is never anybody's lineage parent, so moving its digest
+          # leaves exactly one thing wrong with the ledger.
+          d=proof-ledger/loop/ledger/entries
+          f=$(grep -l '^epoch 0$' "$d"/*.cert | xargs grep -l '^verdict refuse$' | head -1)
+          test -n "$f" || { echo "::error::the fixture filed no refusal in epoch 0"; exit 1; }
+          sed -i "s/^utility .*/utility $(printf 'e%.0s' $(seq 64))/" "$f"
+          mv "$f" "$d/$(sha256sum "$f" | cut -c1-16).cert"
+          echo "  $(basename "$f") now claims a different judge, inside epoch 0"
+
+      - id: refused
+        continue-on-error: true
+        uses: ./.github/actions/ledger
+        with:
+          command: fsck
+          root: proof-ledger
+          epoch-len: "4"
+
+      - name: It must have refused, and for the right reason
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.refused.outcome }}
+          REASON: ${{ steps.refused.outputs.why }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" != "failure" ]; then
+            echo "::error::fsck accepted a ledger whose judge changed inside an epoch."
+            echo "::error::That is the invariant the whole epoch mechanism rests on, and"
+            echo "::error::a gate that has never refused is not known to be one."
+            exit 1
+          fi
+          # And for the right reason. A refusal that fired on some other rule
+          # would leave this one untested while reading green, which is the
+          # failure mode a negative drill is supposed to not have.
+          if ! printf '%s' "$REASON" | grep -q 'different evaluators'; then
+            echo "::error::fsck refused, but not for the epoch rule: $REASON"
+            exit 1
+          fi
+          echo "  fsck refused it by name, which is what makes the epoch rules real"
+
   drill:
     runs-on: ubuntu-latest
     timeout-minutes: 30

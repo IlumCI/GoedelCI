@@ -499,7 +499,7 @@ jobs:
     permissions:
       contents: write
     outputs:
-      have: ${{ steps.pick.outputs.have }}
+      have: ${{ steps.derive.outcome == 'success' && steps.pick.outputs.have || 'no' }}
       point: ${{ steps.pick.outputs.point }}
       baseline: ${{ steps.refs.outputs.baseline }}
       candidate: ${{ steps.push.outputs.candidate }}
@@ -616,17 +616,45 @@ jobs:
           echo "baseline=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "parent=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
 
+      # **A patch that will not apply is a balk, not a dead job.** The drafter
+      # held it to the project's fast check, not to `git apply`, so a patch can
+      # be well-formed code and still not land -- and a red job here files no
+      # certificate, leaves the milestone unmoved, and offers the same rung
+      # again tomorrow. The marker is already committed, so the point is spent
+      # either way; what a balk buys is that the milestone eventually retires.
       - id: derive
         if: steps.pick.outputs.have == 'yes'
+        continue-on-error: true
         uses: ./.github/actions/envelope
         with:
           command: derive
           file: envelope.env
           parent: ${{ steps.refs.outputs.parent }}
 
+      - name: A candidate that will not apply is refused here
+        if: steps.pick.outputs.have == 'yes' && steps.derive.outcome == 'failure'
+        uses: ./.github/actions/ladder
+        with:
+          command: balk
+          config: ${{ steps.cfg.outputs.json }}
+          why: the drafted patch does not apply to the tree it was written against
+
+      - name: And the night stops there
+        if: steps.pick.outputs.have == 'yes' && steps.derive.outcome == 'failure'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain loop/ladder)" ]; then
+            git add loop/ladder
+            git commit -q -m "loop: the drafted patch would not apply"
+            git push origin HEAD:refs/heads/loop/main
+          fi
+          echo "have=no" >> "$GITHUB_OUTPUT"
+          echo "::notice::the candidate would not apply; filed as a balk"
+
       - id: push
         name: Push it where the judge can reach it
-        if: steps.pick.outputs.have == 'yes'
+        if: steps.pick.outputs.have == 'yes' && steps.derive.outcome == 'success'
         shell: bash
         env:
           POINT: ${{ steps.pick.outputs.point }}
@@ -714,6 +742,10 @@ jobs:
           BASE: ${{ steps.decide.outputs.base }}
           STALE: ${{ steps.decide.outputs.stale }}
           POINT: ${{ needs.stage.outputs.point }}
+          # Named here rather than relied on from $GITHUB_ENV: an unset name in
+          # a bash arithmetic expansion is zero, and `n / 0` ends the step with
+          # a division error in the middle of the one job that writes history.
+          EPOCH_LEN: ${{ steps.cfg.outputs.epoch-len }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -726,12 +758,22 @@ jobs:
             sed -i "s/^verdict .*/verdict stale/" "$cert"
             echo "::notice::the tip moved mid-judge; filed as stale"
           fi
-          # seq is re-derived under the lock, where it is authoritative.
+          # **seq AND epoch are re-derived under the lock, where they are
+          # authoritative.** The judge stamped both at the start of the trial,
+          # and the night may have filed entries since -- `follow` records a
+          # supersession when main overrode an adoption, and `plan` records a
+          # restore when the clade moved. Two entries is enough to carry the
+          # count across an epoch boundary, and an entry whose epoch disagrees
+          # with its position is one `ledger fsck` refuses outright: the branch
+          # goes red with a corrupt record and the night's work is unmergeable.
           n=0
           if [ -d loop/ledger/entries ]; then
             n=$(find loop/ledger/entries -name '*.cert' | wc -l)
           fi
           sed -i "s/^seq .*/seq $(( n + 1 ))/" "$cert"
+          test "${EPOCH_LEN:-0}" -gt 0 \
+            || { echo "::error::no epoch length; the config step did not run"; exit 1; }
+          sed -i "s|^epoch .*|epoch $(( n / EPOCH_LEN ))|" "$cert"
           name=$(sha256sum "$cert" | cut -c1-16)
           blob=$(git hash-object -w "$cert")
           # Pure plumbing: the commit's tree is built in an index, so the

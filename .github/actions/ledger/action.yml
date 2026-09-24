@@ -61,6 +61,12 @@ outputs:
   tip:
     description: "the name of the newest adopted entry, or `root`"
     value: ${{ steps.run.outputs.tip }}
+  why:
+    description: >-
+      when fsck refuses, which claim it refused on. A caller that only knows
+      THAT the record is bad cannot tell a drill that exercised the rule it
+      meant to from one that tripped over something else on the way.
+    value: ${{ steps.run.outputs.why }}
 
 runs:
   using: composite
@@ -380,7 +386,9 @@ runs:
             out("epoch", str(n // epoch_len))
             out("boundary", "yes" if is_boundary(n, epoch_len) else "no")
             out("tip", tip(es))
+            out("why", "")
         except LedgerError as exc:
             print("::error::ledger %s: %s" % (cmd, exc))
+            out("why", str(exc))
             sys.exit(1)
         PYEOF

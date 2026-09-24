@@ -87,9 +87,11 @@ llama.cpp server on your own machine via `GOEDEL_INFERENCE_URL`.
 **5. Apply the branch protections** in [`.github/RULESETS.md`](.github/RULESETS.md).
 Everything in code refuses; those are the walls GitHub itself holds up.
 
-**6. Run `proof` by hand once.** It runs a whole night against a hand-written
-candidate — no model, no pushes — and tells you the wiring is right before you
-let a schedule loose on it. Then enable the `loop-night` schedule.
+**6. Run `proof` by hand once.** It runs a whole night against the probe you
+declared in `[proof]` — no model, no pushes — and files a synthetic run of
+certificates to check the claims the epoch rules make about a *sequence* of
+them. It tells you the wiring is right before you let a schedule loose on it.
+Then enable the `loop-night` schedule.
 
 Until step 4, everything still works except `draft` and the ladder: `ci` and
 `proof` are green, and the machine simply has nothing to write with.
@@ -104,7 +106,7 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `ci.yml` | the gate: the machine proves itself, then your project builds and tests |
 | `loop-night.yml` | the night — follow, reconsider, ladder, draft, judge, adopt, tidy |
 | `loop-judge.yml` | the two-arm gate, called by the night and runnable by hand |
-| `proof.yml` | two drills end to end, no model, no pushes |
+| `proof.yml` | two drills end to end, plus a synthetic epoch; no model, no pushes |
 | `boundary.yml` | the only lane that may change the evaluator itself |
 | `floors.yml` | measures this runner class's own noise, as data |
 | **Actions** | |
@@ -134,7 +136,9 @@ check gets deleted — not by argument, by nobody noticing it went.
 ### It cannot edit its own judge
 
 `[project] evaluator` names the machine, the config, the record, the test
-runner and the benchmark. Nothing the loop proposes may touch any of them, and
+runner and the benchmark. (`criterion` is the subset that *is* the judge —
+everything but the record — and it is what each certificate's `utility` digest
+covers.) Nothing the loop proposes may touch any of them, and
 `config` refuses to load at all if an `allow` mask admits an `evaluator` path —
 checked against the masks rather than the tree, so a file that does not exist
 yet cannot slip through by not existing yet.

@@ -13,3 +13,6 @@ anchors-*.tsv
 
 __pycache__/
 *.py[cod]
+
+# What the proof workflow builds and throws away.
+proof-ledger/

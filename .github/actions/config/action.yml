@@ -23,11 +23,22 @@ description: >-
 #   Rows naming no witness, no rail and no rising count are refused at load,
 #   not at judgement time.
 #
-# * **The utility has a digest.** `utility` is sha256 over every file the
-#   evaluator masks cover, and it goes into every certificate. It is what makes
-#   "these two verdicts came from the same machine" a checkable claim rather
-#   than an assumption -- the Red Queen property the ledger's epoch rules rest
-#   on (arXiv:2606.26294).
+# * **The utility has a digest, and it covers the JUDGE and not the RECORD.**
+#   `utility` is sha256 over every file the CRITERION masks cover, and it goes
+#   into every certificate. It is what makes "these two verdicts came from the
+#   same machine" a checkable claim rather than an assumption -- the Red Queen
+#   property the ledger's epoch rules rest on (arXiv:2606.26294).
+#
+#   It was sha256 over the EVALUATOR masks, which is the right set for "what
+#   may the machine not write to" and the wrong set for "what is the judge".
+#   The evaluator masks cover `loop/**`, because the record must be protected
+#   from the thing it is a record of -- so every night's certificate changed
+#   the digest, every entry in an epoch carried a different utility, and
+#   `ledger fsck` would have refused the second night the loop ever had. The
+#   whole epoch mechanism was inert and would have failed loudly on first use.
+#
+#   `criterion` defaults to the evaluator masks with the record removed, and
+#   must be a subset of them: a judge you are not forbidden to edit is not one.
 
 inputs:
   root:
@@ -197,6 +208,29 @@ runs:
                     "these allow masks also admit evaluator paths, so the machine could "
                     "edit its own judge: " + ", ".join(bad))
 
+            # **The criterion: what the judge IS, as opposed to what the
+            # machine may not write to.** They differ by exactly the record.
+            RECORD = "loop/"
+            criterion = tuple(project.get("criterion", ()))
+            if not criterion:
+                criterion = tuple(m for m in evaluator
+                                  if not (m == RECORD.rstrip("/") or m.startswith(RECORD)))
+            if not criterion:
+                raise ConfigError(
+                    "[project] criterion is empty, so nothing identifies the judge and "
+                    "every epoch would look like a different machine")
+            for m in criterion:
+                probe = m.replace("**", "x").replace("*", "x")
+                if not matches(probe, evaluator):
+                    raise ConfigError(
+                        "[project] criterion names %s, which the evaluator masks do not "
+                        "cover. A judge the machine is not forbidden to edit is not one." % m)
+                if m == RECORD.rstrip("/") or m.startswith(RECORD):
+                    raise ConfigError(
+                        "[project] criterion names %s, which is the record. The record "
+                        "changes every night, so a criterion covering it makes every "
+                        "certificate in an epoch disagree about which judge decided it." % m)
+
             h = raw.get("harness", {})
             harness = {
                 "setup": list(h.get("setup", [])),
@@ -326,12 +360,13 @@ runs:
                 "name": str(project.get("name", Path(root).name)),
                 "goal": str(project.get("goal", "loop/goal.txt")),
                 "allow": list(allow), "evaluator": list(evaluator),
+                "criterion": list(criterion),
                 "harness": harness, "author": author, "judge": judge,
                 "kinds": kinds, "floors": floors, "proof": proof,
             }
 
-        def utility_digest(root, evaluator):
-            """sha256 over every evaluator file, by path then content.
+        def utility_digest(root, criterion):
+            """sha256 over every file the criterion covers, by path then content.
 
             The path is hashed too. Renaming a judge without changing a byte of
             it is still a different judge: the workflow that called the old
@@ -346,7 +381,7 @@ runs:
                 rel = p.relative_to(root).as_posix()
                 if rel.startswith(".git/"):
                     continue
-                if matches(rel, evaluator):
+                if matches(rel, criterion):
                     files.append((rel, p))
             for rel, p in files:
                 h.update(rel.encode("utf-8")); h.update(b"\0")
@@ -442,12 +477,26 @@ runs:
             raises("a proof whose target is not among its own files is refused",
                    pf({"target": "src/other.py"}))
 
+            claim("the criterion defaults to the evaluator without the record",
+                  load({"project": {"allow": ["src/**"],
+                                    "evaluator": [".github/**", "loop/**", "goedel.toml"]},
+                        "harness": {"test": "t"}, "kinds": {"x": {"j1": "claims"}}},
+                       ".")["criterion"] == [".github/**", "goedel.toml"])
+            raises("a criterion covering the record is refused: the record moves nightly",
+                   bad({"project": {"allow": ["src/**"], "evaluator": [".github/**", "loop/**"],
+                                    "criterion": ["loop/**"]}}))
+            raises("a criterion the evaluator does not cover is refused",
+                   bad({"project": {"allow": ["src/**"], "evaluator": [".github/**"],
+                                    "criterion": ["scripts/**"]}}))
+            raises("an evaluator that is nothing but the record leaves no criterion",
+                   bad({"project": {"allow": ["src/**"], "evaluator": ["loop/**"]}}))
+
             import tempfile
             with tempfile.TemporaryDirectory() as td:
                 r = Path(td); (r / ".github").mkdir()
                 (r / ".github/a.yml").write_text("one")
                 d1, n1 = utility_digest(r, [".github/**"])
-                claim("the utility digest covers the evaluator files", n1 == 1)
+                claim("the utility digest covers the criterion files", n1 == 1)
                 (r / ".github/a.yml").write_text("two")
                 d2, _ = utility_digest(r, [".github/**"])
                 claim("editing the judge changes the digest", d1 != d2)
@@ -457,6 +506,15 @@ runs:
                 (r / "src").mkdir(); (r / "src/x.py").write_text("anything")
                 d4, _ = utility_digest(r, [".github/**"])
                 claim("a change outside the masks does not", d3 == d4)
+
+                # The claim the whole separation exists for.
+                (r / "loop/ledger/entries").mkdir(parents=True)
+                (r / "loop/ledger/entries/0000000000000000.cert").write_text("a night")
+                d5, _ = utility_digest(r, [".github/**"])
+                claim("and filing a certificate does not change which judge decided it",
+                      d4 == d5,
+                      "a criterion covering the record makes every entry in an epoch "
+                      "disagree, and fsck refuses the second night the loop ever has")
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 
@@ -477,7 +535,7 @@ runs:
             except tomllib.TOMLDecodeError as exc:
                 raise ConfigError("goedel.toml is not valid TOML: %s" % exc) from None
             cfg = load(raw, root)
-            digest, n = utility_digest(root, cfg["evaluator"])
+            digest, n = utility_digest(root, cfg["criterion"])
             cfg["utility"] = digest
             cfg["utility_files"] = n
 
@@ -501,7 +559,7 @@ runs:
             export("GOEDEL_MIN_EVIDENCE", str(cfg["judge"]["min_evidence"]))
 
             print("  %s: %d kind(s) enabled (%s)" % (cfg["name"], len(enabled), ", ".join(enabled)))
-            print("  the evaluator is %d file(s), digest %s" % (n, digest[:16]))
+            print("  the criterion is %d file(s), digest %s" % (n, digest[:16]))
             print("  epoch %d entries, repeats %d, confidence %.2f, fdr %.2f"
                   % (cfg["judge"]["epoch_len"], cfg["judge"]["repeats"],
                      cfg["judge"]["confidence"], cfg["judge"]["fdr"]))

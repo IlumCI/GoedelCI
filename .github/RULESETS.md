@@ -10,7 +10,14 @@ Settings → Rules → Rulesets, or `gh api /repos/:owner/:repo/rulesets`.
 ## Ruleset `main` — branch `main` (or your default)
 
 - Require a pull request before merging.
-- Required status checks: **`ci / machine`** and **`ci / project`**.
+- Required status checks: **`ci / machine`**, **`ci / project`**,
+  **`proof / ledger`**, **`proof / drill (pass)`** and **`proof / drill (fail)`**.
+
+`proof` is required and not optional. It is the only thing that checks the
+seams between the actions rather than each one alone, and the only thing that
+checks the claims the epoch rules make about a *sequence* of certificates —
+which no single night can. Every bug that has actually shipped here lived in
+one of those two places.
 - Block force pushes. Restrict deletions.
 
 The loop's token never pushes your default branch anyway — the audit pull
