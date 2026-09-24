@@ -9,6 +9,14 @@ name: ci
 # adopt turns the branch red even if the night's own judge was somehow wrong.
 # That independence is the point of having both.
 #
+# The night ASKS for that run rather than causing it. A push made with
+# GITHUB_TOKEN does not trigger a workflow -- GitHub's recursion guard -- so
+# the `loop/**` filter below never fires for anything the machine pushed, and
+# for a while nothing checked the one branch the machine writes to.
+# `workflow_dispatch` is the documented exception, which is why this file
+# carries one and why `loop-night`'s `verify` job is the only thing that uses
+# it. The push filter still covers a human pushing to `loop/**` by hand.
+#
 # CONSUMER: humans merging to main (branch protection requires both jobs), and
 # the loop's audit trail on loop/**.
 
@@ -40,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Every workflow is one GitHub can actually load
         uses: ./.github/actions/template-check
@@ -117,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: cfg
         uses: ./.github/actions/config
@@ -155,7 +163,7 @@ jobs:
           echo "  $CLAIMS claim(s) counted; the loop has something to hold onto"
 
       - if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-harness
           path: |

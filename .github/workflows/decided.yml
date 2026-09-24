@@ -43,8 +43,10 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # To ask `ci` to run on loop/main; see the last step of this job.
+      actions: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
@@ -161,3 +163,23 @@ jobs:
         with:
           command: fsck
           epoch-len: ${{ steps.cfg.outputs.epoch-len }}
+
+      # See the `verify` job in loop-night.yml: a push made with GITHUB_TOKEN
+      # does not trigger a workflow, so `ci`'s `loop/**` filter never fires
+      # for anything this pushed. `workflow_dispatch` is the exception, and
+      # the check runs land on the pull request's head.
+      - name: Ask ci to verify the branch this left behind
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --heads \
+               "https://github.com/$REPO" loop/main >/dev/null 2>&1; then
+            echo "  no loop/main to verify"; exit 0
+          fi
+          gh workflow run ci.yml --repo "$REPO" --ref loop/main \
+            || echo "::warning::could not ask ci to run on loop/main"
+          echo "  ci asked to run on loop/main"

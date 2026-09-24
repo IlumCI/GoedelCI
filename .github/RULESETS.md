@@ -96,6 +96,13 @@ the difference between removing the human and removing the gate.
   default branch directly: a direct push would work and would also walk past
   every gate you configured.
 
+  Required checks are what makes this real, and not only as policy. A push
+  made with `GITHUB_TOKEN` does not trigger a workflow, so the night asks for
+  its own `ci` run by dispatch -- and a required check that has not reported
+  yet holds auto-merge open until it does. With no required checks configured,
+  auto-merge lands the adoption the moment GitHub considers the branch
+  mergeable, which may be before anything has looked at it.
+
 What is removed is the waiting. What is kept is the checking.
 
 Two further things are worth setting before you walk away:

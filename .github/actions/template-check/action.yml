@@ -572,7 +572,7 @@ runs:
 
             claim("a local uses is found", us("      - uses: ./.github/actions/cert\n")
                   == ["./.github/actions/cert"])
-            claim("a marketplace one is not", us("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n") == [])
+            claim("a marketplace one is not", us("      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n") == [])
             claim("an unpinned third-party action is caught",
                   len(lo("f", "steps:\n  - uses: actions/checkout@v4\n")) == 1)
             claim("and the message says a tag is somebody else's moving pointer",
