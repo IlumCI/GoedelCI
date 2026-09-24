@@ -286,9 +286,20 @@ runs:
 
             a = raw.get("author", {})
             author = {
+                # **Carried, because `draft` reads it.** It was written in
+                # goedel.toml, documented in goedel.toml, and dropped here --
+                # so every `draft ask` died on `KeyError: 'provider'` before
+                # it could make a request, with or without a key. A field the
+                # loader silently discards is worse than one it refuses.
+                "provider": str(a.get("provider", "anthropic")).strip().lower(),
                 "base_url_env": str(a.get("base_url_env", "GOEDEL_INFERENCE_URL")),
                 "api_key_env": str(a.get("api_key_env", "GOEDEL_INFERENCE_KEY")),
-                "model": str(a.get("model", "")),
+                # Defaulted rather than required: a config that says nothing
+                # about the model should still load, and the name it gets is
+                # the same one goedel.toml ships with. An EXPLICIT empty
+                # string is still refused below, because that is somebody
+                # having meant something by it.
+                "model": str(a.get("model", "claude-sonnet-5")),
                 "attempts": int(a.get("attempts", 6)),
                 "temperature": float(a.get("temperature", 0.0)),
                 "max_tokens": int(a.get("max_tokens", 2600)),
@@ -297,6 +308,14 @@ runs:
             }
             if author["shards"] < 1:
                 raise ConfigError("[author] shards must be at least 1")
+            if author["provider"] not in ("anthropic", "openai"):
+                raise ConfigError(
+                    "[author] provider is 'anthropic' or 'openai' (which covers any "
+                    "OpenAI-compatible endpoint), not %r" % author["provider"])
+            if not author["model"]:
+                raise ConfigError(
+                    "[author] model is empty, so every request would ask for a model "
+                    "named nothing and the endpoint would refuse it")
 
             j = raw.get("judge", {})
             judge = {
@@ -472,6 +491,29 @@ runs:
                 d = json.loads(json.dumps(base));
                 for k, v in over.items(): d[k] = v
                 return lambda: load(d, ".")
+            # --- [author]: what `draft` actually reads off this ------------
+            claim("the provider reaches the loader that draft reads it from",
+                  cfg["author"]["provider"] == "anthropic",
+                  "dropping it made every `draft ask` die on KeyError before "
+                  "it could make a request, key or no key")
+            claim("and a provider written down is the one carried",
+                  load(dict(base, author={"provider": "openai"}), ".")["author"]["provider"]
+                  == "openai")
+            claim("case and spacing around it do not decide whether the loop works",
+                  load(dict(base, author={"provider": " Anthropic "}), ".")["author"]["provider"]
+                  == "anthropic")
+            raises("a provider nothing implements is refused at load, not at 02:17",
+                   bad({"author": {"provider": "acme"}}))
+            claim("a config that says nothing about the model still loads",
+                  bool(cfg["author"]["model"]))
+            raises("but an explicitly empty model is refused",
+                   bad({"author": {"model": ""}}))
+            claim("every field draft reads off the author section is present",
+                  all(k in cfg["author"] for k in
+                      ("provider", "model", "api_key_env", "base_url_env",
+                       "temperature", "max_tokens", "attempts", "shards")),
+                  sorted(cfg["author"]))
+
             raises("an allow mask that admits an evaluator path is refused at load",
                    bad({"project": {"allow": [".github/**"], "evaluator": [".github/**"]}}))
             raises("an allow mask whose parent is the evaluator is refused too",

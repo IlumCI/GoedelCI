@@ -128,12 +128,23 @@ runs:
         # separates the two, because three balks retire a rung and an
         # afternoon of 503s would otherwise retire the whole ladder.
         NO_ANSWER = 3
+        # A different thing from NO_ANSWER, and the difference is whether
+        # waiting helps. An endpoint that timed out may answer tomorrow; a
+        # repository with no API key configured will not, and under a nightly
+        # schedule it produces a green square every night for good while
+        # nothing is drafted. That is the silent stall this whole design
+        # refuses elsewhere, so it is refused here too.
+        NO_CREDENTIAL = 4
 
         FENCE_OPEN = re.compile(r"^<<<FILE (.+?)>>>\s*$")
         FENCE_CLOSE = "<<<END>>>"
 
         class DraftError(Exception): pass
         class NoAnswer(DraftError): pass
+        # A subclass, so every `except NoAnswer` still catches it and the
+        # callers that only care about "nothing came back" keep working. The
+        # two places that report it look at the type and say something else.
+        class NoCredential(NoAnswer): pass
 
         def out(k, v):
             """A step output, and never more than one.
@@ -179,7 +190,7 @@ runs:
 
             if a["provider"] == "anthropic":
                 if not key:
-                    raise NoAnswer("no API key in $%s" % a["api_key_env"])
+                    raise NoCredential("no API key in $%s" % a["api_key_env"])
                 url = (base or "https://api.anthropic.com") + "/v1/messages"
                 body = {"model": model, "max_tokens": a["max_tokens"],
                         "temperature": temperature, "system": system,
@@ -190,7 +201,7 @@ runs:
                     b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
             else:
                 if not base:
-                    raise NoAnswer("no endpoint in $%s" % a["base_url_env"])
+                    raise NoCredential("no endpoint in $%s" % a["base_url_env"])
                 url = base.rstrip("/") + "/chat/completions"
                 body = {"model": model, "max_tokens": a["max_tokens"],
                         "temperature": temperature,
@@ -749,6 +760,23 @@ runs:
             claim("a witness kind's envelope carries both patches",
                   "[witness]" in wenv and "[patch]" in wenv)
             claim("a greedy draw records no seed", "seed -" in wenv)
+            # -- what a failure to ask MEANS ------------------------------
+            #
+            # The two are reported differently and exit differently because
+            # one of them gets better if you wait and the other does not. An
+            # unconfigured repository under a nightly schedule was a green
+            # square a night, for good, with nothing drafted.
+            claim("a missing credential is a kind of no-answer, so every "
+                  "existing handler still catches it",
+                  issubclass(NoCredential, NoAnswer))
+            claim("but it is distinguishable from one",
+                  isinstance(NoCredential("x"), NoCredential)
+                  and not isinstance(NoAnswer("x"), NoCredential))
+            claim("and the two leave different exit codes",
+                  NO_CREDENTIAL != NO_ANSWER)
+            claim("an endpoint that timed out is still only a no-answer",
+                  not isinstance(NoAnswer("the endpoint did not answer"), NoCredential))
+
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 
@@ -757,6 +785,16 @@ runs:
         cmd = os.environ["COMMAND"].strip()
         if cmd == "selftest":
             sys.exit(selftest())
+
+        def unconfigured(exc):
+            """Said as an error, because nothing improves by waiting."""
+            print("::error::%s" % exc)
+            print("::error::This is the only credential the loop needs, and without it")
+            print("::error::nothing can be drafted -- not tonight and not any night.")
+            print("::error::Settings -> Secrets and variables -> Actions -> New")
+            print("::error::repository secret. The default provider is Anthropic;")
+            print("::error::[author] provider = \"openai\" in goedel.toml points this at")
+            print("::error::any OpenAI-compatible endpoint instead.")
 
         if cmd == "ask":
             # One question, one answer, no interpretation. Whoever asked owns
@@ -769,10 +807,14 @@ runs:
                             Path(os.environ["USER_FILE"]).read_text(encoding="utf-8"),
                             int(seed) if seed else None)
             except NoAnswer as exc:
-                print("::warning::no answer: %s" % exc)
                 Path(os.environ["OUT"]).write_text("", encoding="utf-8")
-                out("drew", "no"); out("why", "no answer: %s" % exc)
-                out("operator", "-"); out("attempts", "0")
+                out("operator", "-"); out("attempts", "0"); out("drew", "no")
+                if isinstance(exc, NoCredential):
+                    unconfigured(exc)
+                    out("why", "no credential: %s" % exc)
+                    sys.exit(NO_CREDENTIAL)
+                print("::warning::no answer: %s" % exc)
+                out("why", "no answer: %s" % exc)
                 sys.exit(NO_ANSWER)
             Path(os.environ["OUT"]).write_text(reply, encoding="utf-8")
             print("  %d character(s) came back" % len(reply))
@@ -808,9 +850,13 @@ runs:
             out("operator", ev["operator"]); out("attempts", str(attempts)); out("why", "")
         except NoAnswer as exc:
             # Not a balk: nothing here is evidence about the rung.
+            out("drew", "no"); out("operator", "-"); out("attempts", "0")
+            if isinstance(exc, NoCredential):
+                unconfigured(exc)
+                out("why", "no credential: %s" % exc)
+                sys.exit(NO_CREDENTIAL)
             print("::warning::the model never answered: %s" % exc)
-            out("drew", "no"); out("why", "no answer: %s" % exc)
-            out("operator", "-"); out("attempts", "0")
+            out("why", "no answer: %s" % exc)
             sys.exit(NO_ANSWER)
         except DraftError as exc:
             print("::notice::drew nothing: %s" % str(exc)[:500])

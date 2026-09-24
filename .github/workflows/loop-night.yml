@@ -446,6 +446,21 @@ jobs:
           user: ladder-card.txt
           out: ladder-reply.txt
 
+      # **A missing credential is not a quiet night.** Without it nothing can
+      # be drafted, tonight or any night, and the run would otherwise go green
+      # having done nothing at all -- a schedule producing a green square a
+      # day forever while the project stands still. An endpoint that timed out
+      # is different and stays a warning: waiting helps with one of these.
+      - name: A loop with nothing to write with is not a loop
+        if: startsWith(steps.reply.outputs.why, 'no credential')
+        shell: bash
+        env:
+          WHY: ${{ steps.reply.outputs.why }}
+        run: |
+          set -euo pipefail
+          echo "::error::$WHY"
+          exit 1
+
       - id: propose
         if: steps.reply.outcome == 'success'
         name: Admit it, or refuse it and say why
@@ -564,6 +579,13 @@ jobs:
           if [ "$DREW" = "yes" ]; then
             cp envelope.env shard/envelope.env
             echo "drew" > shard/state
+          elif printf '%s' "$WHY" | grep -q '^no credential'; then
+            # Third state, and it has to be its own. It is not a balk --
+            # three balks RETIRE a milestone, so an unconfigured repository
+            # would have worked its way down the ladder refusing everything
+            # for a reason that has nothing to do with any of it -- and it is
+            # not a no-answer either, because waiting does not help.
+            echo "nocredential" > shard/state
           elif printf '%s' "$WHY" | grep -q '^no answer'; then
             echo "noanswer" > shard/state
           else
@@ -625,11 +647,13 @@ jobs:
           # A glob rather than `ls`, because `ls` on an absent directory exits
           # 2 and `pipefail` makes that the shell's last word.
           shopt -s nullglob
-          took=""; drew=0; balked=0; why=""
+          took=""; drew=0; balked=0; nokey=0; why=""
           for d in shards/loop-shard-*; do
             state=$(cat "$d/state" 2>/dev/null || echo none)
             case "$state" in
               drew) drew=$((drew+1)); [ -n "$took" ] || took="$d" ;;
+              nocredential) nokey=$((nokey+1))
+                    [ -n "$why" ] || why=$(head -c 300 "$d/why" | tr '\n\r' '  ') ;;
               # `tr` and not a bare read. The reason is whatever the model
               # said, and a newline in it writes a SECOND assignment into
               # $GITHUB_OUTPUT that the runner obeys.
@@ -637,7 +661,16 @@ jobs:
                     [ -n "$why" ] || why=$(head -c 300 "$d/why" | tr '\n\r' '  ') ;;
             esac
           done
-          echo "  $drew shard(s) drew, $balked balked"
+          echo "  $drew shard(s) drew, $balked balked, $nokey had nothing to ask with"
+          # Loud, and before anything is recorded. A night that could not ask
+          # is not a night the milestone failed, and a schedule that goes
+          # green on it goes green every night for good.
+          if [ "$drew" = "0" ] && [ "$nokey" != "0" ]; then
+            echo "::error::no shard had a credential to ask with: $why"
+            echo "::error::Nothing can be drafted until that is configured, so this"
+            echo "::error::night is a failure rather than a quiet one."
+            exit 1
+          fi
           if [ -z "$took" ]; then
             echo "have=no" >> "$GITHUB_OUTPUT"
             echo "balked=$balked" >> "$GITHUB_OUTPUT"
