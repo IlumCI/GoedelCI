@@ -1,0 +1,762 @@
+name: loop-judge
+
+# The generalized two-arm gate: propose.yml's shape, for candidates the CI
+# machine authors itself. One runner, one checkout, both arms -- anything
+# else compares two machines and calls the difference an effect.
+#
+# It holds NO secrets and asks for `contents: read`, deliberately: the judge
+# is the part of the loop most exposed to the candidate's own content (it
+# builds and boots it), so it is the part least entitled to authority. The
+# verdict becomes real only when loop-night's adopt job -- which never runs
+# candidate code -- commits the certificate.
+#
+# CONSUMER: loop-night.adopt (the certificate artifact), and anybody reading
+# a refused night. CANARY: the broken-candidate drill -- a candidate patched
+# to break a boot selftest must end `verdict refuse` with the boot failure
+# named in `why`; and verify-boot's own section-count canary rides along in
+# both arms.
+
+on:
+  workflow_call:
+    inputs:
+      point:
+        type: string
+        required: true
+      baseline_ref:
+        type: string
+        required: true
+      candidate_ref:
+        type: string
+        required: true
+      rail:
+        type: string
+        required: true
+      chi_bar:
+        type: string
+        required: true
+      alpha_k:
+        type: string
+        required: true
+      minutes:
+        type: string
+        required: true
+      half:
+        type: string
+        required: true
+      level:
+        type: string
+        required: true
+      boots:
+        type: string
+        required: true
+      queries:
+        type: string
+        required: true
+      kind:
+        type: string
+        required: true
+      rung:
+        type: string
+        required: true
+      axis:
+        type: string
+        required: true
+      corpus:
+        type: string
+        required: true
+      # **The ladder rung this night was working on, and empty when it was
+      # not.** `ladder.py` counts a rung met by an adopted certificate
+      # carrying its point and retired by three refused ones; the
+      # certificate carried the ENVELOPE's point, which identifies the
+      # patch and differs every night, so both counters read zero for good
+      # and a rung could be neither completed nor retired. Not `required`,
+      # because a template or grid night is not the ladder's work and a
+      # certificate of theirs claiming the rung would retire it for
+      # something it never tried.
+      ladder:
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+    inputs:
+      point:
+        description: "sha256 of the envelope (its tried marker must be on the ref)"
+        required: true
+      baseline_ref:
+        description: "the loop branch commit to judge from"
+        required: true
+      candidate_ref:
+        description: "the candidate ref or sha"
+        required: true
+      rail:
+        required: true
+        default: "host.retrieval"
+      chi_bar:
+        required: true
+        default: "4.687"
+      alpha_k:
+        required: true
+        default: "0"
+      minutes:
+        required: true
+        default: "60"
+      half:
+        required: true
+        default: "extend"
+      level:
+        required: true
+        default: "0"
+      boots:
+        required: true
+        default: "1"
+      queries:
+        required: true
+        default: "250"
+      kind:
+        required: true
+        default: "tune"
+      rung:
+        required: true
+        default: "1"
+      axis:
+        required: true
+        default: "grid"
+      corpus:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  judge:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.minutes) }}
+    env:
+      POINT: ${{ inputs.point }}
+      BASE_REF: ${{ inputs.baseline_ref }}
+      CAND_REF: ${{ inputs.candidate_ref }}
+      RAIL: ${{ inputs.rail }}
+      CHI: ${{ inputs.chi_bar }}
+      ALPHA_K: ${{ inputs.alpha_k }}
+      MINUTES: ${{ inputs.minutes }}
+      HALF: ${{ inputs.half }}
+      LEVEL: ${{ inputs.level }}
+      BOOTS: ${{ inputs.boots }}
+      QUERIES: ${{ inputs.queries }}
+      KIND: ${{ inputs.kind }}
+      RUNG: ${{ inputs.rung }}
+      AXIS: ${{ inputs.axis }}
+      CORPUS: ${{ inputs.corpus }}
+      LADDER: ${{ inputs.ladder }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.baseline_ref }}
+          # Full history: the candidate ref must be fetchable and the parent
+          # tree must exist for the derive assertion below.
+          fetch-depth: 0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version --verbose
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: uefi-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: The tools must work before they are trusted to judge
+        run: |
+          set -euo pipefail
+          python3 tools/knob.py --selftest
+          python3 tools/rails.py --selftest
+          python3 tools/retrieval.py --selftest
+          python3 tools/godel.py --selftest
+
+      # The envelope is already on the branch -- the marker was committed
+      # before the trial, by construction -- and it is re-admitted here even
+      # though propose admitted it, because this job is about to run what it
+      # describes and defense in depth is cheap.
+      - name: Read the envelope back off its marker, and re-admit it
+        run: |
+          set -euo pipefail
+          ENV_FILE="loop/ledger/tried/${POINT:0:16}.env"
+          test -f "$ENV_FILE" || { echo "::error::no tried marker for $POINT"; exit 1; }
+          test "$(python3 tools/godel.py point "$ENV_FILE")" = "$POINT" \
+            || { echo "::error::the marker is not the envelope the point names"; exit 1; }
+          python3 tools/godel.py admit "$ENV_FILE"
+          echo "ENV_FILE=$ENV_FILE" >> "$GITHUB_ENV"
+          echo "PARENT_TREE=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_ENV"
+
+      # **The candidate's tree must be exactly apply(parent, patch)** before
+      # a boot is spent on it. A candidate ref carrying anything else --
+      # however it got there -- is not the proposal the marker records.
+      - name: The candidate is what the envelope says, bit for bit
+        run: |
+          set -euo pipefail
+          want=$(python3 tools/godel.py derive "$ENV_FILE" --parent "$PARENT_TREE")
+          got=$(git rev-parse "$CAND_REF^{tree}")
+          if [ "$want" != "$got" ]; then
+            echo "::error::the candidate tree is $got, the envelope derives $want"
+            exit 1
+          fi
+          echo "CAND_TREE=$got" >> "$GITHUB_ENV"
+
+      # The evidence corpus, from the manifest in force. The manifest names a
+      # MODE and this job owns the command -- the REPAIRS.TXT rule: nothing a
+      # repo file says is executed, it only selects among things this file
+      # already does.
+      - name: The corpus
+        run: |
+          set -euo pipefail
+          test -f loop/evidence/corpus.txt || { echo "::error::no corpus manifest"; exit 1; }
+          mode=$(awk 'NR==2{print $1}' loop/evidence/corpus.txt)
+          case "$mode" in
+            fixture)
+              nodes=$(awk 'NR==2{print $2}' loop/evidence/corpus.txt | sed 's/nodes=//')
+              case "$nodes" in ''|*[!0-9]*) echo "::error::bad node count"; exit 1;; esac
+              python3 tools/retrieval.py --fixture out/fixture --nodes "$nodes" \
+                --limit 0 --dump /dev/null >/dev/null
+              echo "FOREST=out/fixture" >> "$GITHUB_ENV"
+              echo "CORPUS_MODE=fixture" >> "$GITHUB_ENV"
+              echo "::notice::the corpus is a generated fixture, at roughly a quarter"
+              echo "::notice::of the real forest's sensitivity -- corpus.txt says so"
+              ;;
+            release)
+              tag=$(awk 'NR==2{print $2}' loop/evidence/corpus.txt | sed 's/tag=//')
+              asset=$(awk 'NR==2{print $3}' loop/evidence/corpus.txt | sed 's/asset=//')
+              want=$(awk 'NR==2{print $4}' loop/evidence/corpus.txt | sed 's/sha256=//')
+              gh release download "$tag" --pattern "$asset" --dir out
+              got=$(sha256sum "out/$asset" | cut -d' ' -f1)
+              test "$got" = "$want" || { echo "::error::corpus digest mismatch"; exit 1; }
+              mkdir -p out/forest && tar -xzf "out/$asset" -C out/forest
+              echo "FOREST=out/forest" >> "$GITHUB_ENV"
+              echo "CORPUS_MODE=release" >> "$GITHUB_ENV"
+              ;;
+            *) echo "::error::corpus.txt names a mode this job does not have: $mode"; exit 1;;
+          esac
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # --- the baseline arm ------------------------------------------------
+
+      - name: Build the baseline
+        run: |
+          set -euo pipefail
+          cargo build --release --locked 2>&1 | tee build-a.log
+
+      - uses: ./.github/actions/verify-boot
+        with:
+          arm: a
+
+      - name: Keep the baseline
+        run: |
+          set -euo pipefail
+          cp verify.log verify-a.log
+          mv rails.txt kernel-a.txt
+          mv rails2.txt kernel-a2-within.txt
+
+      # **What a level above zero actually buys, and it is the hole
+      # `rails.py` names about itself.** The second reading kept above is
+      # taken in the SAME boot, so it measures within-boot noise -- and the
+      # two arms of a comparison are different boots. Driven once:
+      # `smp.all_cores` moved 1.7% and 12.2% within its own boots and 67.3%
+      # between them, so a floor measured from the within-boot pair was 24%
+      # where the honest one was over 67%. A second BOOT of the same binary
+      # is the only thing that closes that, and it costs a boot, which is
+      # exactly what an OOPS level is for.
+      #
+      # Static duplication rather than a loop, because a composite action
+      # cannot be called in a loop from YAML. One extra boot per arm at
+      # level 1 and above; levels 2 and 3 buy query count only, and the
+      # certificate records `boots` so the record says which it was.
+      - uses: ./.github/actions/verify-boot
+        if: fromJSON(env.LEVEL) >= 1
+        with:
+          arm: a2
+      - name: The baseline's between-boot partner
+        if: fromJSON(env.LEVEL) >= 1
+        run: |
+          set -euo pipefail
+          mv rails.txt kernel-a2.txt
+          rm -f rails2.txt
+          echo "BOOTS_SPENT=2" >> "$GITHUB_ENV"
+      # **Which second reading to use is the only thing LEVEL decides.**
+      # Assembling the rail block is common to both, and it lived inside the
+      # `< 1` branch -- so the first night the OOPS schedule ever raised a
+      # level took the `>= 1` branch, never wrote `before.txt`, and the judge
+      # died on `FileNotFoundError: before.txt` with an empty `judged.txt`.
+      # The certificate read `moved absent / no line for the claimed rail`,
+      # which describes a rail that was never measured and reads exactly like
+      # a candidate that did something wrong.
+      #
+      # It could not fire until a level rose, and levels rise only on a
+      # starved trial, so it sat behind eight nights at the base level. Its
+      # twin one branch down had the same shape and the same cost: `run: |`
+      # missing a bar, which bit at the base level instead.
+      - name: Or the within-boot one, at the base level
+        if: fromJSON(env.LEVEL) < 1
+        run: |
+          set -euo pipefail
+          cp kernel-a2-within.txt kernel-a2.txt
+          echo "BOOTS_SPENT=1" >> "$GITHUB_ENV"
+
+      - name: The baseline's rail block
+        run: |
+          set -euo pipefail
+          python3 tools/retrieval.py "$FOREST" --limit "$QUERIES" --dump retrieval-a.tsv | tee retrieval-a.log
+          python3 tools/rails.py collect --rail retrieval=retrieval-a.tsv --out host-a.txt
+          cat kernel-a.txt host-a.txt | grep -v '^\[rail\]' > body-a.txt
+          # The cost rails: exact by construction (one locked toolchain, one
+          # tree), floored at zero in rails.py, and the cleanup kind's J1.
+          size=$(stat -c%s target/x86_64-unknown-uefi/release/glados.efi)
+          warns=$(grep -c '^warning' build-a.log || true)
+          { echo "cost.image_bytes $size B lower";
+            echo "cost.warnings $warns n lower"; } >> body-a.txt
+          { echo '[rail] v1'; cat body-a.txt; echo '[rail] end'; } > before.txt
+
+      # --- the witness arm, for the kinds whose J1 it is --------------------
+      #
+      # The three-tree shape: the witness (the new claim) applied to the
+      # BASELINE must fail its boot -- genuinely, as a claim failure with the
+      # machine still answering, not as an infra death -- and the candidate
+      # (witness + fix) must then pass. A bugfix without this is a diff with
+      # a story; recording fail-then-pass is what makes it a certificate.
+
+      - name: The witness alone, on the baseline
+        if: env.KIND == 'bugfix' || env.KIND == 'test'
+        run: |
+          set -euo pipefail
+          wt=$(python3 tools/godel.py derive "$ENV_FILE" --parent "$PARENT_TREE" --witness-only)
+          wc_commit=$(git commit-tree "$wt" -p HEAD -m "witness arm (never pushed)")
+          git checkout -f --detach "$wc_commit"
+          cargo build --release --locked 2>&1 | tee build-w.log
+
+      - uses: ./.github/actions/verify-boot
+        if: env.KIND == 'bugfix' || env.KIND == 'test'
+        id: witness-boot
+        continue-on-error: true
+        with:
+          arm: w
+
+      - name: The witness must have FAILED, and failed the right way
+        if: env.KIND == 'bugfix' || env.KIND == 'test'
+        run: |
+          set -euo pipefail
+          cp verify.log verify-w.log || true
+          if [ "${{ steps.witness-boot.outcome }}" != "failure" ]; then
+            echo "WITNESS_RES=the witness passes on the baseline, so there is nothing to fix" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # A claim failure reaches the shell and prints FAIL; an infra death
+          # does neither, and blaming the candidate for the runner would be
+          # the propose.yml two-machines error one level down.
+          if grep -q '^  alive' verify-w.log && grep -qE '(^|[[:space:]])FAIL' verify-w.log; then
+            echo "WITNESS_RES=fail-then-pass" >> "$GITHUB_ENV"
+          else
+            echo "WITNESS_RES=the witness arm died of infrastructure, not of the claim" >> "$GITHUB_ENV"
+          fi
+
+      # --- the candidate arm -----------------------------------------------
+
+      # A full checkout, not `checkout -- .`: a partial checkout leaves files
+      # the candidate deleted still in the worktree. Safe because admission
+      # refused any patch touching the evaluator, so the tools judging this
+      # tree are byte-identical to the baseline's -- and that was asserted,
+      # not assumed, by the derive check above.
+      - name: Become the candidate
+        run: git checkout -f --detach "$CAND_REF"
+
+      # **A candidate that will not build is a REFUSAL, not a red run.**
+      # It was fatal, so the judge job went red, `adopt` was skipped for
+      # needing it, and nothing was filed -- no certificate, no ledger line,
+      # and `refused` never moved on the rung that produced it. Under a
+      # schedule that is a silent stall: the same rung is offered again
+      # every night, the author writes the same broken file at temperature
+      # zero, and the loop spends a runner a night forever with a human
+      # needed to notice. The balk mechanism exists to stop exactly that one
+      # stage earlier, and this is the same hole one stage later.
+      #
+      # The baseline's build stays fatal, deliberately. A baseline that will
+      # not build is the runner or the branch being wrong, not the
+      # candidate, and blaming a candidate for infrastructure is the
+      # two-machines error propose.yml already records.
+      - name: Build the candidate
+        id: cand-build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cargo build --release --locked 2>&1 | tee build-b.log
+
+      - name: A candidate that did not build is refused here
+        if: steps.cand-build.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          errs=$(grep -E '^error' build-b.log | head -c 400 | tr '\n' ' ' || true)
+          echo "CAND_DEAD=the candidate did not build: ${errs:-no error line}" >> "$GITHUB_ENV"
+
+      - uses: ./.github/actions/verify-boot
+        id: cand-boot
+        if: env.CAND_DEAD == ''
+        continue-on-error: true
+        with:
+          arm: b
+
+      - name: A candidate that did not boot is refused too
+        if: env.CAND_DEAD == '' && steps.cand-boot.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          echo "CAND_DEAD=the candidate built and did not survive its boot" >> "$GITHUB_ENV"
+
+      - name: Keep the candidate
+        if: env.CAND_DEAD == ''
+        run: |
+          set -euo pipefail
+          cp verify.log verify-b.log
+          mv rails.txt kernel-b.txt
+          mv rails2.txt kernel-b2-within.txt
+
+      - uses: ./.github/actions/verify-boot
+        if: env.CAND_DEAD == '' && fromJSON(env.LEVEL) >= 1
+        with:
+          arm: b2
+      - name: The candidate's between-boot partner
+        if: env.CAND_DEAD == '' && fromJSON(env.LEVEL) >= 1
+        run: |
+          set -euo pipefail
+          mv rails.txt kernel-b2.txt
+          rm -f rails2.txt
+      # `run: |`, and the missing bar is what stopped this loop ever reaching a
+      # verdict. Without it the block is a *plain* YAML scalar, which folds
+      # every line into one with spaces between them -- so the runner was
+      # handed `cp kernel-b2-within.txt kernel-b2.txt python3 tools/...` as a
+      # single command and died on `syntax error near unexpected token '}'`,
+      # the `{ ... }` group having lost the newline that separated it.
+      #
+      # It bit at `LEVEL < 1`, which is the *base* level and the default, so
+      # the first night that ever ran hit it: both arms built, both booted,
+      # both kept their rails, and the candidate's second reading could not be
+      # taken. Its baseline twin thirty lines up has the bar and passed, which
+      # is what made the failure look like something about the candidate.
+      - name: Or the within-boot one, at the base level
+        if: env.CAND_DEAD == '' && fromJSON(env.LEVEL) < 1
+        run: |
+          set -euo pipefail
+          cp kernel-b2-within.txt kernel-b2.txt
+
+      # Unconditional but for a dead candidate, for the reason its
+      # baseline twin is -- see there. **Both arms build to the same path**,
+      # so running this after a failed candidate build would `stat` the
+      # BASELINE's binary and report every cost rail as `same`: a candidate
+      # that does not compile, judged as having changed nothing.
+      - name: The candidate's rail block
+        if: env.CAND_DEAD == ''
+        run: |
+          set -euo pipefail
+          python3 tools/retrieval.py "$FOREST" --limit "$QUERIES" --dump retrieval-b.tsv | tee retrieval-b.log
+          python3 tools/rails.py collect --rail retrieval=retrieval-b.tsv --out host-b.txt
+          cat kernel-b.txt host-b.txt | grep -v '^\[rail\]' > body-b.txt
+          size=$(stat -c%s target/x86_64-unknown-uefi/release/glados.efi)
+          warns=$(grep -c '^warning' build-b.log || true)
+          { echo "cost.image_bytes $size B lower";
+            echo "cost.warnings $warns n lower"; } >> body-b.txt
+          { echo '[rail] v1'; cat body-b.txt; echo '[rail] end'; } > after.txt
+
+      # --- the verdict ------------------------------------------------------
+
+      - name: Count what both arms answered
+        if: env.CAND_DEAD == ''
+        run: |
+          set -euo pipefail
+          sa=$(grep -c '^\[selftest\]' verify-a.log || true)
+          sb=$(grep -c '^\[selftest\]' verify-b.log || true)
+          ta=$(grep -oE '[0-9]+ passed' verify-a.log | tail -1 | cut -d' ' -f1)
+          tb=$(grep -oE '[0-9]+ passed' verify-b.log | tail -1 | cut -d' ' -f1)
+          ca=$(grep -cE '^  ok ' verify-a.log || true)
+          cb=$(grep -cE '^  ok ' verify-b.log || true)
+          echo "SECTIONS=$sa/$sb" >> "$GITHUB_ENV"
+          echo "SUITES=$ta/$tb" >> "$GITHUB_ENV"
+          echo "CLAIMS=$ca/$cb" >> "$GITHUB_ENV"
+          {
+            echo "CLAIMS_SA=$sa"; echo "CLAIMS_SB=$sb"
+            echo "CLAIMS_TA=$ta"; echo "CLAIMS_TB=$tb"
+            echo "CLAIMS_CA=$ca"; echo "CLAIMS_CB=$cb"
+          } >> "$GITHUB_ENV"
+
+      - name: Judge it against what it claimed, at the bar in force
+        run: |
+          set -euo pipefail
+          # A candidate that never built or never booted is refused before
+          # any rail is consulted, because there are no readings to consult
+          # -- and the certificate says which of the two it was, so the
+          # ledger records a refusal with a reason rather than a red run
+          # with none.
+          if [ -n "${CAND_DEAD:-}" ]; then
+            echo "MOVED=-" >> "$GITHUB_ENV"
+            echo "VERDICT=refuse" >> "$GITHUB_ENV"
+            echo "WHY=$CAND_DEAD" >> "$GITHUB_ENV"
+            # `-` and not `0`. Nothing counted these, and a zero reads as a
+            # boot that answered nothing, which is a different fact from a
+            # boot that never happened.
+            echo "SECTIONS=-" >> "$GITHUB_ENV"
+            echo "SUITES=-" >> "$GITHUB_ENV"
+            echo "CLAIMS=-" >> "$GITHUB_ENV"
+            : > judged.txt
+            exit 0
+          fi
+          # Three shapes of judgement, by what the kind's J1 is.
+          #
+          # Witness kinds: J1 is the witness (fail-then-pass, established
+          # above); the rails' job here is J2 -- nothing may read worse, and
+          # an unstable comparison refuses the night the way it refuses any.
+          if [ "$KIND" = "bugfix" ] || [ "$KIND" = "test" ]; then
+            python3 tools/rails.py compare before.txt after.txt \
+              --again kernel-a2.txt kernel-b2.txt | tee judged.txt
+            worse=$(grep -c ' worse ' judged.txt || true)
+            unstable=$(grep -c ' unstable ' judged.txt || true)
+            if [ "$WITNESS_RES" != "fail-then-pass" ]; then
+              echo "VERDICT=refuse" >> "$GITHUB_ENV"
+              echo "WHY=$WITNESS_RES" >> "$GITHUB_ENV"
+            elif [ "$unstable" != "0" ]; then
+              echo "VERDICT=refuse" >> "$GITHUB_ENV"
+              echo "WHY=witness held but $unstable rail(s) were not comparable" >> "$GITHUB_ENV"
+            elif [ "$worse" != "0" ]; then
+              echo "VERDICT=refuse" >> "$GITHUB_ENV"
+              echo "WHY=witness held but $worse rail(s) regressed" >> "$GITHUB_ENV"
+            else
+              echo "VERDICT=adopt" >> "$GITHUB_ENV"
+              echo "WHY=witness failed on the baseline and passes with the fix; no rail regressed" >> "$GITHUB_ENV"
+            fi
+            echo "MOVED=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # **`feature` is greenfield, and fail-then-pass cannot express it.**
+          # Not a gap in the model's behaviour -- arithmetic about which
+          # trees exist. A witness must build and run against the PARENT
+          # tree, and a module being created is by construction absent from
+          # it, so the witness arm dies of infrastructure rather than of its
+          # claim and the judge above correctly refuses. Every rung the
+          # ladder could emit was therefore refused before a runner was
+          # spent, which is why three nights of this loop produced
+          # certificates and no `src/` line.
+          #
+          # What IS mechanically derivable here is weaker, and is stated
+          # rather than dressed up: the candidate compiles, boots, loses no
+          # claim, and ADDS one -- so the new code is exercised by something
+          # that printed `ok`, not merely compiled. It does not say the
+          # feature is correct.
+          #
+          # That is the honest bar for creating a thing, and it is the
+          # ordering the witnessed kinds need: after this adoption the
+          # module exists, so the rungs that follow CAN fail against it, and
+          # those are the ones that say it is right. A loop that could never
+          # take this step could never take theirs either.
+          #
+          # It is not gameable in the direction that matters. A claim is a
+          # line the boot printed `ok` for, so buying one costs running one;
+          # the monotonic veto below catches anything traded away for it;
+          # and the diff budget (400 lines, 10 files) and the path masks are
+          # unchanged.
+          if [ "$KIND" = "feature" ]; then
+            # **A feature is allowed to pay for its own bytes.**
+            # `cost.image_bytes` is floored at zero and one byte larger
+            # is `worse` by an asserted claim -- which is exactly right
+            # for `cleanup`, the kind whose J1 IS that rail. Here the
+            # same rail is J2, "nothing may read worse", and a new
+            # module cannot satisfy it: the bytes are the point. So the
+            # one kind that writes new code refused every candidate it
+            # could ever have, and would have gone on doing so however
+            # good they got. `--allow` prices the rail instead of
+            # vetoing on it: the movement is still measured, still
+            # printed and still in `judged.txt`, so the certificate
+            # records what the feature cost. What bounds the growth is
+            # this kind's diff budget, 400 lines over 10 files.
+            #
+            # `cost.warnings` is deliberately NOT allowed. A feature
+            # that adds warnings has added code nothing exercises,
+            # which is the thing this branch already refuses one line
+            # down -- and its J1 is that the boot count rose, so the
+            # selftest does run what it added.
+            # **And the uncontrolled timing rails cannot be attributed.**
+            # Every floor rails.py declares is a boot-to-boot spread of ONE
+            # binary -- `evidence-floors` boots a fixed build eight times --
+            # and this job compares TWO. Adding a module relocates every
+            # function after it, which on a tight arithmetic loop is an
+            # alignment and instruction-cache effect nobody here has
+            # measured. `ai.` and `smp.` have no control to divide that out,
+            # so a movement there is the change's logic or its layout and
+            # there is no instrument in this repository that can say which.
+            #
+            # Measured on this loop's own candidates: a 26-line function
+            # that copies sixteen bytes read `ai.matmul -40.5%` and
+            # `smp.one_core -30.5%`, and an earlier one read `smp.one_core
+            # +69.7%`. Against a measured boot-to-boot p95 of 4.2% and 1.2%
+            # respectively -- so these are not the day either. They are the
+            # binary being a different binary.
+            #
+            # Reported, not vetoed on. The controlled groups still refuse --
+            # graphics, the interpreter -- and so do `host.retrieval` and
+            # `cost.warnings`, which is what caught the first real feature
+            # candidate. The gap this names is closed by measuring a
+            # build-to-build spread, which nothing here does yet.
+            python3 tools/rails.py compare before.txt after.txt \
+              --again kernel-a2.txt kernel-b2.txt \
+              --allow cost.image_bytes \
+              --adrift ai.matmul smp.one_core smp.all_cores | tee judged.txt
+            worse=$(grep -c ' worse ' judged.txt || true)
+            unstable=$(grep -c ' unstable ' judged.txt || true)
+            echo "MOVED=-" >> "$GITHUB_ENV"
+            if [ "$CLAIMS_CB" -le "$CLAIMS_CA" ]; then
+              echo "VERDICT=refuse" >> "$GITHUB_ENV"
+              echo "WHY=a feature that adds no claim is code nothing exercises (claims $CLAIMS_CA->$CLAIMS_CB)" >> "$GITHUB_ENV"
+            elif [ "$unstable" != "0" ]; then
+              echo "VERDICT=refuse" >> "$GITHUB_ENV"
+              echo "WHY=$unstable rail(s) were not comparable" >> "$GITHUB_ENV"
+            elif [ "$worse" != "0" ]; then
+              echo "VERDICT=refuse" >> "$GITHUB_ENV"
+              echo "WHY=$worse rail(s) regressed" >> "$GITHUB_ENV"
+            else
+              echo "VERDICT=adopt" >> "$GITHUB_ENV"
+              echo "WHY=it builds, it boots, it added $(( CLAIMS_CB - CLAIMS_CA )) claim(s) and lost none; no rail regressed" >> "$GITHUB_ENV"
+            fi
+            exit 0
+          fi
+          # `rail none` outside the witness kinds claims nothing moved --
+          # and adopting on "nothing broke" would be adopting what nothing
+          # measured. Refused with the missing judge named.
+          if [ "$RAIL" = "none" ]; then
+            python3 tools/rails.py compare before.txt after.txt \
+              --again kernel-a2.txt kernel-b2.txt | tee judged.txt
+            echo "MOVED=-" >> "$GITHUB_ENV"
+            echo "VERDICT=refuse" >> "$GITHUB_ENV"
+            echo "WHY=this kind claims no rail and carries no witness, so no J1 can say yes" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          set +e
+          python3 tools/rails.py judge before.txt after.txt \
+            --again kernel-a2.txt kernel-b2.txt \
+            --claims "$RAIL" --bar "$CHI" | tee judged.txt
+          code=${PIPESTATUS[0]}
+          set -e
+          case "$code" in
+            0) moved=better; verdict=adopt ;;
+            1) moved=$(grep -oE "^  $RAIL +[a-z]+" judged.txt | awk '{print $2}' || true)
+               verdict=refuse ;;
+            2) moved=unstable; verdict=refuse ;;
+            *) echo "::error::rails.py answered $code"; exit 1 ;;
+          esac
+          echo "MOVED=${moved:-absent}" >> "$GITHUB_ENV"
+          echo "VERDICT=$verdict" >> "$GITHUB_ENV"
+          why=$(grep -m1 "^  $RAIL " judged.txt | sed 's/^ *//;s/  */ /g' || true)
+          [ -n "$why" ] || why="no line for the claimed rail"
+          # propose.yml's own rule, which the loop was quietly exempt from:
+          # a generated fixture is NOT evidence about a retrieval constant,
+          # so an adoption of a host.* claim on fixture evidence is
+          # downgraded to a refusal that says so. The grid stays
+          # refusal-only until the operator publishes the real forest --
+          # which is honest, not stuck.
+          if [ "$verdict" = "adopt" ] && [ "${CORPUS_MODE:-}" = "fixture" ]; then
+            case "$RAIL" in
+              host.*)
+                verdict=refuse
+                why="the fixture corpus is not evidence about $RAIL; a real forest is"
+                echo "VERDICT=refuse" >> "$GITHUB_ENV"
+                ;;
+            esac
+          fi
+          echo "WHY=$why" >> "$GITHUB_ENV"
+
+      # The monotonic invariants, counted from what both arms actually
+      # printed. A decrease is a refusal for every kind whose row does not
+      # license removal -- today no enabled kind does.
+      #
+      # **Counted before the judge, vetoed after it.** `feature`'s J1 reads
+      # the claim count, so the counting had to move ahead of the judgement;
+      # keeping the veto here is what makes it a veto rather than one more
+      # branch a kind could forget. Two steps, one set of greps -- a second
+      # copy of them is two numbers that have to agree and will not.
+      - name: The counts that may not fall
+        if: env.CAND_DEAD == ''
+        run: |
+          set -euo pipefail
+          sa=$CLAIMS_SA; sb=$CLAIMS_SB
+          ta=$CLAIMS_TA; tb=$CLAIMS_TB
+          ca=$CLAIMS_CA; cb=$CLAIMS_CB
+          if [ "$sb" -lt "$sa" ] || [ "$tb" -lt "$ta" ] || [ "$cb" -lt "$ca" ]; then
+            echo "::error::the candidate answers less than the baseline: sections $sa->$sb, suites $ta->$tb, claims $ca->$cb"
+            echo "VERDICT=refuse" >> "$GITHUB_ENV"
+            echo "WHY=the candidate answers less than the baseline (sections $sa->$sb suites $ta->$tb claims $ca->$cb)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Render the certificate
+        run: |
+          set -euo pipefail
+          # **`ls` on a directory that does not exist exits 2**, `pipefail` hands that
+          # status to the assignment, and `set -e` then ends the shell -- in silence,
+          # because the only message went to /dev/null. That is exactly what happened
+          # to the first night that ever reached a verdict: both arms built, both
+          # booted, the rail was judged `same` and refused correctly, and the
+          # certificate could not be rendered because the ledger had no `entries/`
+          # yet. `3dab0fb` removed the `.keep` placeholders for good reasons -- fsck
+          # was right to refuse them -- and left the loop unable to count to one.
+          #
+          # `if` rather than `[ -d x ] && n=...`, which `pool.yml` already records the
+          # trap for: whether a false AND-OR list is fatal under `set -e` differs
+          # between shells, and here the false case is the ordinary one.
+          n=0
+          if [ -d loop/ledger/entries ]; then
+            n=$(ls -1 loop/ledger/entries | wc -l)
+          fi
+          seq=$(( n + 1 ))
+          python3 tools/godel.py cert --emit \
+            --set "seq=$seq" \
+            --set "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --set "point=$POINT" \
+            --set "kind=$KIND" --set "rung=$RUNG" --set "axis=$AXIS" \
+            --set "parent-tree=$PARENT_TREE" \
+            --set "candidate-tree=$CAND_TREE" \
+            --set "rail=$RAIL" --set "corpus=$CORPUS" \
+            --set "alpha-k=$ALPHA_K" --set "chi-bar=$CHI" \
+            --set "minutes=$MINUTES" --set "half=$HALF" \
+            --set "level=$LEVEL" --set "boots=${BOOTS_SPENT:-1}" \
+            --set "queries=$QUERIES" \
+            --set "sections=$SECTIONS" --set "suites=$SUITES" \
+            --set "claims=$CLAIMS" \
+            --set "witness=$([ "${WITNESS_RES:-}" = fail-then-pass ] && echo fail-then-pass || echo -)" \
+            --set "moved=$MOVED" --set "why=$WHY" \
+            ${LADDER:+--set "ladder=$LADDER"} \
+            --set "verdict=$VERDICT" \
+            --set "runner=${{ github.run_id }}/${{ github.run_attempt }}" \
+            > certificate.cert
+          python3 tools/godel.py cert --check certificate.cert
+          cat certificate.cert
+
+      - name: Keep everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loopjudge-${{ inputs.point }}
+          path: |
+            certificate.cert
+            before.txt
+            after.txt
+            kernel-a2.txt
+            kernel-b2.txt
+            kernel-a2-within.txt
+            kernel-b2-within.txt
+            judged.txt
+            verify-a.log
+            verify-b.log
+            verify-w.log
+            build-a.log
+            build-b.log
+            build-w.log
+            retrieval-a.tsv
+            retrieval-b.tsv
+            retrieval-a.log
+            retrieval-b.log
+          if-no-files-found: ignore
+          retention-days: 90

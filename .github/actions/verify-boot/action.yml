@@ -1,0 +1,288 @@
+name: Verify the built image
+description: >
+  Boot the image this job just built under QEMU with KVM, run every diag suite,
+  and fail unless the machine came up clean and was still alive afterwards.
+
+# **Green used to mean `cargo build --release --locked` succeeded.** That was
+# the whole gate on an artifact this repository signs with a key every machine
+# in the field trusts. A kernel that compiles and then triple-faults on the
+# first page-table walk is green; so is one whose ChaCha20 returns the wrong
+# bytes.
+#
+# One composite action rather than a copy in each workflow, for the reason
+# `theme::chrome` is one formula: two definitions of "verified" would agree on
+# the day they were written and then drift, and the one that drifts is the one
+# nobody is reading.
+#
+# It runs between the build and the signature on purpose. A failure here means
+# no `sign` step runs, so nothing is signed, so nothing is published, so no
+# machine is told about it. That ordering is the gate.
+
+inputs:
+  timeout:
+    description: Seconds to wait for the whole run
+    required: false
+    default: "900"
+  arm:
+    description: >
+      A discriminator for the artifact name, for callers that run this action
+      more than once in one job. Without it the second upload collides with
+      the first -- upload-artifact@v4 refuses a duplicate name -- and the job
+      fails at its very last step, after both builds and both boots were
+      already paid for. propose.yml passes "a" and "b".
+    required: false
+    default: ""
+  smp:
+    description: >
+      Guest core count. Four by default, because `diag mt` and `diag migrate`
+      are false statements about a machine with one core. One is a legitimate
+      ask -- `video bench` is only comparable at -smp 1 -- so the matrix jobs
+      pass it rather than fork the action.
+    required: false
+    default: "4"
+
+runs:
+  using: composite
+  steps:
+    # `ovmf` for the firmware and `qemu-system-x86` for the emulator.
+    # `--no-install-recommends` because the recommends pull in a desktop
+    # session's worth of packages for a job that never opens a window.
+    - name: QEMU and OVMF
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 ovmf
+        qemu-system-x86_64 --version | head -1
+
+    # **Acceleration is not an optimisation here, it is whether this job
+    # exists.** Measured in this repository: a boot plus four cheap commands is
+    # over 24 minutes under TCG and 61 seconds under a hypervisor. A gate that
+    # costs half an hour a push is a gate somebody turns off.
+    #
+    # So a missing or unwritable /dev/kvm fails loudly rather than falling back
+    # to TCG and timing out twenty minutes later, which would read as the
+    # kernel hanging.
+    #
+    # **Whether a standard `ubuntu-latest` runner has it is not settled here.**
+    # GitHub's own announcement of hardware acceleration (23 February 2023) is
+    # explicitly about "larger" hosted runners, the Ubuntu image README does
+    # not list KVM at all, and the nested-virtualisation request is still an
+    # unanswered discussion. The udev rule below is verbatim from that
+    # announcement. This job answers the question on its first run rather than
+    # assuming it: if the device is absent, the fix is one word -- a larger
+    # runner label on the calling workflow, or a self-hosted runner on the
+    # GF63, which is also the only place `dev::power`, `smp bench` and the real
+    # `store bench` mean anything.
+    - name: KVM, or nothing
+      uses: ./.github/actions/kvm
+
+    # A **fixture checkpoint**, built here from nothing, rather than a download
+    # or nothing at all.
+    #
+    # `--no-payload` was the first answer and it was measured wrong. `diag all`
+    # really is 59 of 59 either way -- those suites test machinery and none of
+    # them asks the model a question -- but the gate also reads the *boot*
+    # selftests, and `ai::init` returns early with no checkpoint. Eleven
+    # sections were silently not running: the godel machine, QDoRA adapters,
+    # the backward kernels, the trainer's arithmetic, constrained decoding, the
+    # agent loop, the linear probe, the situation planner, the initiative
+    # policy and the corpus bundles. Which is to say: every claim about the
+    # self-modification loop, on a job whose whole purpose is to gate what that
+    # loop ships.
+    #
+    # `hybtest.py --build` writes a 353 KB hybrid shaped to hit every path the
+    # real one does, and a 256-token byte tokenizer to match -- the kernel
+    # refuses a tokenizer whose ids the embedding does not have, and is right
+    # to. Measured: 18 boot sections without it, 28 with, zero FAIL either way.
+    # No download, no 598 MB of weights that are not in this repository and
+    # never will be.
+    #
+    # **It is a hybrid, so the adapter axis cannot run on this runner**, and
+    # that is a fact worth stating rather than leaving somebody to infer from
+    # a journal nobody reads. `hybtest.py` exists to exercise the Qwen3.5
+    # path, the trainer refuses a hybrid by design -- their gated, partially
+    # rotated projections need a verified backward of their own -- so a
+    # nightly trial here answers `refused: the model is a hybrid the trainer
+    # will not touch`. Driven, at hour 3 with the clock wound forward. That is
+    # correct: this job gates *builds*, and the loop runs on a machine with a
+    # dense checkpoint. Anything that wanted CI to exercise the loop itself
+    # would need a small dense fixture as well, which is a second checkpoint
+    # to build and is not what this job is for.
+    #
+    # `initiative off` then `agent stop` first, in that order, because the
+    # resident mind wakes about fifteen seconds in and holds the engine for a
+    # whole episode -- which presents as this job timing out with commands
+    # unsent. `echo ready` between them and `diag all` because at hypervisor
+    # speed the serial pacing races and two commands can arrive concatenated.
+    - name: Build the fixture checkpoint
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 -m pip install --quiet --disable-pip-version-check numpy
+        python3 tools/hybtest.py out/ci-fixture.bin --build-only
+
+    - name: Boot it and run every suite
+      shell: bash
+      # Inputs through env rather than interpolated into the script -- the
+      # rule propose.yml's envelope taught, applied as a convention even where
+      # the caller is a workflow rather than a person.
+      env:
+        TIMEOUT: ${{ inputs.timeout }}
+        SMP: ${{ inputs.smp }}
+      run: |
+        set -euo pipefail
+        python3 tools/drive.py \
+          --model out/ci-fixture.bin --tokenizer out/ci-fixture-tokenizer.bin \
+          --qemu-extra "-accel kvm -cpu host -smp $SMP" \
+          --timeout "$TIMEOUT" \
+          "initiative off" "agent stop" "echo ready" "diag all" \
+          "echo mid" "bench report" "echo again" "bench report" \
+          "echo once more" "bench report" "echo alive" \
+          2>&1 | tee verify.log
+
+    # Every rail this build can measure about itself, lifted out of the
+    # transcript and kept as its own artifact.
+    #
+    # **Recorded rather than judged, and the distinction is the honest one.**
+    # Comparing two builds needs two reports and this job has one; what it can
+    # do is make sure the number exists and is attached to the commit that
+    # produced it, so the comparison is available to whatever asks later.
+    # **The second reading, not the first**, which is protocol rather than
+    # fussiness. Measured across three boots of one binary on the development
+    # machine: the first was two to three times slower than the next two on
+    # every timing rail, which is the host's page cache meeting a freshly
+    # written image. `tools/rails.py` refuses such a pair outright -- its
+    # controls moved 69% and 74% -- so a first reading is not merely noisy, it
+    # is a reading the comparison will decline to use.
+    #
+    # Two settled readings of one binary come back `same` on all thirteen
+    # rails -- five graphics, four interpreter, ai.matmul, ai.bpb and two
+    # memory-bandwidth, counted from `RAILS` in src/bench.rs rather than
+    # remembered (this line said twelve for a while, against CLAUDE.md's
+    # thirteen, and the table settled it) -- which is what says the
+    # instrument works at all.
+    - name: Keep the rail report
+      shell: bash
+      run: |
+        set -euo pipefail
+        awk '/^\[rail\] v1/{n++} n==2' verify.log \
+          | sed -n '/^\[rail\] v1/,/^\[rail\] end/p' > rails.txt
+        # **A second settled reading, which is what lets a comparison measure
+        # its own noise instead of trusting a table.** The floors in
+        # `tools/rails.py` were taken on one machine, on one build, at one core
+        # count, and had already been wrong by up to seven times once before. A
+        # dry run of `propose.yml` on two builds differing by one retrieval
+        # constant reported three interpreter rails regressed -- a J2 veto,
+        # from noise, on a change that cannot touch the interpreter. Two
+        # readings of one binary bound that directly: what a build does against
+        # itself is the noise with the effect removed by construction.
+        awk '/^\[rail\] v1/{n++} n==3' verify.log \
+          | sed -n '/^\[rail\] v1/,/^\[rail\] end/p' > rails2.txt
+        if ! grep -q '^\[rail\] end' rails.txt; then
+          echo "::error::bench report did not finish"
+          exit 1
+        fi
+        if ! grep -q '^\[rail\] end' rails2.txt; then
+          echo "::error::the third bench report did not finish"
+          exit 1
+        fi
+        # An `absent` rail is a fact about the runner rather than a failure --
+        # CI has no NVMe store and may have no framebuffer. It is surfaced
+        # rather than ignored, because a rail quietly absent on every build is
+        # a rail nobody will notice was never measured.
+        if grep -q ' absent ' rails.txt; then
+          echo "::notice::rails this runner could not measure:"
+          grep ' absent ' rails.txt
+        fi
+        cat rails.txt
+
+    # **Six separate questions, because `diag all` answering cleanly is only
+    # one of them.** A boot that halted before the shell prints no tally at
+    # all, and a grep for FAIL finds nothing in a log that stops at the
+    # firmware banner -- silence passes a check written the obvious way.
+    - name: Read what it said
+      shell: bash
+      run: |
+        set -euo pipefail
+        fail=0
+
+        # 1. drive.py exits 1 on a timeout, and the pipe above would have
+        #    swallowed it without pipefail. Belt and braces: the line itself.
+        if grep -q '\[drive\] TIMEOUT' verify.log; then
+          echo "::error::the run timed out with commands unsent"
+          fail=1
+        fi
+
+        # 2. It reached a shell and was still answering after the suites. This
+        #    is the one that catches a halt, and it is why `echo alive` is the
+        #    last command rather than `diag all`.
+        if ! grep -q '^  alive' verify.log; then
+          echo "::error::the machine never answered after the suites"
+          fail=1
+        fi
+
+        # 3. The tally, which must exist and must read zero failures.
+        tally=$(grep -oE '[0-9]+ passed, [0-9]+ failed' verify.log | tail -1 || true)
+        if [ -z "$tally" ]; then
+          echo "::error::diag printed no tally at all, so nothing ran"
+          fail=1
+        elif ! echo "$tally" | grep -q ', 0 failed'; then
+          echo "::error::$tally"
+          fail=1
+        else
+          echo "$tally"
+        fi
+
+        # 4. Any FAIL line anywhere, including the boot selftests, which run
+        #    long before `diag` and are not in the tally.
+        if grep -nE '(^|[[:space:]])FAIL' verify.log; then
+          echo "::error::something printed FAIL"
+          fail=1
+        fi
+
+        # 5. The sections that only run when a checkpoint loaded.
+        #
+        #    **This check exists because its absence hid eleven of them.** The
+        #    first version of this job staged no model, `ai::init` returned
+        #    early, and every selftest behind it -- the godel machine among
+        #    them -- silently did not run. Nothing printed FAIL, the tally read
+        #    59 of 59, and the gate was green. A count is the cheap half; the
+        #    named one is the half that says *which*, and it is the section
+        #    holding every claim about the loop this job exists to gate.
+        sections=$(grep -c '^\[selftest\]' verify.log || true)
+        if [ "${sections:-0}" -lt 25 ]; then
+          echo "::error::only $sections boot selftest sections ran; expected 25 or more"
+          fail=1
+        fi
+        for want in 'godel machine' 'qdora adapters' 'backward kernels' 'trainer arithmetic'; do
+          if ! grep -q "^\[selftest\] $want" verify.log; then
+            echo "::error::the '$want' section did not run -- did the checkpoint load?"
+            fail=1
+          fi
+        done
+
+        # 6. The boot report, which is what `main::section` writes when a
+        #    subsystem faults or answers `false`. An Optional one does not halt
+        #    the boot, so without this a kernel that came up with a dead
+        #    subsystem would be signed and published.
+        if grep -q 'did not survive their own selftest' verify.log; then
+          echo "::error::a subsystem did not survive its own selftest"
+          grep -A 6 'did not survive their own selftest' verify.log
+          fail=1
+        fi
+
+        exit $fail
+
+    - name: Keep the transcript
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: verify-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.arm && format('-{0}', inputs.arm) || '' }}
+        path: |
+          verify.log
+          rails.txt
+          rails2.txt
+          .qemu/qemu-stderr.log
+        if-no-files-found: ignore
+        retention-days: 14

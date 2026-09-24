@@ -1,0 +1,1208 @@
+name: loop-night
+
+# The CI Godel machine's night: follow main, reconsider, propose, judge,
+# adopt. Four jobs under ONE concurrency group, which is what makes
+# fast-forward-only real -- there is never a second night interleaving with
+# this one, so adopt's fetch-then-commit is atomic in the only sense that
+# matters here.
+#
+# The machine's whole world is `loop/*`. Its token has `contents: write`
+# and no `workflows` write, so GitHub itself rejects any push touching
+# `.github/workflows/**`; the audit PR is how its work reaches a human, and
+# `main` is reachable only through that human.
+#
+# CONSUMER: loop/main's ledger (the next night reads it), the rolling audit
+# PR (the operator reads it), and ci.yml, which re-verifies every push to
+# loop/** with a job the loop does not control. CANARY: the three Phase 1
+# drills -- broken-candidate refused end to end, stale detected at adopt,
+# a hand-edited certificate refused by fsck -- plus fsck halting the whole
+# night on a corrupted ledger, proven in godel.py's own selftest.
+#
+# The cron is live. It was commented until the Phase 1 exit proof was
+# green, per the plan -- a schedule is the last thing a loop earns -- and
+# `loop-proof.yml` is that proof. See the note on the schedule below for
+# what else had to stop being true first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "propose and judge, but adopt writes nothing"
+        type: boolean
+        default: false
+      # `author_target` was here, and it is gone on purpose. It carried the
+      # note that an unattended targeting policy is a design decision rather
+      # than a default, which was correct while the loop had no goal: without
+      # one, nothing but a human could say which file the model should touch.
+      #
+      # `loop/goal.txt` is that policy now. The open rung names its own target
+      # and its own kind, so the night needs no input at all -- which is the
+      # whole requirement: the operator writes one line, and the rest is the
+      # system. An input left here would be a hand on the wheel every night.
+  # **The schedule, earned.** This read "the cron stays commented until
+  # the Phase 1 exit proof is green, per the plan: a schedule is the last
+  # thing a loop earns" for as long as the file has existed, and the proof
+  # was never written -- a gate on a thing that did not exist can only stay
+  # shut. `loop-proof.yml` is that proof and run 35748769962 is it green:
+  # the three decisions as claims, and a broken candidate refused end to
+  # end with a certificate `cert --check` accepts and `adopt-decide` lands
+  # on the live tree.
+  #
+  # What makes an unattended night safe is not the proof alone. Four things
+  # had to stop being true first, and each was a way the loop stalls with
+  # nobody watching:
+  #
+  #   a candidate that would not build took the judge down, so nothing was
+  #   filed and `refused` never moved on the rung that produced it
+  #
+  #   a night with no inference server recorded a balk against the rung,
+  #   so an afternoon of failed downloads would have retired the ladder
+  #
+  #   every failed night leaked its candidate branch, because `tidy` was
+  #   keyed on `dry_run` and `adopt` only runs after a green judge
+  #
+  #   and a rung could be neither met nor retired, because the certificate
+  #   carried the envelope's point and `ladder.py` counts on the rung's --
+  #   so the loop would have rebuilt one file every night for good
+  #
+  # It still cannot reach `main`. The token has no `workflows` write, the
+  # machine's whole world is `loop/*`, and the rolling audit PR is the only
+  # route to the operator's tree -- which a human merges.
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loop-main
+  cancel-in-progress: false
+
+jobs:
+  # --- follow: the machine follows main, never the reverse -----------------
+  follow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tip: ${{ steps.tip.outputs.tip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: loop/main
+          fetch-depth: 0
+
+      - name: A corrupted ledger judges nothing
+        run: python3 tools/godel.py fsck --root .
+
+      - name: Follow main, and record what it overrode
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "already carries main"
+          else
+            # First find out WHAT conflicts, then let main win. A conflict
+            # here is the operator having overridden an adoption, and the
+            # ledger records the override instead of pretending it did not
+            # happen -- main is the human authority.
+            set +e
+            git merge --no-commit --no-ff origin/main >/dev/null 2>&1
+            set -e
+            conflicted=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            if [ -n "$conflicted" ]; then
+              git checkout --theirs -- .
+              git add -A
+              parent=$(git rev-parse 'HEAD^{tree}')
+              git commit -m "loop: follow main, which overrode: $conflicted"
+              cand=$(git rev-parse 'HEAD^{tree}')
+              # Counted the safe way; see the long note in loop-judge.yml. `ls` on an
+              # absent directory exits 2 and `pipefail` makes that the shell's last word.
+              n=0
+              if [ -d loop/ledger/entries ]; then
+                n=$(ls -1 loop/ledger/entries | wc -l)
+              fi
+              seq=$(( n + 1 ))
+              point=$(printf 'superseded by main at %s over %s' \
+                "$(git rev-parse origin/main)" "$conflicted" | sha256sum | cut -d' ' -f1)
+              python3 tools/godel.py cert --emit \
+                --set "seq=$seq" --set "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --set "point=$point" --set "kind=event" --set "rung=1" \
+                --set "axis=grid" --set "parent-tree=$parent" \
+                --set "candidate-tree=$cand" --set "rail=none" \
+                --set "corpus=00000000" --set "alpha-k=0" --set "chi-bar=-" \
+                --set "minutes=0" --set "half=extend" --set "level=0" \
+                --set "boots=0" --set "queries=0" --set "sections=0/0" --set "suites=0/0" \
+                --set "claims=0/0" --set "witness=-" --set "moved=-" \
+                --set "why=main overrode: $conflicted" \
+                --set "verdict=superseded" \
+                --set "runner=${{ github.run_id }}/${{ github.run_attempt }}" \
+                > /tmp/superseded.cert
+              name=$(sha256sum /tmp/superseded.cert | cut -c1-16)
+              mkdir -p loop/ledger/entries
+              cp /tmp/superseded.cert "loop/ledger/entries/$name.cert"
+              git add loop/ledger/entries
+              git commit -m "loop: a superseded entry for what main overrode"
+            else
+              git commit -m "loop: follow main" || echo "nothing to merge"
+            fi
+            python3 tools/godel.py fsck --root .
+            git push origin HEAD:loop/main
+          fi
+
+      - name: Where the night grows from
+        id: tip
+        run: echo "tip=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  # --- plan: the model and the ladder, once ---------------------------------
+  #
+  # **This was the head of `propose` and it is its own job so the author can
+  # be more than one runner.** Six `create` attempts ran in series in one
+  # job and cost 454 seconds of a 900-second budget -- and, because the
+  # decode is greedy at temperature 0, those six attempts were six draws
+  # from one distribution with only the compiler's feedback to move them.
+  # Measured both ways: five identical first answers to five identical
+  # cards, and separately four distinct error sets converging on the fifth
+  # attempt. So the loop had a feedback loop or a search, never both, and
+  # the runner it was using was one of twenty it could have.
+  #
+  # The split is what buys both. This job decides the rung once; `author`
+  # fans out over shards that each draw with their own declared seed and
+  # each spend their own attempts on the compiler's feedback; `propose`
+  # reads what came back. The wall clock is one shard rather than the sum.
+  plan:
+    runs-on: ubuntu-latest
+    # Forty-five: the decomposer's three attempts on a 4B at four bits, on
+    # four vCPU, after a 2.8 GB fetch on a cold cache.
+    timeout-minutes: 45
+    needs: follow
+    permissions:
+      contents: write
+    outputs:
+      rung: ${{ steps.rung.outputs.have }}
+      verb: ${{ steps.rung.outputs.verb }}
+      order: ${{ steps.rung.outputs.order }}
+      # **The tree the rest of the night grows from is this job's LAST
+      # commit, not follow's.** Reconsider may commit a rollback and the
+      # ladder step may commit a new rung, both pushed to loop/main. When
+      # all of this was one job the later steps simply stood on that HEAD;
+      # as three jobs, a shard that checked out follow's tip would draw
+      # against a tree that no longer exists and name a parent the judge
+      # cannot find.
+      tip: ${{ steps.rung.outputs.tip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.follow.outputs.tip }}
+          fetch-depth: 0
+
+      # Clade before axis, as the kernel orders it. Under MIN_EVIDENCE (6)
+      # trials below the head this answers "stay" by construction, so early
+      # nights report and move on; when it answers Back, the backtrack is a
+      # real commit -- the target tree restored, the ledger carried forward
+      # whole, and a `rollback` event entry appended -- through the same
+      # index plumbing adopt uses, so the worktree never mediates.
+      - name: Reconsider, and go if the record says go
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          d=$(python3 tools/godel.py reconsider --root . --emit)
+          echo "clade says: $d"
+          case "$d" in back=*) ;; *) exit 0;; esac
+          back=${d#back=}; back=${back%% *}
+          target=${d##*target=}
+          parent=$(git rev-parse 'HEAD^{tree}')
+          # Counted the safe way; see the long note in loop-judge.yml. `ls` on an
+          # absent directory exits 2 and `pipefail` makes that the shell's last word.
+          n=0
+          if [ -d loop/ledger/entries ]; then
+            n=$(ls -1 loop/ledger/entries | wc -l)
+          fi
+          seq=$(( n + 1 ))
+          point=$(printf 'rollback %s steps to %s from %s' "$back" "$target" "$parent"             | sha256sum | cut -d' ' -f1)
+          # The commit's tree: the target, with the CURRENT ledger overlaid
+          # (a rollback that rolled back its own record would be a lineage
+          # erasing the decision that moved it), plus the event entry.
+          python3 tools/godel.py cert --emit             --set "seq=$seq" --set "utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"             --set "point=$point" --set "kind=event" --set "rung=1"             --set "axis=grid" --set "parent-tree=$parent"             --set "candidate-tree=$target" --set "rail=none"             --set "corpus=00000000" --set "alpha-k=0" --set "chi-bar=-"             --set "minutes=0" --set "half=extend" --set "level=0"             --set "boots=0" --set "queries=0" --set "sections=0/0" --set "suites=0/0"             --set "claims=0/0" --set "witness=-" --set "moved=-"             --set "why=the clade chose an ancestor: back $back"             --set "verdict=rollback"             --set "runner=${{ github.run_id }}/${{ github.run_attempt }}"             > /tmp/rollback.cert
+          name=$(sha256sum /tmp/rollback.cert | cut -c1-16)
+          blob=$(git hash-object -w /tmp/rollback.cert)
+          export GIT_INDEX_FILE=/tmp/rb-index
+          git read-tree "$target"
+          git rm -r --cached loop/ledger --quiet 2>/dev/null || true
+          git read-tree --prefix=loop/ledger/ 'HEAD:loop/ledger'
+          git update-index --add --cacheinfo             "100644,$blob,loop/ledger/entries/$name.cert"
+          tree=$(git write-tree)
+          unset GIT_INDEX_FILE
+          new=$(git commit-tree "$tree" -p HEAD -m "loop: rollback $back to ${target:0:12} (seq $seq)")
+          git checkout -f --detach "$new"
+          python3 tools/godel.py fsck --root .
+          git push origin "$new:refs/heads/loop/main"
+
+      # **The author runs here, in the job, and needs no credential.**
+      #
+      # GitHub Models retired mid-loop -- `HTTP 410
+      # github_models_retirement_brownout` -- and the property it was chosen
+      # for was "the workflow's own token, no new credential". A model in the
+      # job restores that better than the hosted endpoint ever had it: there
+      # is no token at all, and a pinned tarball plus a pinned GGUF are two
+      # files with digests, which do not get retired.
+      #
+      # What a later run can re-derive is the VERDICT, from the patch the
+      # envelope carries whole; the draw that wrote the patch is provenance.
+      - uses: actions/cache@v4
+        with:
+          path: out/models
+          # Keyed on the manifests, so repinning either the runtime or the
+          # weights misses the cache by construction. `fetchmodel.py` checks
+          # the digest again on a hit regardless: a restored cache is a
+          # transfer too, and this tree does not trust transfers.
+          key: author-${{ hashFiles('tools/models/*.txt') }}
+
+      - name: The author it will ask
+        id: author
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 tools/fetchmodel.py tools/models/llama-cpp.txt --out out/models
+          python3 tools/fetchmodel.py tools/models/qwen38-4b.txt --out out/models
+          tar -xzf out/models/llama-b11071-bin-ubuntu-x64.tar.gz -C out/models
+          bin=out/models/llama-b11071
+          chmod +x "$bin"/llama-server "$bin"/llama-quantize
+
+          # **Q4_K_M fetched whole, where the old author was requantised
+          # here.** Bonsai shipped as Q2_0, which has no x86 kernel and so
+          # ran scalar -- 2.18 t/s prefill against TQ2_0's 17.33 -- so the
+          # night converted it locally and pinned the derived file. This
+          # one needs none of that: Q4_K_M is a first-class llama.cpp
+          # quantisation with kernels, so there is nothing to derive and
+          # nothing to keep byte-reproducible.
+          #
+          # It costs bytes instead. 2.78 GB against 1.18, and CPU decode
+          # is memory-bandwidth bound, so roughly twice the time per
+          # token. The fan-out is what pays for it: every shard gets the
+          # full six attempts on its own runner, so the night's wall clock
+          # is one shard's however many there are.
+          tq=out/models/Qwen3.8-4B-Q4_K_M.gguf
+          # The shared objects sit beside the binary in the tarball, and
+          # nothing guarantees an RPATH survives extraction.
+          # **`--reasoning off`, or every answer lands in the wrong field.**
+          # This author opens every answer with a `<think>` block unless
+          # told not to, and b11071 enforces a raw grammar from the first
+          # generated token -- which, with thinking on, is already inside
+          # the block the template opened. So the fence is sampled as
+          # reasoning, nothing in the grammar ever closes it, and the
+          # reply comes back with its whole file in `reasoning_content`
+          # and `content` empty: a perfectly shaped answer that reads as
+          # none. Off, the template writes an empty think block itself and
+          # the grammar starts where the answer does. `ask_model` asks for
+          # the same thing per request, so neither half depends on the
+          # other being there.
+          #
+          # `-np 1` because nothing here asks twice at once, and one slot
+          # is the whole context rather than a share of it. And 16384
+          # because a retry card carries the compiler's last refusal on
+          # top of a 2,600-token answer budget, and running out of context
+          # mid-file is a truncation the grammar cannot see.
+          #
+          # Asked of the binary before it is passed, because the flag was
+          # read out of b11071's source and not yet run: a server handed
+          # an argument it does not know exits before `/health`, and that
+          # would stand the whole model lane down to switch off one thing
+          # `ask_model` already switches off per request.
+          # Read into a variable and not piped: `grep -q` leaves at the
+          # first match, the writer takes a SIGPIPE, and under `pipefail`
+          # that reads as the flag being absent exactly when it is there.
+          help=$(LD_LIBRARY_PATH="$PWD/$bin" "$bin"/llama-server --help 2>&1 || true)
+          think=""
+          if grep -qE -- '--reasoning( |,|$)' <<< "$help"; then
+            think="--reasoning off"
+          else
+            echo "::warning::llama-server has no --reasoning flag; thinking is off per request only"
+          fi
+          LD_LIBRARY_PATH="$PWD/$bin" "$bin"/llama-server \
+            -m "$tq" $think -np 1 \
+            --host 127.0.0.1 --port 8080 -c 16384 -t 4 --threads-batch 4 \
+            > out/models/server.log 2>&1 &
+          for i in $(seq 1 120); do
+            if curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              # `--no-warmup` was here and is deliberately gone. It defers
+              # the weight load to the first request, so `/health` answered
+              # in **4 seconds** and the completion then timed out -- a
+              # server that is up by every check available and cannot answer
+              # anything yet. The cost moves into this wait, where it shows.
+              echo "  the server answered after ${i}s"
+              echo "GLADOS_INFERENCE_URL=http://127.0.0.1:8080/v1/chat/completions" \
+                >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          # `continue-on-error`, deliberately. A night with no inference is a
+          # night that authored nothing, which is an ordinary outcome: the
+          # grid, `discover` and the template families need no model and are
+          # most of what the loop can do. The step goes red so somebody sees
+          # it; the night carries on.
+          echo "::error::llama-server never answered on 127.0.0.1:8080"
+          tail -40 out/models/server.log || true
+          exit 1
+
+      # **The operator writes one line and the machine writes the rest.**
+      # `loop/goal.txt` is the north star; this keeps the ladder under it
+      # stocked. A rung is a milestone with a witness, so a night always has
+      # something to aim at that is not "walk the grid again" -- which is
+      # where the kernel-side machine stopped, eight points and then nothing.
+      #
+      # It asks GitHub Models with this workflow's own token and no new
+      # credential, and everything the reply could do is refused by
+      # `ladder.py` before it is a rung: prose outside the fence, two fences,
+      # a kind with no witness, a stale goal hash, a sequence that skips, a
+      # target outside the kind's masks or inside the evaluator, or a line
+      # trying to declare the `point` that would mark it met.
+      #
+      # A refusal is the ordinary outcome and not a failure. The night goes on
+      # to the grid; retrying with more context is how a fence contract stops
+      # being one.
+
+      # **The operator writes one line and the machine writes the rest.**
+      # `loop/goal.txt` is the north star; this keeps the ladder under it
+      # stocked. A rung is a milestone with a witness, so a night always has
+      # something to aim at that is not "walk the grid again" -- which is
+      # where the kernel-side machine stopped, eight points and then nothing.
+      #
+      # It asks GitHub Models with this workflow's own token and no new
+      # credential, and everything the reply could do is refused by
+      # `ladder.py` before it is a rung: prose outside the fence, two fences,
+      # a kind with no witness, a stale goal hash, a sequence that skips, a
+      # target outside the kind's masks or inside the evaluator, or a line
+      # trying to declare the `point` that would mark it met.
+      #
+      # A refusal is the ordinary outcome and not a failure. The night goes on
+      # to the grid; retrying with more context is how a fence contract stops
+      # being one.
+      - name: Keep the ladder stocked
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if python3 tools/ladder.py next --root . >/dev/null 2>&1; then
+            echo "  a rung is already open:"
+            python3 tools/ladder.py next --root .
+            exit 0
+          fi
+          set +e
+          out=$(python3 tools/ladder.py propose --root . 2>&1); code=$?
+          set -e
+          echo "$out"
+          if [ "$code" != "0" ]; then
+            echo "::notice::no new rung tonight; the grid still has work"
+            exit 0
+          fi
+          git add loop/ladder
+          git commit -m "loop: a rung toward the north star"
+          git push origin HEAD:loop/main
+
+      # **The author's compile gate needs a toolchain, and this job had
+      # none.** Without it `godel.py create` answers `cannot` and every
+      # reply goes to a runner unchecked -- which is safe, the judge still
+      # decides, and wastes a night per typo. With it, a reply that does
+      # not compile costs a `cargo check` and the author is asked again:
+      # measured at 12 s warm on this tree against a build, two boots and a
+      # rail collection.
+
+      # The rung travels as a FILE and not as a job output. A title carries
+      # spaces and backticks and a witness carries a sentence, and every one
+      # of those is a quoting accident waiting in `$GITHUB_OUTPUT`; this
+      # loop has already spent three nights on a reason that reached
+      # argparse as several arguments. An artifact is bytes.
+      - name: Which rung, and which lanes in which order
+        id: rung
+        run: |
+          set -euo pipefail
+          have=no
+          verb=author
+          if python3 tools/ladder.py next --root . --emit-env /tmp/rung.env; then
+            have=yes
+            verb=$(awk -F= '$1=="RUNG_VERB"{print $2}' /tmp/rung.env)
+          else
+            : > /tmp/rung.env
+          fi
+          order=$(python3 tools/godel.py lanes --root . | sed -n 's/^order //p')
+          echo "have=$have" >> "$GITHUB_OUTPUT"
+          echo "verb=$verb" >> "$GITHUB_OUTPUT"
+          echo "order=$order" >> "$GITHUB_OUTPUT"
+          echo "tip=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "  rung open: $have; lanes: $order"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loop-rung
+          path: /tmp/rung.env
+          if-no-files-found: error
+          retention-days: 7
+
+  # --- author: one shard, one declared draw ---------------------------------
+  #
+  # **Speculative, and that is the point.** The lane walk in `propose` may
+  # never reach the model -- the template lane could take the night -- and
+  # these shards will have run anyway. On a public repository hosted minutes
+  # are free and the concurrency limit is twenty jobs, so the thing being
+  # spent is a resource that does not deplete, to buy the one that does:
+  # wall clock inside a night.
+  #
+  # `fail-fast: false`, because a shard is a sample. One that does not
+  # compile is a sample that did not work and says nothing about the next,
+  # and cancelling its siblings for it would make the search narrower the
+  # worse the draw was.
+  author:
+    runs-on: ubuntu-latest
+    # **Seventy-five, and the arithmetic is the reason.** Six attempts,
+    # each a prefill of a card that grows by the compiler's last refusal
+    # and up to 2,600 tokens of answer at four bits on four vCPU, is about
+    # five minutes an attempt at worst and thirty for the six -- the old
+    # thirty-minute cap was the answer budget exactly, with nothing left
+    # for the fetch, the toolchain or a cold cargo cache. A timeout that
+    # fires mid-draw is a shard that says nothing about the rung, which is
+    # safe and wasted.
+    timeout-minutes: 75
+    needs: [follow, plan]
+    if: needs.plan.outputs.rung == 'yes' && contains(needs.plan.outputs.order, 'model')
+    strategy:
+      fail-fast: false
+      matrix:
+        # Public repository, so a runner-minute costs nothing, and every
+        # shard is another independent sample of a rung the greedy path
+        # may be wrong about the same way every night. Single digits, so
+        # the lexical order `propose` reads them in is the numeric one.
+        shard: [0, 1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tip }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: loop-rung
+          path: /tmp
+
+      # **The author runs here, in the job, and needs no credential.**
+      #
+      # GitHub Models retired mid-loop -- `HTTP 410
+      # github_models_retirement_brownout` -- and the property it was chosen
+      # for was "the workflow's own token, no new credential". A model in the
+      # job restores that better than the hosted endpoint ever had it: there
+      # is no token at all, and a pinned tarball plus a pinned GGUF are two
+      # files with digests, which do not get retired.
+      #
+      # What a later run can re-derive is the VERDICT, from the patch the
+      # envelope carries whole; the draw that wrote the patch is provenance.
+      - uses: actions/cache@v4
+        with:
+          path: out/models
+          # Keyed on the manifests, so repinning either the runtime or the
+          # weights misses the cache by construction. `fetchmodel.py` checks
+          # the digest again on a hit regardless: a restored cache is a
+          # transfer too, and this tree does not trust transfers.
+          key: author-${{ hashFiles('tools/models/*.txt') }}
+
+      - name: The author it will ask
+        id: author
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 tools/fetchmodel.py tools/models/llama-cpp.txt --out out/models
+          python3 tools/fetchmodel.py tools/models/qwen38-4b.txt --out out/models
+          tar -xzf out/models/llama-b11071-bin-ubuntu-x64.tar.gz -C out/models
+          bin=out/models/llama-b11071
+          chmod +x "$bin"/llama-server "$bin"/llama-quantize
+
+          # **Q4_K_M fetched whole, where the old author was requantised
+          # here.** Bonsai shipped as Q2_0, which has no x86 kernel and so
+          # ran scalar -- 2.18 t/s prefill against TQ2_0's 17.33 -- so the
+          # night converted it locally and pinned the derived file. This
+          # one needs none of that: Q4_K_M is a first-class llama.cpp
+          # quantisation with kernels, so there is nothing to derive and
+          # nothing to keep byte-reproducible.
+          #
+          # It costs bytes instead. 2.78 GB against 1.18, and CPU decode
+          # is memory-bandwidth bound, so roughly twice the time per
+          # token. The fan-out is what pays for it: every shard gets the
+          # full six attempts on its own runner, so the night's wall clock
+          # is one shard's however many there are.
+          tq=out/models/Qwen3.8-4B-Q4_K_M.gguf
+          # The shared objects sit beside the binary in the tarball, and
+          # nothing guarantees an RPATH survives extraction.
+          # **`--reasoning off`, or every answer lands in the wrong field.**
+          # This author opens every answer with a `<think>` block unless
+          # told not to, and b11071 enforces a raw grammar from the first
+          # generated token -- which, with thinking on, is already inside
+          # the block the template opened. So the fence is sampled as
+          # reasoning, nothing in the grammar ever closes it, and the
+          # reply comes back with its whole file in `reasoning_content`
+          # and `content` empty: a perfectly shaped answer that reads as
+          # none. Off, the template writes an empty think block itself and
+          # the grammar starts where the answer does. `ask_model` asks for
+          # the same thing per request, so neither half depends on the
+          # other being there.
+          #
+          # `-np 1` because nothing here asks twice at once, and one slot
+          # is the whole context rather than a share of it. And 16384
+          # because a retry card carries the compiler's last refusal on
+          # top of a 2,600-token answer budget, and running out of context
+          # mid-file is a truncation the grammar cannot see.
+          #
+          # Asked of the binary before it is passed, because the flag was
+          # read out of b11071's source and not yet run: a server handed
+          # an argument it does not know exits before `/health`, and that
+          # would stand the whole model lane down to switch off one thing
+          # `ask_model` already switches off per request.
+          # Read into a variable and not piped: `grep -q` leaves at the
+          # first match, the writer takes a SIGPIPE, and under `pipefail`
+          # that reads as the flag being absent exactly when it is there.
+          help=$(LD_LIBRARY_PATH="$PWD/$bin" "$bin"/llama-server --help 2>&1 || true)
+          think=""
+          if grep -qE -- '--reasoning( |,|$)' <<< "$help"; then
+            think="--reasoning off"
+          else
+            echo "::warning::llama-server has no --reasoning flag; thinking is off per request only"
+          fi
+          LD_LIBRARY_PATH="$PWD/$bin" "$bin"/llama-server \
+            -m "$tq" $think -np 1 \
+            --host 127.0.0.1 --port 8080 -c 16384 -t 4 --threads-batch 4 \
+            > out/models/server.log 2>&1 &
+          for i in $(seq 1 120); do
+            if curl -sf http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              # `--no-warmup` was here and is deliberately gone. It defers
+              # the weight load to the first request, so `/health` answered
+              # in **4 seconds** and the completion then timed out -- a
+              # server that is up by every check available and cannot answer
+              # anything yet. The cost moves into this wait, where it shows.
+              echo "  the server answered after ${i}s"
+              echo "GLADOS_INFERENCE_URL=http://127.0.0.1:8080/v1/chat/completions" \
+                >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          # `continue-on-error`, deliberately. A night with no inference is a
+          # night that authored nothing, which is an ordinary outcome: the
+          # grid, `discover` and the template families need no model and are
+          # most of what the loop can do. The step goes red so somebody sees
+          # it; the night carries on.
+          echo "::error::llama-server never answered on 127.0.0.1:8080"
+          tail -40 out/models/server.log || true
+          exit 1
+
+      # **The operator writes one line and the machine writes the rest.**
+      # `loop/goal.txt` is the north star; this keeps the ladder under it
+      # stocked. A rung is a milestone with a witness, so a night always has
+      # something to aim at that is not "walk the grid again" -- which is
+      # where the kernel-side machine stopped, eight points and then nothing.
+      #
+      # It asks GitHub Models with this workflow's own token and no new
+      # credential, and everything the reply could do is refused by
+      # `ladder.py` before it is a rung: prose outside the fence, two fences,
+      # a kind with no witness, a stale goal hash, a sequence that skips, a
+      # target outside the kind's masks or inside the evaluator, or a line
+      # trying to declare the `point` that would mark it met.
+      #
+      # A refusal is the ordinary outcome and not a failure. The night goes on
+      # to the grid; retrying with more context is how a fence contract stops
+      # being one.
+
+      # **The author's compile gate needs a toolchain, and this job had
+      # none.** Without it `godel.py create` answers `cannot` and every
+      # reply goes to a runner unchecked -- which is safe, the judge still
+      # decides, and wastes a night per typo. With it, a reply that does
+      # not compile costs a `cargo check` and the author is asked again:
+      # measured at 12 s warm on this tree against a build, two boots and a
+      # rail collection.
+      - name: The toolchain the author checks against
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version --verbose
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: uefi-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      # **Shard 0 draws greedily and the rest draw seeded.** Zero is the
+      # night the loop would have had anyway, so the fan-out can only ever
+      # add: if the greedy path was going to work, shard 0 produces it and
+      # wins the tie by being lowest. The others are declared draws --
+      # `--seed N` at the temperature the front matter names -- and the
+      # seed is provenance, which shard's answer this was. It is not a
+      # replay: logits move with the runner's CPU and the server's cache,
+      # and nothing needs them not to, because what a later run re-derives
+      # is the verdict on the patch, which the envelope carries whole.
+      - name: One draw, and the compiler's answer to it
+        id: draw
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          n=${{ matrix.shard }}
+          target=$(awk -F= '$1=="RUNG_TARGET"{print $2}' /tmp/rung.env)
+          kind=$(awk -F= '$1=="RUNG_KIND"{print $2}' /tmp/rung.env)
+          title=$(sed -n 's/^RUNG_TITLE=//p' /tmp/rung.env)
+          witness=$(sed -n 's/^RUNG_WITNESS=//p' /tmp/rung.env)
+          verb=$(awk -F= '$1=="RUNG_VERB"{print $2}' /tmp/rung.env)
+          mkdir -p /tmp/shard
+          echo "$n" > /tmp/shard/shard.txt
+          # **No server is not a draw.** The author step is
+          # `continue-on-error`, so a shard whose llama-server never came up
+          # reaches here -- and without this it would come back empty and
+          # count toward a balk against the rung. Three balks retire a rung,
+          # so a bad afternoon for a CDN would retire the ladder. That was
+          # fixed once when the author lived in `propose` and moving it here
+          # would have quietly un-fixed it.
+          if [ "${{ steps.author.outcome }}" = "failure" ]; then
+            echo "noserver" > /tmp/shard/noserver
+            echo "  shard $n: no inference server, so this is not a draw" \
+              > /tmp/shard/why.txt
+            exit 1
+          fi
+          # **Every shard keeps the whole budget.** Shard 0 is the night
+          # the loop would have had, greedy with `create`'s own six
+          # attempts, and the seeded shards get the same six: they run on
+          # their own runners, so the wall clock is one shard's either way,
+          # and an attempt is where the compiler's feedback does its work.
+          # Two each was the first version and bought nothing but a shard
+          # that stopped while it was still converging.
+          seed=""
+          if [ "$n" != "0" ]; then
+            seed="--seed $n"
+          fi
+          # **Both verbs.** A rung that creates a file is `create`; a
+          # witnessed rung -- `bugfix`, `test` -- edits a file that exists
+          # and is `author`, which writes the diff. The first version of
+          # this step answered only `create` and turned every witnessed rung
+          # away as "not a fan-out", uncounted and unasked -- so once the
+          # first rung was met and the ladder offered a witnessed one, it
+          # would have been retired by balks without the model ever seeing
+          # it. Nothing else calls `author` any more; this is its only door.
+          set +e
+          if [ "$verb" = "create" ]; then
+            python3 tools/godel.py create --root . \
+              --kind "$kind" --target "$target" \
+              --title "$title" --witness "$witness" \
+              $seed \
+              --emit-env /tmp/shard/env.txt > /tmp/shard/account.txt 2> /tmp/shard/why.txt
+          else
+            python3 tools/godel.py author --root . \
+              --kind "$kind" --target "$target" $seed \
+              --emit-env /tmp/shard/env.txt > /tmp/shard/account.txt 2> /tmp/shard/why.txt
+          fi
+          code=$?
+          set -e
+          cat /tmp/shard/why.txt >&2
+          # **Written last, and only by a draw that finished.** A shard
+          # killed by its timeout or by a cancel still uploads what it had,
+          # and a partial `why.txt` is not evidence about the rung -- so the
+          # count `propose` makes is of shards that positively got an
+          # answer, rather than of shards that failed to say they did not.
+          #
+          # And 3 is not a draw either. It is `godel.NO_ANSWER`: the server
+          # came up and then never answered, or answered only inside its
+          # think block. That is the no-server case arriving after the
+          # health check instead of before it, and it is a fact about the
+          # night, so it must not become a balk against the rung.
+          case "$code" in
+            0|1) echo "$code" > /tmp/shard/drew ;;
+            3) echo "noanswer" > /tmp/shard/noanswer ;;
+          esac
+          exit $code
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: loop-shard-${{ matrix.shard }}
+          path: /tmp/shard
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # --- propose: the lane walk, over what the shards brought back ------------
+  #
+  # It decodes nothing now. The model lane reads `author`'s artifacts and the
+  # other two lanes never needed a model, so this job wants cargo and a
+  # checkout and nothing else -- which is why the three-gigabyte author is
+  # fetched in `plan` and in the shards and not here.
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [follow, plan, author]
+    # `!cancelled()` and not `always()`: a shard that drew nothing is a
+    # shard that failed, and the night still has two other lanes to walk --
+    # but an operator who cancelled the run meant it, and `always()` would
+    # walk the lanes anyway and mark a point tried on a night nobody wanted.
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    permissions:
+      contents: write
+    outputs:
+      point: ${{ steps.pick.outputs.point }}
+      rail: ${{ steps.pick.outputs.rail }}
+      alpha_k: ${{ steps.pick.outputs.alpha_k }}
+      chi_bar: ${{ steps.pick.outputs.chi_bar }}
+      minutes: ${{ steps.pick.outputs.minutes }}
+      half: ${{ steps.pick.outputs.half }}
+      level: ${{ steps.pick.outputs.level }}
+      boots: ${{ steps.pick.outputs.boots }}
+      queries: ${{ steps.pick.outputs.queries }}
+      ladder: ${{ steps.pick.outputs.ladder }}
+      kind: ${{ steps.pick.outputs.kind }}
+      rung: ${{ steps.pick.outputs.rung }}
+      axis: ${{ steps.pick.outputs.axis }}
+      corpus: ${{ steps.pick.outputs.corpus }}
+      baseline: ${{ steps.pick.outputs.baseline }}
+      candidate: ${{ steps.pick.outputs.candidate }}
+      have: ${{ steps.pick.outputs.have }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.tip }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: loop-rung
+          path: /tmp
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: loop-shard-*
+          path: /tmp/shards
+
+      # **The author's compile gate needs a toolchain, and this job had
+      # none.** Without it `godel.py create` answers `cannot` and every
+      # reply goes to a runner unchecked -- which is safe, the judge still
+      # decides, and wastes a night per typo. With it, a reply that does
+      # not compile costs a `cargo check` and the author is asked again:
+      # measured at 12 s warm on this tree against a build, two boots and a
+      # rail collection.
+      - name: The toolchain the author checks against
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version --verbose
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: uefi-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      - name: Pick the next point, and mark it tried before anything runs
+        id: pick
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # **The target comes from the ladder, not from a dispatch input.**
+          # It was `inputs.author_target`, under a comment saying an
+          # unattended targeting policy is a design decision rather than a
+          # default -- which was right when there was no goal. There is one
+          # now, so the open rung names the file and the kind, and the
+          # operator is out of the nightly path entirely.
+          rung_target=""
+          rung_kind="cleanup"
+          rung_title=""
+          rung_witness=""
+          rung_point=""
+          verb="author"
+          if [ -s /tmp/rung.env ]; then
+            # **The rung's point, carried all the way to the certificate.**
+            # It was emitted here and read by nobody, so `ladder.py` counted
+            # `met` and `refused` against a point no certificate ever
+            # carried -- the envelope's point identifies the patch and
+            # differs every night. Both counters read zero forever, so a
+            # rung could be neither completed nor retired, and the loop
+            # would have rebuilt the same file every night with the ladder
+            # never leaving its first rung.
+            rung_point=$(awk -F= '$1=="RUNG_POINT"{print $2}' /tmp/rung.env)
+            rung_target=$(awk -F= '$1=="RUNG_TARGET"{print $2}' /tmp/rung.env)
+            rung_kind=$(awk -F= '$1=="RUNG_KIND"{print $2}' /tmp/rung.env)
+            rung_title=$(sed -n 's/^RUNG_TITLE=//p' /tmp/rung.env)
+            rung_witness=$(sed -n 's/^RUNG_WITNESS=//p' /tmp/rung.env)
+            verb=$(awk -F= '$1=="RUNG_VERB"{print $2}' /tmp/rung.env)
+          fi
+
+          # **Which lane goes first is the ledger's answer, not this file's.**
+          # `godel.py lanes` ranks grid, template and model by how little the
+          # record can predict their next verdict -- `godel.rs:4458`'s rule,
+          # which the kernel machine has had since it had axes and this one
+          # did not. The order here was fixed: grid, then templates, then the
+          # author, so a rung toward the operator's north star waited behind
+          # eleven knob points it has nothing to do with.
+          #
+          # The composed core's "always last" rule is what that fixed order
+          # came from, and it was right when a model call cost a dozen decodes
+          # on the one engine in the building. The author runs in this job for
+          # about two minutes now, so the rule it was protecting no longer
+          # bites, and the cost survives as the tie-break instead: on a fresh
+          # ledger every lane reads 1.000 and grid still goes first.
+          #
+          # **The ranking is walked, not peeked at.** The first version read
+          # `first` and short-circuited on the single value `model`, so a
+          # ranking that said `template` fell straight through to `godel.py
+          # next`, which walks the grid internally before templates -- the
+          # answer computed, printed, and then ignored for two of its three
+          # values. `--lane` is what lets a lane be asked on its own, and the
+          # whole order is walked so every rank means what it says.
+          python3 tools/godel.py lanes --root .
+          order=$(python3 tools/godel.py lanes --root . | sed -n 's/^order //p')
+          code=1
+          authored=no
+          balked=no
+          ladder_point=""
+          for lane in $order; do
+            if [ "$code" = "0" ]; then break; fi
+            case "$lane" in
+              model)
+                # **The shards already ran; this reads them.** The
+                # author used to decode here, six attempts in series,
+                # and it is `author` now -- six runners, each with its
+                # own declared draw and its own six attempts at the
+                # compiler's feedback. What is left here is the choice
+                # between what came back.
+                #
+                # Lowest shard wins, and that is the whole rule. Shard
+                # 0 is the greedy draw, so the fan-out can only add:
+                # if the night would have worked without it, shard 0
+                # produced that answer and takes the tie. And `ls`
+                # sorts, so two runs over the same shards choose the
+                # same one -- a night nobody can reconstruct is the
+                # thing this whole ledger exists to not be.
+                if [ ! -d /tmp/shards ]; then
+                  echo "  model: no shards ran tonight" > /tmp/account.txt
+                  continue
+                fi
+                # A glob and not `ls | sort`: `ls` on an absent directory
+                # exits 2 and `pipefail` makes that the shell's last word,
+                # which this file already records costing a night. Bash
+                # expands a glob in sorted order, so `shard-0` still comes
+                # first and the tie still breaks the same way twice.
+                shopt -s nullglob
+                took=""
+                for sd in /tmp/shards/loop-shard-*; do
+                  [ -s "$sd/env.txt" ] || continue
+                  cp "$sd/env.txt" /tmp/env.txt
+                  cp "$sd/account.txt" /tmp/account.txt
+                  took=$(cat "$sd/shard.txt" 2>/dev/null || echo "?")
+                  break
+                done
+                # Only a shard that finished a draw is evidence about the
+                # rung. One with no server, one killed by its timeout and
+                # one cancelled mid-decode all leave no `drew` file, and
+                # none of them says anything about whether the rung can be
+                # written.
+                drew=0
+                first=""
+                for sd in /tmp/shards/loop-shard-*; do
+                  [ -f "$sd/drew" ] || continue
+                  drew=$((drew + 1))
+                  [ -n "$first" ] || first="$sd"
+                done
+                if [ -z "$took" ] && [ "$drew" = "0" ]; then
+                  echo "  model: no shard got an answer tonight -- no server," \
+                    "or one that never answered" > /tmp/account.txt
+                  echo "::notice::the model lane stood down: no shard got an answer"
+                  continue
+                fi
+                if [ -z "$took" ]; then
+                  # Every shard that drew came back empty, which is a
+                  # fact about the rung rather than about any one draw --
+                  # independent samples, and the compiler refused them
+                  # all. That is exactly what a balk records.
+                  balked=yes
+                  # The reason is the first shard that actually drew --
+                  # not shard 0 by position, which may have had no server
+                  # and would file "no inference server" as a fact about
+                  # the rung, the very mix-up this block exists to stop.
+                  tail -c 300 "$first/why.txt" 2>/dev/null \
+                    | tr '\n' ' ' > /tmp/balk.txt || true
+                  echo "  model: $drew shard(s) drew and none were usable" \
+                    > /tmp/account.txt
+                  continue
+                fi
+                echo "  lane model: shard $took drew the candidate"
+                ladder_point="$rung_point"
+                authored=yes
+                code=0
+                ;;
+              *)
+                echo "  lane $lane"
+                set +e
+                python3 tools/godel.py next --root . --lane "$lane" \
+                  --emit-env /tmp/env.txt > /tmp/account.txt
+                code=$?
+                set -e
+                ;;
+            esac
+            if [ "$code" != "0" ]; then
+              echo "    nothing there:"
+              sed 's/^/    /' /tmp/account.txt || true
+            fi
+          done
+          if [ "$balked" = "yes" ]; then
+            reason=$(cat /tmp/balk.txt 2>/dev/null || true)
+            [ -n "$reason" ] || reason="the author came back with nothing"
+            # `--why=` and not `--why `, because a reason that happens to
+            # start with a dash is a flag to argparse in the spaced form.
+            python3 tools/ladder.py balk --root . --why="$reason" || true
+            if [ -n "$(git status --porcelain loop/ladder)" ]; then
+              git add loop/ladder
+              git commit -q -m "loop: the author balked at this rung"
+              git push origin HEAD:loop/main
+            fi
+          fi
+          if [ "$code" != "0" ]; then
+            # **A rung the author cannot write must retire, or it blocks.**
+            # `create` decodes at temperature 0, so its first attempt
+            # against an unchanged card is the same every night; a rung it
+            # balks at files no certificate, so `refused` never moves and
+            # nothing behind it is ever reached. Recorded only when the
+            # model lane was the one that came back empty, since a grid
+            # lane running out of points says nothing about the rung.
+            echo "have=no" >> "$GITHUB_OUTPUT"
+            echo "::notice::every lane is out of moves tonight:"
+            cat /tmp/account.txt || true
+            exit 0
+          fi
+          if [ "$authored" = "yes" ]; then
+            # The author emits point= only; the account is recomputed the
+            # way every account figure is.
+            {
+              python3 tools/godel.py alpha --root . \
+                | sed -n 's/.*: \([0-9]*\) of 32.*/alpha_k=\1/p'
+              echo "chi_bar=-"
+              echo "rail=none"
+              # `--emit` and not a regular expression over the prose.
+              # The prose stopped saying `N boot(s)` when a level
+              # started buying queries instead of boots, so the sed
+              # matched nothing and `half`, `level`, `minutes`,
+              # `boots` and `queries` all went out empty -- five
+              # `required: true` inputs of the judge, which then
+              # would not start. See the note in godel.py.
+              python3 tools/godel.py oops --root . --axis model --emit
+            } >> /tmp/account.txt
+          fi
+          cat /tmp/account.txt
+          # The account, as outputs (key=value already).
+          while IFS='=' read -r k v; do
+            echo "$k=$v" >> "$GITHUB_OUTPUT"
+          done < /tmp/account.txt
+          point=$(awk -F= '$1=="point"{print $2}' /tmp/account.txt)
+          echo "have=yes" >> "$GITHUB_OUTPUT"
+          # Empty unless the model lane worked the rung. A template or grid
+          # night is not the ladder's work, and a certificate of theirs
+          # claiming the rung would retire it for something it never tried.
+          echo "ladder=${ladder_point:-}" >> "$GITHUB_OUTPUT"
+          echo "kind=$(awk '$1=="kind"{print $2}' /tmp/env.txt)" >> "$GITHUB_OUTPUT"
+          echo "rung=$(awk '$1=="rung"{print $2}' /tmp/env.txt)" >> "$GITHUB_OUTPUT"
+          echo "axis=$(awk '$1=="axis"{print $2}' /tmp/env.txt)" >> "$GITHUB_OUTPUT"
+          echo "corpus=$(awk '$1=="corpus"{print $2}' /tmp/env.txt)" >> "$GITHUB_OUTPUT"
+
+          # Marker before trial: an interrupted night has still spent the
+          # night -- godel.rs writes its marker at the same moment for the
+          # same reason.
+          mkdir -p loop/ledger/tried
+          cp /tmp/env.txt "loop/ledger/tried/${point:0:16}.env"
+          git add loop/ledger/tried
+          git commit -m "loop: tried ${point:0:16}"
+          git push origin HEAD:loop/main
+          echo "baseline=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          # The candidate: parent tree + the patch, as a real commit on its
+          # own ref, derived through plumbing so the worktree stays the
+          # baseline's.
+          parent=$(git rev-parse 'HEAD^{tree}')
+          cand_tree=$(python3 tools/godel.py derive /tmp/env.txt --parent "$parent")
+          cand=$(git commit-tree "$cand_tree" -p HEAD -m "loop: candidate ${point:0:16}")
+          git push origin "$cand:refs/heads/loop/cand/${point:0:16}"
+          echo "candidate=$cand" >> "$GITHUB_OUTPUT"
+
+  # --- judge: the two-arm gate, in its own workflow ------------------------
+
+
+  # --- judge: the two-arm gate, in its own workflow ------------------------
+  judge:
+    needs: propose
+    # **An explicit status function, or a skipped shard skips the judge.**
+    # With none, GitHub adds an implicit `success()`, and that looks at the
+    # whole chain of ancestors rather than at `needs` -- so a night with no
+    # open rung, where `author` is skipped by design, would skip this job
+    # too, even though `propose` ran and staged a template or grid point.
+    # The marker and the candidate ref would be pushed, nothing judged,
+    # nothing filed, and `tidy` would delete the ref: a night that spends a
+    # point and records nothing. actions/runner#2205.
+    if: ${{ !cancelled() && needs.propose.result == 'success' && needs.propose.outputs.have == 'yes' }}
+    uses: ./.github/workflows/loop-judge.yml
+    with:
+      point: ${{ needs.propose.outputs.point }}
+      baseline_ref: ${{ needs.propose.outputs.baseline }}
+      candidate_ref: ${{ needs.propose.outputs.candidate }}
+      rail: ${{ needs.propose.outputs.rail }}
+      chi_bar: ${{ needs.propose.outputs.chi_bar }}
+      alpha_k: ${{ needs.propose.outputs.alpha_k }}
+      minutes: ${{ needs.propose.outputs.minutes }}
+      half: ${{ needs.propose.outputs.half }}
+      level: ${{ needs.propose.outputs.level }}
+      boots: ${{ needs.propose.outputs.boots }}
+      queries: ${{ needs.propose.outputs.queries }}
+      kind: ${{ needs.propose.outputs.kind }}
+      rung: ${{ needs.propose.outputs.rung }}
+      axis: ${{ needs.propose.outputs.axis }}
+      corpus: ${{ needs.propose.outputs.corpus }}
+      ladder: ${{ needs.propose.outputs.ladder }}
+
+  # --- no night leaves a candidate ref behind -------------------------------
+  #
+  # **It was `inputs.dry_run` alone, and that leaked a branch per bad
+  # night.** `adopt` deletes the ref on its way out, but it only runs when
+  # `judge` succeeded -- so every night the judge failed, was skipped or was
+  # cancelled left `loop/cand/<point>` on the remote forever. Two were
+  # already stranded when this was noticed, from the two nights the judge
+  # could not start. Nightly, over a year, that is a refs list nobody can
+  # read and a clone that carries every candidate the loop ever refused.
+  #
+  # Keyed on `adopt` rather than on `judge`, because adopt is the thing that
+  # does the deleting: any outcome of it other than success means the branch
+  # is still there, and that is one condition covering the dry run, the
+  # failed judge, the skipped judge and an adopt that fell over itself.
+  tidy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [propose, judge, adopt]
+    if: always() && needs.propose.outputs.have == 'yes' && needs.adopt.result != 'success'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          POINT: ${{ needs.propose.outputs.point }}
+        run: git push origin --delete "loop/cand/${POINT:0:16}" || true
+
+  # --- adopt: the only writer of entries, serialized, staleness-checked ----
+  adopt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [propose, judge]
+    # Explicit for the reason `judge` is: an implicit `success()` here would
+    # read a skipped `author` as a reason to file nothing.
+    if: ${{ !cancelled() && needs.judge.result == 'success' && needs.propose.outputs.have == 'yes' && !inputs.dry_run }}
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: loop/main
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: loopjudge-${{ needs.propose.outputs.point }}
+          path: /tmp/judge
+
+      - name: Adopt, refuse, or find the world moved
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 tools/godel.py cert --check /tmp/judge/certificate.cert
+          cert=/tmp/judge/certificate.cert
+          parent=$(awk '$1=="parent-tree"{print $2}' "$cert")
+          verdict=$(awk '$1=="verdict"{print $2}' "$cert")
+          point=$(awk '$1=="point"{print $2}' "$cert")
+          live=$(git rev-parse 'HEAD^{tree}')
+
+          # **The one honest edit a certificate ever receives, before it is
+          # frozen**: the judge answered about a parent that is no longer
+          # the tip, so its verdict cannot land -- whatever it was. The
+          # entry records `stale` and the point re-authors from the new tip
+          # under a new name, because parent-tree is inside the envelope
+          # hash.
+          #
+          # **The decision is `godel.py adopt-decide` and not four lines of
+          # shell here.** It was four lines of shell, in a job that runs
+          # once a night, and it is the whole of this loop's concurrency
+          # safety -- so proving it meant a night with a race arranged
+          # inside it, which is the Phase 1 drill that was never written.
+          # As a pure function all of its states are asserted on every
+          # selftest with nothing staged, which is what `update::decide`
+          # does for the updater and for the same reason. `base` comes back
+          # from the same call, so the tree a commit is built on cannot
+          # disagree with the verdict written beside it.
+          eval "$(python3 tools/godel.py adopt-decide --cert "$cert" \
+                    --live "$live")"
+          if [ "$verdict" = "stale" ]; then
+            sed -i "s/^verdict .*/verdict stale/" "$cert"
+            echo "::notice::the tip moved mid-judge; filed as stale"
+          fi
+          # seq is re-derived under the lock, where it is authoritative.
+          # Counted the safe way; see the long note in loop-judge.yml. `ls` on an
+          # absent directory exits 2 and `pipefail` makes that the shell's last word.
+          n=0
+          if [ -d loop/ledger/entries ]; then
+            n=$(ls -1 loop/ledger/entries | wc -l)
+          fi
+          seq=$(( n + 1 ))
+          sed -i "s/^seq .*/seq $seq/" "$cert"
+
+          # Pure plumbing from here: the commit's tree is built in an
+          # index, so the worktree is never mutated and there is no
+          # deleted-file / stale-file class of mistake to make. On an
+          # adoption the base is the candidate tree (which already carries
+          # tonight's marker -- it derives from the post-marker tip); on a
+          # refusal it is the live tree. Either way the one addition is the
+          # certificate, so code and record land in one commit and are
+          # inseparable in history.
+          name=$(sha256sum "$cert" | cut -c1-16)
+          blob=$(git hash-object -w "$cert")
+          # `base` came from adopt-decide above, beside the verdict it
+          # must agree with.
+          export GIT_INDEX_FILE=/tmp/adopt-index
+          git read-tree "$base"
+          git update-index --add --cacheinfo \
+            "100644,$blob,loop/ledger/entries/$name.cert"
+          tree=$(git write-tree)
+          unset GIT_INDEX_FILE
+          new=$(git commit-tree "$tree" -p HEAD -m "loop: $verdict ${point:0:16} (seq $seq)")
+          git checkout -f --detach "$new"
+          python3 tools/godel.py fsck --root .
+          git push origin "$new:refs/heads/loop/main"
+          git push origin --delete "loop/cand/${point:0:16}" || true
+
+      - name: The rolling audit PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tail=$(python3 tools/godel.py ledger --root . --tail 10)
+          # **The ladder, above the ledger.** The ledger says what was
+          # judged; it does not say whether the loop is getting anywhere.
+          # An operator checking in once a week wants the second question
+          # answered first, and it is the one the north star was written to
+          # ask -- so `progress` goes at the top, where a stalled ladder is
+          # visible without reading fourteen certificates.
+          star=$(python3 tools/ladder.py goal --root . 2>/dev/null | head -2 || true)
+          rungs=$(python3 tools/ladder.py progress --root . 2>/dev/null || true)
+          body=$(printf 'Where the loop is going:\n\n```\n%s\n\n%s\n```\n\nAnd what it has judged, newest last:\n\n```\n%s\n```\n\nEvery entry is a content-named certificate under loop/ledger/entries, re-verified by ci.yml on every push to this branch. Merging is yours; the machine only ever writes here.' "$star" "$rungs" "$tail")
+          n=$(gh pr list --head loop/main --base main --state open --json number --jq length)
+          if [ "$n" = "0" ]; then
+            gh pr create --head loop/main --base main \
+              --title "The loop ledger" --body "$body"
+          else
+            num=$(gh pr list --head loop/main --base main --state open --json number --jq '.[0].number')
+            gh pr edit "$num" --body "$body"
+          fi

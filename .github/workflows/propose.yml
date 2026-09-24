@@ -1,0 +1,344 @@
+name: propose
+
+# What happens to a change the machine wrote.
+#
+# `godel source` picks a point from the declared space and writes a patch;
+# `godel push` sends it here. The kernel cannot compile and cannot judge a
+# source change, so this is the half that can: apply it, build it, boot it,
+# measure the rail it *claimed*, and answer.
+#
+# ### The shape is two builds and one comparison
+#
+# A rail figure on its own says nothing -- the noise floors in `tools/rails.py`
+# were measured at 16 to 35% across boots of one binary. So both arms are built
+# here, in one job, on one runner, from one checkout: the baseline as the tree
+# stands and the candidate with the patch applied. Anything else compares two
+# machines and calls the difference an effect.
+#
+# ### It answers three things, not two
+#
+# `rails.py judge` exits 0 for adopt, 1 for refuse and 2 for **not
+# comparable** -- a control drifted and these two readings do not compare.
+# That third one is not a refusal: a verdict of "no" from an invalid
+# measurement is as wrong as a yes, and the honest answer is take it again.
+#
+# ### It signs the verdict, and with its own key
+#
+# A verdict is the only thing that writes a ledger line the machine did not
+# derive itself, so `godel verdict` refuses an unsigned one. That made signing
+# the last step to wire, and it is wired now -- with `VERDICT_SIGNING_KEY` and
+# emphatically **not** with `UPDATE_SIGNING_KEY`.
+#
+# The separation is the reason this step can exist at all. This workflow is
+# reached by `workflow_dispatch` from the `proposal` function, which any
+# allowlisted device can call; `release.yml` is reached by pushing a tag, which
+# needs write access to the repository. Signing verdicts with the update key
+# would put the key that ships kernels to every machine in the field into a
+# workflow a machine in the field can start. The verdict key's whole power is
+# to tell one machine that a proposal it made was adopted or refused.
+#
+# `src/update/mod.rs` pins both points and `update::verify_verdict` checks the
+# second one, so a verdict signature is not an update signature however it is
+# presented. With no secret configured this step says so and the verdict goes
+# home unsigned, where the kernel refuses it -- which is the correct behaviour
+# and has been driven end to end.
+
+on:
+  workflow_dispatch:
+    inputs:
+      envelope:
+        description: "The envelope `godel push` sends: provenance, then the patch"
+        required: true
+      forest:
+        description: "Path to a forest for the retrieval rail (blank = fixture only)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# One judge at a time, queued rather than cancelled: a queued device proposal
+# is a paid-for question, where a superseded push is not. And a ceiling on the
+# whole job, because two release builds plus two 900-second boot budgets can
+# legitimately take an hour and anything past ninety minutes is a hang.
+concurrency:
+  group: propose
+  cancel-in-progress: false
+
+jobs:
+  judge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # The inputs reach every script through env, never by interpolation. An
+    # `${{ inputs.x }}` inside `run:` is pasted into the shell before bash
+    # ever runs, so a crafted envelope would execute in a job that holds
+    # VERDICT_SIGNING_KEY. The Supabase validator makes the machine path
+    # safe; this makes the human path match it.
+    env:
+      ENVELOPE: ${{ inputs.envelope }}
+      FOREST_IN: ${{ inputs.forest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version --verbose
+
+      - name: The knob table must still describe the source
+        run: python3 tools/knob.py check
+
+      # The envelope arrives as a workflow input, which is a string somebody
+      # or something typed. `knob.py` finds the `knob 1` marker inside it,
+      # reads five declared fields, ignores every other line, checks the file
+      # path is inside the repository, and refuses anything that is not "set
+      # this named const". Nothing in it is executed or used as a path.
+      #
+      # The provenance above the marker -- who asked, from which lineage,
+      # against which corpus, and how many tests that corpus has already paid
+      # for -- is what the verdict is filed against when it goes home.
+      - name: Read the patch
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ENVELOPE" > proposal.knob
+          cat proposal.knob
+          python3 tools/knob.py show proposal.knob
+          echo "RAIL=$(grep -m1 '^rail ' proposal.knob | cut -d' ' -f2-)" >> "$GITHUB_ENV"
+
+      - name: The tools must work before they are trusted to judge
+        run: |
+          set -euo pipefail
+          python3 tools/knob.py --selftest
+          python3 tools/rails.py --selftest
+          python3 tools/retrieval.py --selftest
+
+      # The corpus, if this runner has one. A generated fixture proves the
+      # rail tooling runs; it is **not** evidence about a retrieval constant,
+      # measured at roughly a quarter the sensitivity of the real forest. A
+      # runner with no corpus therefore produces `absent` for the claimed rail,
+      # and `rails.py judge` reads that as a veto -- which is the right answer
+      # rather than a gap to paper over.
+      - name: The corpus
+        run: |
+          set -euo pipefail
+          # A path, so it is held to path characters before it may reach
+          # GITHUB_ENV -- a newline in an input is how a second variable gets
+          # smuggled into every later step.
+          if printf '%s' "$FOREST_IN" | LC_ALL=C grep -q '[^A-Za-z0-9_./-]'; then
+            echo "::error::the forest input is not a plain path"
+            exit 1
+          fi
+          if [ -n "$FOREST_IN" ] && [ -d "$FOREST_IN" ]; then
+            echo "FOREST=$FOREST_IN" >> "$GITHUB_ENV"
+            echo "using the forest at $FOREST_IN"
+          else
+            python3 tools/retrieval.py --fixture out/fixture --nodes 400 --limit 0 \
+              --dump /dev/null >/dev/null
+            echo "FOREST=out/fixture" >> "$GITHUB_ENV"
+            echo "::notice::no forest was given, so the retrieval rail is a fixture"
+            echo "::notice::and says only that the tooling runs, not that a constant helps"
+            echo "FIXTURE_ONLY=1" >> "$GITHUB_ENV"
+          fi
+
+      # --- the baseline arm ------------------------------------------------
+
+      - name: Build the tree as it stands
+        run: cargo build --release --locked
+
+      - uses: ./.github/actions/verify-boot
+        with:
+          arm: a
+
+      - name: Keep the baseline
+        run: |
+          set -euo pipefail
+          mv rails.txt kernel-a.txt
+          # The same build's *second* settled reading. It carries no host rail,
+          # deliberately: `retrieval.py` is deterministic over a fixed forest,
+          # so a second run of it would spread by exactly zero and say nothing
+          # about the day. What this pair is for is the kernel's timing rails,
+          # which is where the noise lives.
+          mv rails2.txt kernel-a2.txt
+          python3 tools/retrieval.py "$FOREST" --dump retrieval-a.tsv | tee retrieval-a.log
+          python3 tools/rails.py collect --rail retrieval=retrieval-a.tsv --out host-a.txt
+          cat kernel-a.txt host-a.txt | grep -v '^\[rail\]' > body-a.txt
+          { echo '[rail] v1'; cat body-a.txt; echo '[rail] end'; } > before.txt
+          cat before.txt
+
+      # --- the candidate arm -----------------------------------------------
+
+      - name: Apply what the machine proposed
+        run: |
+          set -euo pipefail
+          python3 tools/knob.py apply proposal.knob
+          git --no-pager diff --stat
+
+      - name: Build it
+        run: cargo build --release --locked
+
+      - uses: ./.github/actions/verify-boot
+        with:
+          arm: b
+
+      - name: Keep the candidate
+        run: |
+          set -euo pipefail
+          mv rails.txt kernel-b.txt
+          mv rails2.txt kernel-b2.txt
+          python3 tools/retrieval.py "$FOREST" --dump retrieval-b.tsv | tee retrieval-b.log
+          python3 tools/rails.py collect --rail retrieval=retrieval-b.tsv --out host-b.txt
+          cat kernel-b.txt host-b.txt | grep -v '^\[rail\]' > body-b.txt
+          { echo '[rail] v1'; cat body-b.txt; echo '[rail] end'; } > after.txt
+          cat after.txt
+
+      # --- the verdict ------------------------------------------------------
+
+      - name: Judge it against what it claimed
+        id: judge
+        run: |
+          set -euo pipefail
+          set +e
+          # `--again` hands each arm its own second reading, so every floor is
+          # the larger of the declared one and twice what that build did
+          # against itself on this runner. It can only widen, never narrow, so
+          # a quiet day cannot make the judge stricter than the table.
+          #
+          # `code=$?` after a pipeline is the *pipeline's* status only because
+          # `pipefail` is still in force from the line above -- `set +e` turns
+          # off `errexit` and nothing else. Driven, rather than reasoned about:
+          # a dry run of this job answered 1 here and took the right branch.
+          python3 tools/rails.py judge before.txt after.txt \
+            --again kernel-a2.txt kernel-b2.txt --claims "$RAIL" | tee judged.txt
+          code=$?
+          set -e
+          case "$code" in
+            0) moved=better; adopted=yes ;;
+            1) moved=$(grep -oE "^  $RAIL +[a-z]+" judged.txt | awk '{print $2}'); adopted=no ;;
+            2) moved=unstable; adopted=no ;;
+            *) echo "::error::rails.py answered $code"; exit 1 ;;
+          esac
+          # A fixture-only run cannot have measured the claimed rail as
+          # evidence, so it may not carry an adoption however the numbers came
+          # out. Said here rather than hoped for.
+          if [ "${FIXTURE_ONLY:-0}" = "1" ]; then
+            adopted=no
+          fi
+          point=$(grep -m1 '^point ' proposal.knob | cut -d' ' -f2 || true)
+          why=$(grep -m1 "^  $RAIL " judged.txt | sed 's/^ *//;s/  */ /g')
+          {
+            echo "verdict 1"
+            echo "point ${point:-0000000000000000000000000000000000000000000000000000000000000000}"
+            echo "rail $RAIL"
+            echo "moved ${moved:-same}"
+            echo "why ${why:-no line}"
+            echo "adopted $adopted"
+          } > verdict.txt
+          cat verdict.txt
+
+      # **Signed with the verdict key, which is not the update key.** See the
+      # header for why; the short version is that this workflow is reachable by
+      # any allowlisted device and `release.yml` is not, so the two must not
+      # hold the same secret.
+      #
+      # The secret is written to a file because `sign.py` takes a path, it is
+      # removed before anything else runs, and it is not among the artifact
+      # paths below. `umask` first, so it is never briefly world-readable on a
+      # shared runner.
+      #
+      # With no secret set this says so and stops, leaving the unsigned verdict
+      # as the artifact. That is a configuration rather than a failure: the
+      # machine refuses an unsigned verdict, so nothing is written to a lineage
+      # on the strength of a run nobody could authenticate.
+      - name: Sign the verdict
+        env:
+          VERDICT_KEY: ${{ secrets.VERDICT_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERDICT_KEY:-}" ]; then
+            echo "::notice::no VERDICT_SIGNING_KEY is configured, so the verdict is unsigned"
+            echo "::notice::and 'godel verdict' will refuse it, which is the correct outcome"
+            exit 0
+          fi
+          umask 077
+          printf '%s' "$VERDICT_KEY" > verdict.key
+          # On every path out of this step, the failing one below included. A
+          # private half left on a runner is a private half.
+          trap 'rm -f verdict.key' EXIT
+          # A signature made with the wrong secret is perfectly well formed, so
+          # the only thing that would notice is the machine it eventually
+          # reaches -- days later and three systems away, answering "not a
+          # signature over this image by this key" and filing nothing. A
+          # correct refusal, about a configuration mistake nobody could see
+          # from where it was made. So the key is proved against the point the
+          # kernel pins before anything is signed with it. Public halves only;
+          # the private one is never rendered and never reaches a log.
+          if ! python3 tools/sign.py --anchor VERDICT_KEY --key-file verdict.key; then
+            echo "::error::VERDICT_SIGNING_KEY is not the key VERDICT_KEY pins in src/update/mod.rs"
+            echo "::error::rotate one to match the other -- signing now produces a verdict"
+            echo "::error::every machine refuses, for a reason none of them can report back"
+            exit 1
+          fi
+          python3 tools/sign.py verdict.txt verdict.sig --key-file verdict.key
+          # Then read it back with the verifier, against that same pinned
+          # point, which is the sentence `release.yml` already carries about a
+          # manifest. Strictly stronger than the check above: a key that
+          # matches says nothing about whether the signature over it is whole.
+          python3 tools/sign.py --check verdict.txt verdict.sig --anchor VERDICT_KEY
+          # One object, text then exactly 80 bytes of GLADOSIG, which is what
+          # `godel verdict` reads and the shape `manifest.py` already argues
+          # for: two objects can be served out of step and produce a signature
+          # failure that is really a deployment race.
+          cat verdict.txt verdict.sig > verdict.bin
+          echo "signed verdict is $(wc -c < verdict.bin) B"
+
+      # The return leg. Degrades to artifact-only with a notice when the
+      # token is unset -- the unsigned-verdict idiom: an unconfigured repo
+      # is a configuration, not a failure.
+      - name: Send the verdict home
+        env:
+          VERDICT_INGEST_TOKEN: ${{ secrets.VERDICT_INGEST_TOKEN }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ ! -f verdict.bin ]; then
+            echo "::notice::no signed verdict to send (unsigned runs stay artifacts)"
+            exit 0
+          fi
+          if [ -z "${VERDICT_INGEST_TOKEN:-}" ] || [ -z "${SUPABASE_URL:-}" ]; then
+            echo "::notice::no ingest token or URL, so the verdict travels as an artifact only"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/ingest.txt -w '%{http_code}' \
+            -X POST "$SUPABASE_URL/functions/v1/verdict" \
+            -H "Authorization: Bearer $VERDICT_INGEST_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            -H "x-run-id: ${{ github.run_id }}" \
+            -H "x-run-attempt: ${{ github.run_attempt }}" \
+            --data-binary @verdict.bin)
+          cat /tmp/ingest.txt
+          if [ "$code" != "202" ]; then
+            echo "::error::the verdict service answered $code"
+            exit 1
+          fi
+
+      - name: Keep everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proposal-${{ github.run_id }}
+          path: |
+            proposal.knob
+            before.txt
+            after.txt
+            kernel-a2.txt
+            kernel-b2.txt
+            judged.txt
+            verdict.txt
+            verdict.sig
+            verdict.bin
+            retrieval-a.log
+            retrieval-b.log
+            retrieval-a.tsv
+            retrieval-b.tsv
+          if-no-files-found: warn
+          retention-days: 30

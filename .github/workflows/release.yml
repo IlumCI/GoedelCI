@@ -1,0 +1,427 @@
+name: release
+
+# Tagged releases: build the kernel image, sign it, publish it to the stable
+# channel, and attach it to the GitHub release as well.
+#
+# Two independent places on purpose. The bucket is what the in-OS updater
+# reads; the release assets are what a person checks it against, and a
+# signature is only worth having if somebody can get the artifact a second way.
+#
+# The ISOs are built here too, which they were not. The reason they were not is
+# still true -- the payloads are hundreds of megabytes of model weights that
+# exist nowhere in this repo -- so they are fetched from a pinned release that
+# holds them, verified against digests that DO live in this repo
+# (payload/*.txt), and only then handed to mkiso.py.
+#
+# Updates still ship the EFI image alone. An ISO is how a machine is installed,
+# not how it is updated, and nothing in `update` will ever pull 576 MB through
+# a 32 KB window.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and sign, but publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Not actions-rs/toolchain. It does `rustup override set`, which sits
+      # ABOVE rust-toolchain.toml in rustup's precedence -- so the pinned
+      # nightly and the x86_64-unknown-uefi target this repo declares would
+      # both be ignored, silently. That is the bug in rust-clippy.yml.
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version --verbose
+          rustc --print target-list | grep -qx x86_64-unknown-uefi
+
+      # **Nothing in the kernel can compare its own knob table against its own
+      # source**, so a row that has gone stale would produce a patch that
+      # applies to nothing: the marker written, the point never measured, and
+      # the loop spending nights on a constant somebody already moved. Cheap,
+      # pure Python, and it runs before the build because a stale row does not
+      # break one.
+      - name: The knob table must still describe the source
+        run: python3 tools/knob.py check
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: uefi-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+
+      # The crate has no dependencies by policy, the target is tier 2 with a
+      # precompiled core, and rust-lld ships with rustup -- so this needs no
+      # cross toolchain and no MSVC.
+      - name: Build
+        run: cargo build --release --locked
+
+      # **The gate.** Between the build and the signature, so a failure here
+      # means nothing is signed, nothing is published, and no machine in the
+      # field is told about this image. See .github/actions/verify-boot.
+      - name: Verify it boots and passes every suite
+        uses: ./.github/actions/verify-boot
+
+      - name: The tag and Cargo.toml must agree
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$crate" != "$tag" ]; then
+            echo "Cargo.toml says $crate, the tag says $tag."
+            echo "VERSION is what the updater compares to decide whether an"
+            echo "image is newer, so a mismatch here ships a wrong answer."
+            exit 1
+          fi
+          echo "VERSION=$crate" >> "$GITHUB_ENV"
+
+      - name: Version, for a manual run
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        run: |
+          echo "VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
+      - name: Sign
+        env:
+          KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          test -n "$KEY" || { echo "UPDATE_SIGNING_KEY is not set"; exit 1; }
+          mkdir -p out
+          cp target/x86_64-unknown-uefi/release/glados.efi "out/glados-$VERSION.efi"
+          python3 tools/sign.py "out/glados-$VERSION.efi" "out/glados-$VERSION.efi.sig" --key "$KEY"
+
+      - name: Build the signed manifest
+        env:
+          KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          ORIGIN: ${{ vars.SUPABASE_URL }}
+        run: |
+          test -n "$ORIGIN" || { echo "the SUPABASE_URL variable is not set"; exit 1; }
+          python3 tools/manifest.py "out/glados-$VERSION.efi" \
+            --version "$VERSION" \
+            --channel stable \
+            --base "$ORIGIN/storage/v1/object/public/stable" \
+            --notes "release $VERSION" \
+            --key "$KEY" \
+            --out out
+
+      # Reads it back with the parser the kernel uses, against the key the
+      # kernel pins. A manifest that CI cannot read is one that fails on every
+      # machine that already trusts us, at the moment they try to update.
+      - name: Verify what we are about to publish
+        run: |
+          python3 tools/manifest.py --verify out/manifest --image "out/glados-$VERSION.efi"
+          # And the image's own detached signature, which that does not cover:
+          # it reads the manifest and checks the digest in it against the
+          # image, so a bad .sig publishes and the refusal arrives on every
+          # machine in the field, at `update stage`, with nothing here to say
+          # why. Same pinned point the kernel will use.
+          python3 tools/sign.py --check "out/glados-$VERSION.efi" \
+            "out/glados-$VERSION.efi.sig" --anchor UPDATE_KEY
+
+      - name: Publish to the stable channel
+        if: startsWith(github.ref, 'refs/tags/') || inputs.dry_run == false
+        env:
+          ORIGIN: ${{ vars.SUPABASE_URL }}
+          KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          put() {
+            curl -sS --fail-with-body -X POST \
+              -H "Authorization: Bearer $KEY" \
+              -H "Content-Type: application/octet-stream" \
+              -H "x-upsert: true" \
+              --data-binary "@$1" \
+              "$ORIGIN/storage/v1/object/stable/$2"
+            echo "  put $2"
+          }
+          # The image before the manifest, and this order is load-bearing: a
+          # manifest naming an object that is not there yet is a window in
+          # which every machine that checks gets a 404 for an update it was
+          # just told about.
+          put "out/glados-$VERSION.efi" "glados-$VERSION.efi"
+          put "out/glados-$VERSION.efi.sig" "glados-$VERSION.efi.sig"
+          put "out/manifest" "manifest"
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A pushed tag does not create a release, and `gh release upload`
+          # needs one to exist -- which is how this step failed on 1.2.28
+          # after everything else had already published correctly.
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Assets publishing. The notes step below sets this."
+          gh release upload "$GITHUB_REF_NAME" \
+            "out/glados-$VERSION.efi" \
+            "out/glados-$VERSION.efi.sig" \
+            out/manifest --clobber
+
+      # **The step that did not exist, and 1.3.8 is what its absence cost.**
+      # `gh release create` carried `--notes "Notes written by hand"` because
+      # the notes live in `out/`, which the tree ignored, so this job could not
+      # read the one file it needed. The release then published every asset
+      # correctly and sat under a placeholder until somebody remembered -- and
+      # `tools/site.py` builds the front page's news column from the release
+      # *body*, so the placeholder was on the site too, which is the same
+      # "derived regions went stale silently" failure `site.yml` exists to stop.
+      #
+      # Its own step after the upload, rather than a flag on `create`, for two
+      # reasons. A tag re-run finds the release already there and would skip a
+      # `create` flag entirely -- which is precisely the path 1.3.8 took. And
+      # failing here fails *after* the artefacts are published, so a missing
+      # notes file is a red X telling somebody to write them and never a
+      # release that did not ship.
+      - name: The notes go out with the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="out/release/NOTES-$VERSION.md"
+          if [ ! -f "$NOTES" ]; then
+            echo "::error::$NOTES is missing, so this release carries a placeholder"
+            exit 1
+          fi
+          # The file wins over anything edited in the web interface, which is a
+          # decision rather than an accident: the notes are authored in the tree
+          # and a re-run must not be a way to quietly restore an older draft.
+          gh release edit "$GITHUB_REF_NAME" --notes-file "$NOTES"
+          echo "  notes: $(wc -c < "$NOTES") byte(s) from $NOTES"
+
+      # Hashed here, from the bytes this job produced, rather than read back
+      # from the API afterwards. GitHub reports a digest of what it stored, so
+      # a digest taken from there proves the file is what was stored and says
+      # nothing about whether the upload changed it. Two independently
+      # computed numbers compared is the check; one number is a restatement.
+      - name: Record what was built
+        run: |
+          mkdir -p sums
+          ( cd out && sha256sum "glados-$VERSION.efi" "glados-$VERSION.efi.sig" manifest ) > sums/kernel.txt
+          cat sums/kernel.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sums-kernel
+          path: sums/kernel.txt
+          retention-days: 1
+
+  # --- the ISOs -------------------------------------------------------------
+  #
+  # A job of its own, and a matrix, because there is more than one image to
+  # build and they differ only in payload and context. Inline in `publish` it
+  # would have re-signed the kernel once per variant, which is both wasted work
+  # and a second chance to get signing wrong.
+  #
+  # `needs: publish` and nothing depends on this in turn. An ISO is install
+  # media: every machine in the field is waiting on the manifest, and nothing
+  # at all is waiting on this.
+  iso:
+    needs: publish
+    runs-on: ubuntu-latest
+    strategy:
+      # One variant failing must not cancel the others. They share nothing but
+      # the kernel image, which is already published by the time this runs.
+      fail-fast: false
+      matrix:
+        include:
+          # seq 0 means "leave the header alone", for a payload whose
+          # canonical context is already the one to ship.
+          - name: qwen3-0.6b
+            payload: payload-qwen3-0.6b-v1
+            manifest: qwen3-0.6b
+            seq: 0
+            label: GLADOS
+          # The 2B distill, Apache-2.0. Its payload is canonical at seq 512,
+          # which is not a context worth shipping for a model this size, so
+          # both variants stamp. The weights are uploaded once and these two
+          # differ by four bytes -- see tools/ctxstamp.py.
+          #
+          # Measured before enabling, because the arithmetic said 32k could
+          # not fit and the arithmetic was wrong twice: HEAP_LADDER's 320 MiB
+          # is the first contiguous region rather than the heap (boot reports
+          # 1340 MiB total), and the kernel holds the KV cache int8 where
+          # convert.py reports f32. At 8k it uses 130 MiB of heap, at 32k
+          # 347 MiB of 1341. Both boot and load.
+          - name: qwen35-2b-8k
+            payload: payload-q35-2b-v1
+            manifest: q35-2b
+            seq: 8192
+            label: GLADOS
+          - name: qwen35-2b-32k
+            payload: payload-q35-2b-v1
+            manifest: q35-2b
+            seq: 32768
+            label: GLADOS
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        run: |
+          V="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Fetch the kernel image that was just published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p out
+          # The published artifact rather than a rebuild. An ISO carrying a
+          # kernel that was compiled separately from the one the manifest
+          # names is an ISO nobody can check against the signature.
+          # No `||` fallback here. The first version ended
+          # `download || cargo build && cp`, which bash parses as
+          # `(download || build) && cp` -- equal precedence, left associative
+          # -- so on a SUCCESSFUL download it skipped the build and ran the
+          # copy anyway, against a target/ this job never populated.
+          #
+          # The fallback was wrong regardless: no Rust toolchain is installed
+          # in this job, deliberately, because it assembles a published
+          # artifact rather than producing one. If the image is missing the
+          # right outcome is to fail saying so.
+          TAG="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then TAG="v$VERSION"; fi
+          gh release download "$TAG" --dir out --pattern "glados-$VERSION.efi" --clobber
+          ls -la "out/glados-$VERSION.efi"
+
+      - name: Fetch the payload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p payload-dir
+          gh release download "${{ matrix.payload }}" --dir payload-dir --clobber
+          ls -la payload-dir
+
+      - name: The payload must be the payload
+        run: |
+          # BEFORE the stamp below, and that order is not cosmetic: stamping
+          # changes four bytes of model.bin, so a digest taken afterwards can
+          # never match what was recorded. Verify what arrived, then modify it.
+          python3 tools/payload.py --selftest
+          python3 tools/payload.py verify payload-dir "payload/${{ matrix.manifest }}.txt"
+
+      - name: Set the context window
+        if: matrix.seq != 0
+        run: |
+          # Four bytes. `--seq` changes no weight, so N context variants are
+          # one upload and N stamps rather than N uploads of the same 1.8 GB.
+          # ctxstamp reads the result back through v4.py, which is the reader
+          # and deliberately not the writer.
+          python3 tools/ctxstamp.py payload-dir/model.bin "${{ matrix.seq }}"
+
+      - name: Build the ISO
+        run: |
+          # The matrix names the image outright. Deriving it as
+          # "$name-$seq" invented a spelling (q35-2b-8192) for a variant
+          # tools/site.py already knows as qwen35-2b-8k, and site.py refuses
+          # to build a download page it cannot describe an image on.
+          NAME="glados-$VERSION-${{ matrix.name }}"
+          python3 tools/mkiso.py "out/$NAME.iso" \
+            --efi "out/glados-$VERSION.efi" \
+            --payload payload-dir \
+            --label "${{ matrix.label }}"
+          ls -la "out/$NAME.iso"
+          echo "ISO_NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Record what was built
+        run: |
+          mkdir -p sums
+          ( cd out && sha256sum "$ISO_NAME.iso" ) > "sums/${{ matrix.name }}.txt"
+          cat "sums/${{ matrix.name }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sums-iso-${{ matrix.name }}
+          path: sums/${{ matrix.name }}.txt
+          retention-days: 1
+
+      - name: Attach the ISO
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "out/$ISO_NAME.iso" --clobber
+
+  # --- SHA256SUMS -----------------------------------------------------------
+  #
+  # Last, because it describes everything the other two jobs published and
+  # cannot be written until they have. `index.html` has linked to this file
+  # for a while and no release ever carried it, which is the sort of promise
+  # a download page should not make twice.
+  sums:
+    needs: [publish, iso]
+    runs-on: ubuntu-latest
+    steps:
+      # No `if:` on the job, and the assembly below runs on every invocation
+      # for the reason the ISO steps do: gating it on a real release would
+      # mean the only run that ever exercises it is the one not allowed to
+      # fail. Only the attach is gated.
+      - uses: actions/checkout@v4
+
+      - name: Which release this describes
+        run: |
+          V="$(grep -m1 '^version' Cargo.toml | cut -d\" -f2)"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          TAG="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then TAG="v$V"; fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sums-*
+          merge-multiple: true
+          path: sums
+
+      - name: Assemble and cross-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat sums/*.txt | sort -k2 > SHA256SUMS
+          echo "--- what the build produced ---"
+          cat SHA256SUMS
+
+          # The check worth having. Every line above came from hashing a file
+          # this workflow built; GitHub reports a digest of what it received.
+          # A disagreement means the upload changed the bytes, which at 1.9 GB
+          # is a real failure mode and one nothing else here would notice.
+          #
+          # SHA256SUMS is excluded from the comparison because on a re-run it
+          # is already an asset, and a file cannot list its own digest.
+          gh release view "$TAG" --json assets             --jq '.assets[] | select(.name != "SHA256SUMS") | "\(.digest|sub("^sha256:";"")) \(.name)"'             | sort -k2 > stored.txt
+          awk '{print $1, $2}' SHA256SUMS | sort -k2 > built.txt
+
+          echo "--- what the release stored ---"
+          cat stored.txt
+
+          # Only meaningful when this run is the one that published. On a dry
+          # run `publish` rebuilds and re-signs and uploads nothing, so this
+          # would compare a fresh build against whatever the last tag stored
+          # and always disagree -- and legitimately, because the signature is
+          # ECDSA and randomised per signature, so even two builds of the same
+          # commit differ in the .sig and in the manifest that names it.
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "  dry run: assembled but not compared, since nothing here was published"
+            exit 0
+          fi
+          if diff -u built.txt stored.txt; then
+            echo "  every asset matches what was built"
+          else
+            echo "  built and stored disagree; refusing to publish this file"
+            exit 1
+          fi
+
+      - name: Attach
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" SHA256SUMS --clobber
