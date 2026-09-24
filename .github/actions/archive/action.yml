@@ -25,11 +25,24 @@ description: >-
 # two runs over the same record must choose the same node, and an operator
 # reading the log must be able to get the same answer by hand.
 #
-# **No sideways moves.** A `back` is only ever proposed toward an ANCESTOR of
-# the tip. Moving to a cousin clade that scores better is a real thing the
-# literature does and a thing this machine deliberately does not do: the
-# repository has one working tree and one history, and restoring a cousin would
-# make the ledger's parent chain stop describing the file tree.
+# **Any adopted node, including a cousin.** An earlier version of this refused
+# to move anywhere but straight up the tip's own ancestry, on the reasoning
+# that a repository has one working tree and restoring a cousin would make the
+# ledger's parent chain stop describing the files. That reasoning was wrong,
+# and it cost the search most of what the archive is for.
+#
+# The parent chain describes the files exactly as well after a sideways move as
+# after a backtrack, because what it records is which STATE a trial was built
+# from, not which commit came before it in time. Every invariant `ledger fsck`
+# enforces still holds: the next entry's lineage names a node that exists, was
+# adopted, and has a smaller sequence number. Nothing else was ever true of a
+# backtrack either.
+#
+# What a move costs is the same in both directions -- the working tree becomes
+# that node's tree and the ledger is carried forward whole -- so restricting it
+# to ancestors bought nothing and removed every branch of the archive that was
+# not on the tip's own line. On a tree where one early decision seeded two
+# lineages, that is most of the search space.
 
 inputs:
   command:
@@ -95,6 +108,16 @@ runs:
         ROOT = "root"
 
         def out(k, v):
+            """A step output, and never more than one.
+
+            `$GITHUB_OUTPUT` is line-oriented, so a value carrying a newline
+            writes a SECOND assignment that the runner obeys. Several of these
+            values are model-derived -- a refusal reason, a milestone title --
+            so a reply containing "\\nverdict=adopt" would set an output no step
+            wrote. Every output here is a scalar by design, so collapsing is
+            both safe and the meaning.
+            """
+            v = str(v).replace("\r", " ").replace("\n", " ")
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
@@ -157,7 +180,17 @@ runs:
             def tip(self):
                 return self.order[-1] if len(self.order) > 1 else ROOT
 
+            def ancestry(self, name):
+                """`name`, its parent, and so on up to the root."""
+                chain, n = [], name
+                while True:
+                    chain.append(n)
+                    if n == ROOT:
+                        return chain
+                    n = self.nodes[n].parent
+
             def distance(self, frm, to):
+                """Steps from `frm` up to `to`, or -1 when `to` is not above it."""
                 n, d = frm, 0
                 while n != to:
                     if n == ROOT:
@@ -165,6 +198,15 @@ runs:
                     n = self.nodes[n].parent
                     d += 1
                 return d
+
+            def lca(self, a, b):
+                """The nearest state both `a` and `b` were built from."""
+                up = self.ancestry(a)
+                seen = set(up)
+                for n in self.ancestry(b):
+                    if n in seen:
+                        return n
+                return ROOT
 
             def report(self):
                 rows = [("node", "seq", "depth", "s/t", "clade s/t", "cmp")]
@@ -217,25 +259,33 @@ runs:
             return es
 
         def reconsider(archive, seed, min_evidence=6, explore=True):
+            """(decision, tree, steps, node, why). `decision` is stay or move."""
             tip = archive.tip()
             total = archive.counts(ROOT)[1]
             if total < min_evidence:
                 # Below the floor this answers `stay` by construction, and that
                 # is not a stub: a clade comparison over four trials is a
-                # comparison of two priors, and backtracking on it would throw
-                # away adopted work for a coin.
+                # comparison of two priors, and moving on it would throw away
+                # adopted work for a coin.
                 return ("stay", "", 0, tip,
                         "%d counted trial(s), under the %d floor" % (total, min_evidence))
             pick = archive.select(seed, explore=explore)
             if pick == tip:
                 return ("stay", "", 0, tip, "the tip is the best clade to grow from")
-            steps = archive.distance(tip, pick)
-            if steps <= 0:
-                return ("stay", "", 0, tip,
-                        "%s is not an ancestor of the tip; no sideways moves" % pick[:12])
-            return ("back", archive.nodes[pick].tree, steps, pick,
-                    "clade %s reads %.3f against the tip's %.3f over %d trial(s)"
-                    % (pick[:12], archive.cmp(pick), archive.cmp(tip), archive.counts(pick)[1]))
+            common = archive.lca(tip, pick)
+            back = archive.distance(tip, common)
+            over = archive.distance(pick, common)
+            if over == 0:
+                shape = "%d step(s) up its own line" % back
+            elif back == 0:
+                shape = "%d step(s) down into a lineage it already carries" % over
+            else:
+                shape = ("%d step(s) up to %s and %d back down another lineage"
+                         % (back, common[:12], over))
+            return ("move", archive.nodes[pick].tree, back, pick,
+                    "clade %s reads %.3f against the tip's %.3f over %d trial(s): %s"
+                    % (pick[:12], archive.cmp(pick), archive.cmp(tip),
+                       archive.counts(pick)[1], shape))
 
         # ------------------------------------------------------------------
 
@@ -273,7 +323,7 @@ runs:
             claim("a one-of-one clade does not read as certainty",
                   build([e("f"*16, 1, ROOT, "adopt")]).cmp(ROOT) < 0.7)
             claim("an event entry is not a trial",
-                  build([e("a"*16, 1, ROOT, "rollback")]).counts(ROOT) == (0, 0))
+                  build([e("a"*16, 1, ROOT, "restore")]).counts(ROOT) == (0, 0))
             claim("a stale entry is", build([e("a"*16, 1, ROOT, "stale")]).counts(ROOT) == (0, 1))
 
             claim("selection is deterministic in its seed", a.select("n1") == a.select("n1"))
@@ -287,6 +337,12 @@ runs:
                   a.distance("c"*16, "a"*16) == 1)
             claim("and a node that is not an ancestor answers -1",
                   a.distance("a"*16, "c"*16) == -1)
+            claim("a node's ancestry ends at the root",
+                  a.ancestry("c"*16) == ["c"*16, "a"*16, ROOT])
+            claim("the nearest common state of a node and itself is itself",
+                  a.lca("c"*16, "c"*16) == "c"*16)
+            claim("and of two lineages is where they parted",
+                  a.lca("c"*16, "a"*16) == "a"*16)
 
             thin = build(es[:2])
             claim("under the evidence floor, reconsider stays",
@@ -299,16 +355,41 @@ runs:
                    e("6"*16, 7, "3"*16, "refuse"), e("7"*16, 8, "3"*16, "refuse")]
             ab = build(bad)
             outs = [reconsider(ab, "s%d" % i, 6) for i in range(40)]
-            claim("a tip with a dead clade under a live ancestor does get backtracked to",
-                  any(o[0] == "back" for o in outs),
+            claim("a tip with a dead clade under a live ancestor does get moved off",
+                  any(o[0] == "move" for o in outs),
                   "forty seeds all answered stay")
-            back = next(o for o in outs if o[0] == "back")
-            claim("a backtrack names a real ancestor", back[3] in ab.clade(ROOT))
-            claim("and how far up it is", back[2] >= 1)
-            claim("and never proposes a sideways move",
-                  all(o[0] == "stay" or ab.distance(ab.tip(), o[3]) > 0 for o in outs))
+            mv = next(o for o in outs if o[0] == "move")
+            claim("a move names a real node", mv[3] in ab.clade(ROOT))
+            claim("and it is never the tip it is moving from", mv[3] != ab.tip())
             claim("a lineage whose every child failed is not where the night goes",
-                  all(o[3] != "3"*16 for o in outs if o[0] == "back"))
+                  all(o[3] != "3"*16 for o in outs if o[0] == "move"))
+            claim("the emitted decision is one the workflow branches on",
+                  all(o[0] in ("stay", "move") for o in outs))
+
+            # A cousin: two lineages from one early decision, one of them dead.
+            # The old version could not reach the live one at all, because it
+            # is not on the tip's own ancestry.
+            cousins = [e("a"*16, 1, ROOT, "adopt"),
+                       e("L"*16, 2, "a"*16, "adopt"),
+                       e("1"*16, 3, "L"*16, "adopt"),
+                       e("2"*16, 4, "L"*16, "adopt"),
+                       e("R"*16, 5, "a"*16, "adopt"),
+                       e("3"*16, 6, "R"*16, "refuse"),
+                       e("4"*16, 7, "R"*16, "refuse"),
+                       e("5"*16, 8, "R"*16, "refuse"),
+                       e("6"*16, 9, "R"*16, "refuse")]
+            cz = build(cousins)
+            claim("the tip is in the dead lineage", cz.tip() == "R"*16)
+            claim("and the live cousin is not one of its ancestors",
+                  cz.distance(cz.tip(), "1"*16) == -1)
+            picks = {reconsider(cz, "c%d" % i, 6)[3] for i in range(60)}
+            claim("a cousin lineage is reachable, which is most of the search space",
+                  bool(picks & {"L"*16, "1"*16, "2"*16}),
+                  "sixty seeds only ever chose %s" % sorted(p[:4] for p in picks))
+            side = [reconsider(cz, "c%d" % i, 6) for i in range(60)]
+            over = [o for o in side if o[0] == "move" and cz.distance(cz.tip(), o[3]) == -1]
+            claim("and a move to one says it went up and back down",
+                  not over or "back down" in over[0][4] or "down into" in over[0][4])
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 

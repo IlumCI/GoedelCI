@@ -234,10 +234,14 @@ jobs:
 
       # Clade before anything else. Under the evidence floor this answers
       # `stay` by construction, so early nights report and move on; when it
-      # answers `back`, the backtrack is a real commit -- the target tree
-      # restored, the ledger carried forward WHOLE (a rollback that rolled back
-      # its own record would be a lineage erasing the decision that moved it),
-      # and a rollback event appended.
+      # answers `move`, the move is a real commit -- the chosen state's tree
+      # restored, the ledger carried forward WHOLE (a restore that restored its
+      # own record would be a lineage erasing the decision that moved it), and
+      # a `restore` event appended.
+      #
+      # The chosen state may be an ancestor of the tip or a cousin. Both cost
+      # the same and both keep every invariant fsck enforces; see the long note
+      # in archive/action.yml.
       - id: clade
         uses: ./.github/actions/archive
         with:
@@ -246,8 +250,8 @@ jobs:
           half: ${{ steps.budget.outputs.half }}
           min-evidence: ${{ env.GOEDEL_MIN_EVIDENCE }}
 
-      - name: Go back, if the record says go back
-        if: steps.clade.outputs.decision == 'back'
+      - name: Move, if the record says move
+        if: steps.clade.outputs.decision == 'move'
         shell: bash
         env:
           TARGET: ${{ steps.clade.outputs.tree }}
@@ -262,42 +266,42 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           parent=$(git rev-parse 'HEAD^{tree}')
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          point=$(printf 'rollback %s to %s from %s' "$STEPS" "$TARGET" "$parent" \
+          point=$(printf 'restore %s from %s' "$TARGET" "$parent" \
                   | sha256sum | cut -d' ' -f1)
-          printf 'GOEDEL_ROLLBACK_POINT=%s\nGOEDEL_ROLLBACK_NOW=%s\nGOEDEL_ROLLBACK_PARENT=%s\n' \
+          printf 'GOEDEL_RESTORE_POINT=%s\nGOEDEL_RESTORE_NOW=%s\nGOEDEL_RESTORE_PARENT=%s\n' \
             "$point" "$now" "$parent" >> "$GITHUB_ENV"
 
-      - if: steps.clade.outputs.decision == 'back'
+      - if: steps.clade.outputs.decision == 'move'
         uses: ./.github/actions/cert
         with:
           command: emit
-          out: rollback.cert
+          out: restore.cert
           set: |
             seq=${{ steps.seq.outputs.seq }}
-            utc=${{ env.GOEDEL_ROLLBACK_NOW }}
-            point=${{ env.GOEDEL_ROLLBACK_POINT }}
+            utc=${{ env.GOEDEL_RESTORE_NOW }}
+            point=${{ env.GOEDEL_RESTORE_POINT }}
             kind=event
             lane=event
             epoch=${{ steps.seq.outputs.epoch }}
             utility=${{ steps.cfg.outputs.utility }}
             rung=0
             axis=none
-            parent-tree=${{ env.GOEDEL_ROLLBACK_PARENT }}
+            parent-tree=${{ env.GOEDEL_RESTORE_PARENT }}
             candidate-tree=${{ steps.clade.outputs.tree }}
-            why=the clade chose an ancestor: ${{ steps.clade.outputs.why }}
-            verdict=rollback
+            why=the clade chose another state: ${{ steps.clade.outputs.why }}
+            verdict=restore
             runner=${{ github.run_id }}/${{ github.run_attempt }}
 
-      - name: Commit the backtrack through the index, never the worktree
-        if: steps.clade.outputs.decision == 'back'
+      - name: Commit the move through the index, never the worktree
+        if: steps.clade.outputs.decision == 'move'
         shell: bash
         env:
           TARGET: ${{ steps.clade.outputs.tree }}
-          STEPS: ${{ steps.clade.outputs.steps }}
+          NODE: ${{ steps.clade.outputs.node }}
         run: |
           set -euo pipefail
-          name=$(sha256sum rollback.cert | cut -c1-16)
-          blob=$(git hash-object -w rollback.cert)
+          name=$(sha256sum restore.cert | cut -c1-16)
+          blob=$(git hash-object -w restore.cert)
           # The commit's tree is the target, with the CURRENT ledger overlaid,
           # plus the event entry. Pure plumbing, so there is no deleted-file or
           # stale-file class of mistake to make.
@@ -308,13 +312,14 @@ jobs:
           git update-index --add --cacheinfo "100644,$blob,loop/ledger/entries/$name.cert"
           tree=$(git write-tree)
           unset GIT_INDEX_FILE
-          new=$(git commit-tree "$tree" -p HEAD -m "loop: rollback $STEPS steps")
+          new=$(git commit-tree "$tree" -p HEAD \
+                  -m "loop: restore the tree of ${NODE:0:12}")
           git checkout -f --detach "$new"
-          rm -f rollback.cert
+          rm -f restore.cert
           git push origin "$new:refs/heads/loop/main"
 
       - name: Re-check the ledger after writing to it
-        if: steps.clade.outputs.decision == 'back'
+        if: steps.clade.outputs.decision == 'move'
         uses: ./.github/actions/ledger
         with:
           command: fsck
@@ -505,7 +510,11 @@ jobs:
             state=$(cat "$d/state" 2>/dev/null || echo none)
             case "$state" in
               drew) drew=$((drew+1)); [ -n "$took" ] || took="$d" ;;
-              balk) balked=$((balked+1)); [ -n "$why" ] || why=$(head -c 300 "$d/why") ;;
+              # `tr` and not a bare read. The reason is whatever the model
+              # said, and a newline in it writes a SECOND assignment into
+              # $GITHUB_OUTPUT that the runner obeys.
+              balk) balked=$((balked+1))
+                    [ -n "$why" ] || why=$(head -c 300 "$d/why" | tr '\n\r' '  ') ;;
             esac
           done
           echo "  $drew shard(s) drew, $balked balked"

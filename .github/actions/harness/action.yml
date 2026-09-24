@@ -107,6 +107,16 @@ runs:
         RAIL_LINE = re.compile(r"^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+) +(-?[0-9.eE+]+) +(\S+) +(lower|higher)\s*$")
 
         def out(k, v):
+            """A step output, and never more than one.
+
+            `$GITHUB_OUTPUT` is line-oriented, so a value carrying a newline
+            writes a SECOND assignment that the runner obeys. Several of these
+            values are model-derived -- a refusal reason, a milestone title --
+            so a reply containing "\\nverdict=adopt" would set an output no step
+            wrote. Every output here is a scalar by design, so collapsing is
+            both safe and the meaning.
+            """
+            v = str(v).replace("\r", " ").replace("\n", " ")
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
@@ -114,11 +124,27 @@ runs:
             """Run one configured command. stdout and stderr are one stream:
             a test runner that prints its failures to stderr and its tally to
             stdout is the common case, and counting them separately means
-            counting half of what happened."""
+            counting half of what happened.
+
+            **A timeout is an ORDINARY answer, not an exception.** A hung test
+            suite raised `TimeoutExpired` out of this function, through
+            `measure`, and out of the action as a traceback -- so the step went
+            red, the judge job died, no certificate was filed, and the
+            milestone that produced the hang never moved. Under a schedule that
+            is the silent stall this whole design is arranged against, and an
+            infinite loop is exactly the kind of thing a machine writes.
+            """
             if not cmd:
                 return None
-            r = subprocess.run(cmd, cwd=root, shell=True, capture_output=True,
-                               text=True, timeout=timeout)
+            try:
+                r = subprocess.run(cmd, cwd=root, shell=True, capture_output=True,
+                                   text=True, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                got = ""
+                for half in (exc.stdout, exc.stderr):
+                    if half:
+                        got += half if isinstance(half, str) else half.decode("utf-8", "replace")
+                return 124, got + ("\n[timed out after %ds]" % timeout)
             return r.returncode, (r.stdout or "") + (r.stderr or "")
 
         def count_claims(text, pattern):
@@ -186,6 +212,9 @@ runs:
                 warnings = count_claims(text, h["warnings_re"])
                 if code == 0:
                     succeeded += 1
+                elif code == 124:
+                    built = False
+                    why = "the build did not finish inside %ds" % timeout
                 else:
                     built = False
                     errs = " ".join(l for l in text.splitlines()
@@ -203,6 +232,9 @@ runs:
                 if code == 0:
                     succeeded += 1
                     tested = True
+                elif code == 124:
+                    why = why or ("the tests did not finish inside %ds -- a candidate that "
+                                  "hangs is refused, not left to hold the runner" % timeout)
                 else:
                     why = why or ("the tests did not pass: %d claim(s) printed a pass" % claims)
 
@@ -213,7 +245,8 @@ runs:
                     code, text = shell(h["bench"], root, timeout)
                     log.append("$ %s\n%s" % (h["bench"], text))
                     if code != 0:
-                        why = why or "the benchmark did not finish"
+                        why = why or ("the benchmark did not finish inside %ds" % timeout
+                                      if code == 124 else "the benchmark did not finish")
                         break
                     succeeded += 1
                     for name, (value, unit, direction) in rails_in(text).items():
@@ -316,6 +349,15 @@ runs:
                             "a", 3, True)
                 claim("and skipping the bench leaves the cost rails alone",
                       "host.q" not in r["rails"] and "cost.warnings" in r["rails"])
+
+                slow = cfg(test="sleep 5", timeout=1)
+                r = measure(root, slow, "a", 1, False)
+                claim("a test suite that hangs is a refusal, not a traceback",
+                      r["tested"] is False and "did not finish" in r["why"])
+                r = measure(root, cfg(build="sleep 5", timeout=1), "a", 1, False)
+                claim("and a build that hangs is too", r["built"] is False)
+                claim("and the reason says how long it was given",
+                      "1s" in r["why"])
 
                 r = measure(root, cfg(setup=["exit 1"], build="true"), "a", 1, False)
                 claim("a setup that fails stops before the build", r["built"] is False)

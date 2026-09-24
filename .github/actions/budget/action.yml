@@ -84,6 +84,16 @@ runs:
         WINDOW = 32
 
         def out(k, v):
+            """A step output, and never more than one.
+
+            `$GITHUB_OUTPUT` is line-oriented, so a value carrying a newline
+            writes a SECOND assignment that the runner obeys. Several of these
+            values are model-derived -- a refusal reason, a milestone title --
+            so a reply containing "\\nverdict=adopt" would set an output no step
+            wrote. Every output here is a scalar by design, so collapsing is
+            both safe and the meaning.
+            """
+            v = str(v).replace("\r", " ").replace("\n", " ")
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
@@ -178,7 +188,7 @@ runs:
             claim("so the record gets equal time",
                   plan([e(1, "refuse"), e(2, "refuse")], "", 45, 3, 3)[3] == "extend")
 
-            events = [{"seq": "1", "verdict": "rollback", "moved": "-", "axis": "a"}]
+            events = [{"seq": "1", "verdict": "restore", "moved": "-", "axis": "a"}]
             claim("an event is not a trial and does not move the schedule",
                   plan(events, "", 45, 3, 3)[:2] == (0, 45))
 

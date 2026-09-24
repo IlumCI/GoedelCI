@@ -95,7 +95,10 @@ runs:
         from pathlib import Path
 
         VERSION = "2"
-        VERDICTS = ("adopt", "refuse", "stale", "rollback", "superseded")
+        # `restore` rather than `rollback`: the archive may move to any adopted
+        # state, including a cousin lineage, and "rollback" names only half of
+        # what that is.
+        VERDICTS = ("adopt", "refuse", "stale", "restore", "superseded")
         MOVED = ("better", "worse", "same", "unstable", "absent", "-")
         OPERATORS = ("clonal", "reaction-norm", "cross-lineage", "-")
         LANES = ("grid", "template", "model", "event")
@@ -238,7 +241,7 @@ runs:
                 raise CertError("a stale verdict is about a candidate, and names none")
             if f["witness"] == "fail-then-pass" and verdict not in ("adopt", "refuse", "stale"):
                 raise CertError("a witness result on a %s entry describes a trial that was not one" % verdict)
-            if verdict in ("rollback", "superseded") and f["lane"] != "event":
+            if verdict in ("restore", "superseded") and f["lane"] != "event":
                 raise CertError("a %s is something that happened to the ledger, so its lane is event" % verdict)
             for key in ("suites", "claims", "checks"):
                 if f[key] == "-":
@@ -268,6 +271,16 @@ runs:
             return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
         def out(k, v):
+            """A step output, and never more than one.
+
+            `$GITHUB_OUTPUT` is line-oriented, so a value carrying a newline
+            writes a SECOND assignment that the runner obeys. Several of these
+            values are model-derived -- a refusal reason, a milestone title --
+            so a reply containing "\\nverdict=adopt" would set an output no step
+            wrote. Every output here is a scalar by design, so collapsing is
+            both safe and the meaning.
+            """
+            v = str(v).replace("\r", " ").replace("\n", " ")
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
@@ -331,8 +344,8 @@ runs:
             raises("an adoption whose interval straddles zero is refused as noise",
                    lambda: mut(interval="-0.10,0.30"))
             raises("an adoption that reduces the claim count is refused", lambda: mut(claims="11/10"))
-            raises("a rollback is an event and may not claim a lane",
-                   lambda: mut(verdict="rollback", lane="model", moved="-"))
+            raises("a restore is an event and may not claim a lane",
+                   lambda: mut(verdict="restore", lane="model", moved="-"))
 
             r = parse(mut(verdict="refuse", moved="worse", witness="-", claims="11/10",
                           interval="-", effect="-", q="-"))

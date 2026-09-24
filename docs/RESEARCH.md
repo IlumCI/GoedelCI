@@ -41,11 +41,11 @@ descends from (`lineage`), so the record is a tree rather than a list, and
 `archive` reconstructs it. Adopted trees are nodes; refusals are evaluations
 attached to the node they were tried from.
 
-**Not done.** DGM keeps every variant alive and can resume any of them. This has
-one working tree and one history, so it can move *up* its own lineage and not
-sideways to a cousin — see the no-sideways-moves note in `archive/action.yml`.
-That is a real reduction in what the search can reach, taken deliberately,
-because restoring a cousin would make the record stop describing the files.
+**Not done.** DGM keeps every variant alive and resumes any of them *in
+parallel*. This has one working tree, so it holds one state at a time and moves
+between them — to an ancestor or to a cousin, whichever the archive selects —
+rather than running several at once. The reachable set is the same; the
+throughput is not.
 
 ---
 
@@ -209,7 +209,8 @@ remove every reason to trust the record.
 | adversarial / forgetting gates on evaluator change | implemented, human-labelled evidence |
 | paired comparison with FDR control | implemented |
 | proof of improvement | **not attempted** |
-| sideways moves in the archive | **not possible** by construction |
+| sideways moves in the archive | implemented |
+| several states explored in parallel | **not done**: one working tree |
 | automatic evaluator co-evolution | **deliberately not done** |
 
 [dgm]: https://arxiv.org/abs/2505.22954

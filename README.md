@@ -168,8 +168,10 @@ If your project has no benchmark, none of this runs and the test counts decide.
 
 The record is a tree, not a list: every certificate names the one it descends
 from. Clades are scored by how well their *descendants* did, not by how well the
-tip itself scored, and the night samples which clade to build from. A branch of
-work whose last four attempts all failed stops being where tomorrow starts.
+tip itself scored, and the night samples which clade to build from — an
+ancestor of where it is now, or a cousin lineage it left behind weeks ago. A
+branch of work whose last four attempts all failed stops being where tomorrow
+starts.
 
 Below six counted trials this never fires — a clade comparison over four trials
 is a comparison of two priors.

@@ -126,6 +126,16 @@ runs:
         class NoAnswer(DraftError): pass
 
         def out(k, v):
+            """A step output, and never more than one.
+
+            `$GITHUB_OUTPUT` is line-oriented, so a value carrying a newline
+            writes a SECOND assignment that the runner obeys. Several of these
+            values are model-derived -- a refusal reason, a milestone title --
+            so a reply containing "\\nverdict=adopt" would set an output no step
+            wrote. Every output here is a scalar by design, so collapsing is
+            both safe and the meaning.
+            """
+            v = str(v).replace("\r", " ").replace("\n", " ")
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
@@ -389,10 +399,21 @@ runs:
             return r.stdout
 
         def run_check(root, command, timeout):
+            """The project's fast gate, over one attempt's staged tree.
+
+            A timeout here is a refusal the next attempt is shown, not an
+            exception: the commonest thing a model writes that hangs is a loop
+            that never terminates, and killing the whole draw for it wastes the
+            five attempts that would have fixed it.
+            """
             if not command:
                 return True, ""
-            r = subprocess.run(command, cwd=root, shell=True, capture_output=True,
-                               text=True, timeout=timeout)
+            try:
+                r = subprocess.run(command, cwd=root, shell=True, capture_output=True,
+                                   text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return False, ("Your code did not finish inside %ds. Something in it does "
+                               "not terminate." % timeout)
             if r.returncode == 0:
                 return True, ""
             return False, ((r.stdout or "") + (r.stderr or "")).strip()
@@ -472,10 +493,27 @@ runs:
             raise DraftError(last_error or "every attempt came back unusable")
 
         def allowed(path, cfg):
-            import fnmatch
+            """Whether a model-named path may be WRITTEN.
+
+            **The traversal check is first and is not decoration.** `fnmatch`
+            matches `src/../../etc/passwd` against `src/**` -- the pattern sees
+            a `src/` prefix and `*` crosses separators -- so a reply naming
+            that path passed the masks and was written into the staging
+            worktree before anything downstream looked at it. `envelope admit`
+            refuses it afterwards, which is too late: the file is already on
+            disk outside the checkout.
+            """
+            import fnmatch, posixpath
+            if not path or path.startswith(("/", "\\")) or ":" in path.split("/")[0]:
+                return False
+            parts = path.split("/")
+            if any(seg in ("", ".", "..") for seg in parts):
+                return False
+            # And the normalised form must be the path itself, so no encoding
+            # of a traversal survives by being spelled differently.
+            if posixpath.normpath(path) != path:
+                return False
             def m(p, masks):
-                if p.startswith("./"):
-                    p = p[2:]
                 for x in masks:
                     if fnmatch.fnmatch(p, x):
                         return True
@@ -554,6 +592,15 @@ runs:
             claim("a src path is writable", allowed("src/a.py", CFG))
             claim("the machine's own actions are not", not allowed(".github/actions/x/action.yml", CFG))
             claim("a path outside every allow mask is not", not allowed("README.md", CFG))
+            claim("a path that climbs out of the tree is not, however it is spelled",
+                  not allowed("src/../../etc/passwd", CFG),
+                  "fnmatch matches this against src/** and the file lands outside the "
+                  "checkout before admission ever sees it")
+            claim("nor is an absolute one", not allowed("/etc/passwd", CFG))
+            claim("nor one with a bare dot segment", not allowed("src/./x.py", CFG))
+            claim("nor an empty one", not allowed("", CFG))
+            claim("nor a windows drive", not allowed("C:/x", CFG))
+            claim("and an ordinary nested path still is", allowed("src/a/b/c.py", CFG))
 
             # -- the card -------------------------------------------------
             rung = {"kind": "feature", "target": "src/new.py", "title": "add a cache",
