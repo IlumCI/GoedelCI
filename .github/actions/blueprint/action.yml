@@ -59,7 +59,15 @@ inputs:
     required: false
     default: ""
   description:
-    description: "for card: what it should be"
+    description: "for card: what it should be, when there is no brief"
+    required: false
+    default: ""
+  brief:
+    description: >-
+      for card: a file holding the specification `brief` produced. When it is
+      there it IS the description -- the raw sentence somebody typed has
+      already been built out into something with acceptance criteria in it, and
+      planning from the sentence again would throw that away.
     required: false
     default: ""
   reply:
@@ -117,6 +125,7 @@ runs:
         CONFIG: ${{ inputs.config }}
         NAME: ${{ inputs.name }}
         DESCRIPTION: ${{ inputs.description }}
+        BRIEF: ${{ inputs.brief }}
         REPLY: ${{ inputs.reply }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
@@ -437,8 +446,17 @@ runs:
 
         try:
             if cmd == "card":
+                description = os.environ.get("DESCRIPTION", "")
+                bp = os.environ.get("BRIEF", "").strip()
+                if bp and Path(bp).is_file():
+                    description = Path(bp).read_text(encoding="utf-8").strip()
+                    if not description:
+                        raise BlueprintError("the brief at %s is empty" % bp)
+                if not description.strip():
+                    raise BlueprintError(
+                        "nothing to plan from: no brief and no description")
                 Path(os.environ["CARD_OUT"]).write_text(
-                    card(os.environ["NAME"], os.environ["DESCRIPTION"], cfg or None),
+                    card(os.environ["NAME"], description, cfg or None),
                     encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
                 print("  asked for a plan for: %s" % os.environ["NAME"])

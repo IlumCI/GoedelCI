@@ -1,17 +1,47 @@
 # GoedelCI
 
-A repository that improves itself, as a template.
+A repository that builds itself, as a template.
 
-You write one paragraph saying what the project is for. Every night, unattended,
-the repository decides the next milestone toward it, writes the code, runs both
-the old and the new version, decides whether the new one is actually better, and
-files a signed record of what it decided and why. Improvements accumulate on a
-branch you merge when you feel like it. Nothing reaches your default branch
-without you.
+You say what you want. It writes the specification, plans it into phases,
+builds the first one, proves the result actually runs, and then improves it
+every night — measuring each change against the version before it and keeping
+only what did not make anything worse. With autonomous promotion on, nothing
+in that sentence involves you.
 
-It is fifteen composite actions and six workflows. There is no package to
-install, no service to run, and nothing outside `.github/` except one config
-file. It runs on GitHub's free hosted runners.
+<!-- goedel:brief -->
+Replace this block with what you want built. A paragraph is plenty; a sentence
+is fine; deleting it entirely is also fine, because a name and a kind of thing
+carry most of a specification on their own. Whatever is here, `genesis` reads
+it, builds it out into `loop/brief.md`, and shows you that before writing a
+line of code.
+<!-- /goedel:brief -->
+
+---
+
+## Starting one
+
+Use this template, add one secret (`GOEDEL_INFERENCE_KEY`), and run `genesis`:
+
+| | |
+|---|---|
+| **name** | what the thing is called |
+| **type** | `app` · `api` · `agent` · `token` · `business` · `experiment` |
+| **description** | optional — the README block above is read when it is empty |
+| **autonomous** | whether nights promote their own work |
+
+Then wait. The first pull request carries the brief it wrote, the plan it drew,
+and a working phase one.
+
+**A name and a type is a complete input.** A kind of thing carries most of its
+own requirements — an API has routes and a schema, an agent has tools and an
+eval set, a token utility site has a thing the token actually does — so the
+missing half is filled in from what that kind of thing usually is. Everything
+it decided is in `loop/brief.md`, including what it decided *not* to build,
+which is where you look first if it guessed wrong.
+
+It will not invent facts about the world. No testimonials, partners, audits,
+holder counts, endorsements or performance claims appear in anything it writes,
+because it has no way to know which of those are true.
 
 ---
 
@@ -48,10 +78,12 @@ so an edited certificate stops being the file the ledger says it is.
 
 ---
 
-## Getting started
+## Adopting it into a project that already exists
 
-**1. Use this template**, or copy `.github/`, `goedel.toml` and `loop/` into an
-existing repository.
+Genesis is for a repository that does not have one yet. To put the loop around
+code you already have:
+
+**1. Copy** `.github/`, `goedel.toml` and `loop/` into the repository.
 
 **2. Edit `goedel.toml`.** It is the whole adapter between this machine and your
 project, and it is commented at length. The parts that matter:

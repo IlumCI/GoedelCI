@@ -71,6 +71,8 @@ jobs:
         with: { command: selftest }
       - uses: ./.github/actions/bench-pair
         with: { command: selftest }
+      - uses: ./.github/actions/brief
+        with: { command: selftest }
       - uses: ./.github/actions/blueprint
         with: { command: selftest }
       - uses: ./.github/actions/scaffold

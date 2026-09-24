@@ -1,0 +1,618 @@
+name: goedel-brief
+description: >-
+  Turn whatever the operator actually wrote -- a paragraph, a sentence, or
+  nothing but a name and a kind of thing -- into a concrete specification the
+  planner can work from.
+
+# **The layer between "a token site" and something buildable.**
+#
+# `blueprint` refuses a criterion that is a feeling, and it is right to: each
+# one becomes a test's witness and a test cannot be written for "it works
+# well". But that strictness was pointed at the wrong end. It refused vague
+# OUTPUT and also, in practice, punished vague INPUT -- and vague input is the
+# normal case. Nobody writing the README of a thing that does not exist yet
+# writes acceptance criteria. They write "a paste bin", or they write the name
+# and nothing else.
+#
+# So this sits in front. It takes whatever there is and produces a brief: what
+# the thing is, who it is for, what it does, what the first version must do to
+# count as working, and what it deliberately will not do. Vagueness is
+# expanded here, once, in a document you can read and disagree with -- and
+# refused from here on, because after this point it would be silent.
+#
+# **`type` is what makes a name sufficient.** A kind of thing carries most of
+# its own requirements: an API has routes and a schema and versioning, an agent
+# has tools and an eval set, a token utility site has a thing the token
+# actually does. The table below is that knowledge, and it is the difference
+# between "pastebin" producing a plan and producing a shrug.
+#
+# The brief lands in `loop/brief.md` and in the genesis pull request, so the
+# first thing you see is what it decided to build. If it is wrong, it is wrong
+# on one page before anything was written, rather than in month two.
+
+inputs:
+  command:
+    description: "read | card | admit | types | selftest"
+    required: true
+  root:
+    description: "the tree to read the description out of"
+    required: false
+    default: "."
+  name:
+    description: "what the thing is called"
+    required: false
+    default: ""
+  type:
+    description: "token | business | app | experiment | api | agent"
+    required: false
+    default: ""
+  description:
+    description: "overrides whatever is in the repository, when given"
+    required: false
+    default: ""
+  source:
+    description: "for read: where to look, in order"
+    required: false
+    default: "loop/brief.md README.md"
+  reply:
+    description: "for admit: the file `draft ask` wrote"
+    required: false
+    default: reply.txt
+  found:
+    description: >-
+      for admit: where the description came from, as `read` reported it. It
+      goes into the brief, because a brief written from a name alone is a set
+      of guesses and a reader who does not know that will take it for a record
+      of what they asked for.
+    required: false
+    default: none
+  input-out:
+    description: "for read: where to put what was found"
+    required: false
+    default: brief-input.txt
+  card-out:
+    required: false
+    default: brief-card.txt
+  system-out:
+    required: false
+    default: brief-system.txt
+
+outputs:
+  found:
+    description: "file | input | none -- where the description came from"
+    value: ${{ steps.run.outputs.found }}
+  words:
+    description: "how many words of description there were to work from"
+    value: ${{ steps.run.outputs.words }}
+  type:
+    description: "the kind of thing, after defaulting"
+    value: ${{ steps.run.outputs.type }}
+  why:
+    description: "one line for the log"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        NAME: ${{ inputs.name }}
+        TYPE: ${{ inputs.type }}
+        DESCRIPTION: ${{ inputs.description }}
+        SOURCE: ${{ inputs.source }}
+        REPLY: ${{ inputs.reply }}
+        INPUT_OUT: ${{ inputs.input-out }}
+        FOUND: ${{ inputs.found }}
+        CARD_OUT: ${{ inputs.card-out }}
+        SYSTEM_OUT: ${{ inputs.system-out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import os, re, sys, textwrap
+        from pathlib import Path
+
+        OPEN, CLOSE = "<!-- goedel:brief -->", "<!-- /goedel:brief -->"
+        FENCE = re.compile(r"<<<BRIEF>>>\s*(.*?)\s*<<<END>>>", re.S)
+        SECTIONS = ("what it is", "who it is for", "what it does",
+                    "done means", "not doing")
+
+        # A description this short is not a description. It is a label, and the
+        # whole point of this action is that a label is allowed.
+        THIN = 12
+
+        class BriefError(Exception): pass
+
+        def out(k, v):
+            v = str(v).replace("\r", " ").replace("\n", " ")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        # -- what each kind of thing is mostly made of --------------------
+        #
+        # This is the knowledge that makes a name sufficient. It is guidance
+        # for the planner, not a template to fill: it says what such a thing
+        # usually needs, what its first version usually is, and how anybody
+        # would know it works. Edit it; it is part of the machine, so changing
+        # it goes through the `boundary` lane.
+
+        TYPES = {
+          "app": textwrap.dedent("""\
+            An application somebody uses directly, with state that survives
+            restarts.
+              usually needs   a way in, a core object it manipulates, storage that
+                              persists, and a view of what is stored
+              first version   the core object, created and read back, stored on
+                              disk. No accounts, no styling, no framework.
+              verify          start it, create one object through the real entry
+                              point, read it back, exit non-zero if it differs
+            """),
+          "api": textwrap.dedent("""\
+            An HTTP service other programs call.
+              usually needs   a small set of routes, a documented request and
+                              response shape, input validation that rejects
+                              rather than guesses, and a health endpoint
+              first version   one resource, created and fetched, with the schema
+                              enforced on the way in
+              verify          start the server, POST then GET, assert the body
+                              round-trips and that a malformed request is refused
+            """),
+          "agent": textwrap.dedent("""\
+            A program that uses a language model with tools to do a task.
+              usually needs   a tool interface, a loop with a stopping condition,
+                              a transcript of what it did, and an EVAL SET -- a
+                              handful of tasks with known-correct outcomes
+              first version   one tool, the loop, and three eval tasks it passes
+              verify          run the eval set against a stub model, assert the
+                              known-correct outcomes. The stub matters: a verify
+                              that needs a live model and a key cannot run on
+                              every candidate, and one that cannot run is not a
+                              gate.
+            """),
+          "experiment": textwrap.dedent("""\
+            A harness for finding something out.
+              usually needs   a hypothesis stated so it could be wrong, a
+                              measurable quantity, a runner that produces the
+                              measurement, and results kept where they can be
+                              compared
+              first version   the runner, over a small fixed input, writing a
+                              measurement the loop can read as a rail
+              verify          run it over the fixed input and assert the
+                              measurement is produced and is within known bounds
+            """),
+          "business": textwrap.dedent("""\
+            A small service somebody pays for.
+              usually needs   a page saying what is offered and at what price,
+                              a way to express interest or buy, somewhere the
+                              request lands, and the thing actually being
+                              delivered
+              first version   the offer page and the intake, with a submission
+                              stored and retrievable. Payment integration is
+                              later; a stored intake is testable today.
+              verify          serve the page, submit the form, assert the
+                              submission is stored and can be read back
+              never           do not write testimonials, customer names, case
+                              studies, press mentions or statistics that are not
+                              real. A page that invents social proof is a page
+                              that has to be taken down.
+            """),
+          "token": textwrap.dedent("""\
+            A website or app around a crypto token -- the utility, not the
+            token itself.
+
+            This template builds and tests software. It does not deploy
+            contracts, hold keys or move funds, and a blueprint that asks it to
+            is asking for something it cannot verify and must not attempt.
+
+              usually needs   a page saying plainly what the token does and what
+                              it does not, the utility itself (the thing holding
+                              the token actually gets you), read-only chain data
+                              where it is displayed, and documentation
+              first version   the utility, working against a local or mocked
+                              chain interface, with the claims on the page
+                              matching what the code does
+              verify          serve the app, exercise the utility against the
+                              mock, assert the behaviour the page claims
+              never           do not write audit results, partnerships,
+                              endorsements, team biographies, holder counts,
+                              exchange listings, roadmap dates or price and
+                              return claims that are not established facts you
+                              were given. Invented ones are the difference
+                              between a product and a fraud, and this machine
+                              cannot tell which it is writing -- so it writes
+                              neither.
+            """),
+        }
+
+        def type_guidance(kind):
+            if kind not in TYPES:
+                raise BriefError("%r is not a kind of thing this knows: %s"
+                                 % (kind, ", ".join(sorted(TYPES))))
+            return TYPES[kind]
+
+        # -- finding what the operator wrote ------------------------------
+
+        def from_markdown(text):
+            """The marked block if there is one, else the prose under the title.
+
+            The marker is unambiguous and is what the template tells people to
+            use. The fallback exists because most people will not, and a README
+            whose first paragraph describes the project is the normal shape of
+            a README.
+            """
+            if OPEN in text and CLOSE in text:
+                return text.split(OPEN, 1)[1].split(CLOSE, 1)[0].strip()
+            lines = text.splitlines()
+            body, started = [], False
+            for line in lines:
+                s = line.strip()
+                if not started:
+                    if s.startswith("# "):
+                        started = True
+                    continue
+                if s.startswith("#"):
+                    break
+                # A badge line or an HTML comment is not a description.
+                if s.startswith(("[!", "<!--", "![")):
+                    continue
+                body.append(line)
+            return "\n".join(body).strip()
+
+        def read(root, sources, override):
+            if override.strip():
+                return "input", override.strip()
+            for rel in sources:
+                p = Path(root) / rel
+                if not p.is_file():
+                    continue
+                got = from_markdown(p.read_text(encoding="utf-8"))
+                if got:
+                    return "file:" + rel, got
+            return "none", ""
+
+        # -- the question -------------------------------------------------
+
+        SYSTEM = textwrap.dedent("""\
+            You turn a rough idea into a specification precise enough to build from.
+
+            The person gave you a name, a kind of thing, and possibly a sentence.
+            That is normal and is not a problem to complain about: your job is to
+            make the decisions they did not make, pick the obvious version of what
+            they asked for, and write it down so they can disagree with it.
+
+            Answer with exactly one fenced block and nothing else:
+
+            <<<BRIEF>>>
+            what it is: <two or three sentences. Concrete. Name the actual thing.>
+            who it is for: <one sentence. A real situation, not "users".>
+            what it does:
+              - <a capability, stated as something the thing DOES>
+              - <another>
+              - <another>
+            done means:
+              - <what must be true of the FIRST version for it to count as working>
+              - <another>
+            not doing:
+              - <something a reasonable person might expect, that this will not do>
+              - <another>
+            <<<END>>>
+
+            Rules:
+            - Decide. "Could be either" is not a specification. If the idea admits
+              several readings, take the smallest useful one and put the others
+              under `not doing`.
+            - `done means` is the hard part. Each line must be something that could
+              be OBSERVED -- a request that returns a particular thing, a file that
+              appears, a number within bounds. Not "is reliable", not "works well".
+              These become tests, and a test cannot be written for an adjective.
+            - Three to six capabilities. This is a first version, not a product
+              roadmap. Everything you leave out goes under `not doing`, where it is
+              a decision rather than an omission.
+            - Never invent facts about the real world: no customers, partners,
+              audits, endorsements, statistics, dates or credentials. If the idea
+              seems to need them, say under `not doing` that they are not
+              included.
+            - Write it so somebody who has never heard of this could build it.
+            """)
+
+        def card(name, kind, description, found):
+            parts = ["THE NAME\n" + name]
+            parts.append("THE KIND OF THING\n" + type_guidance(kind))
+            if description:
+                parts.append("WHAT THEY WROTE\n" + description)
+                if len(description.split()) < THIN:
+                    parts.append(
+                        "THAT IS ALL THEY WROTE. It is a label rather than a "
+                        "specification, which is the normal case. Do not ask for more "
+                        "and do not hedge: decide what the obvious version of this is, "
+                        "build the specification out to something buildable, and put "
+                        "every choice you were not given under `not doing` so it can "
+                        "be argued with.")
+            else:
+                parts.append(
+                    "THEY WROTE NOTHING BUT THE NAME AND THE KIND.\n"
+                    "So the specification is yours. Take the most ordinary, most "
+                    "useful thing that name could mean for that kind of thing, and "
+                    "write it down plainly enough that they can tell you it is wrong.")
+            parts.append(
+                "WHAT HAPPENS TO THIS\n"
+                "A planner turns your brief into phases; each line under `done means` "
+                "becomes the witness of a milestone, and a machine writes a test for "
+                "that sentence and then code until the test passes. A line no test "
+                "can be written for produces a milestone that never completes.")
+            return "\n\n".join(parts)
+
+        # -- admission ----------------------------------------------------
+
+        VAGUE = ("works well", "works correctly", "is reliable", "is robust",
+                 "is clean", "is fast", "is secure", "is scalable", "is intuitive",
+                 "high quality", "best practice", "production ready",
+                 "production-ready", "user friendly", "user-friendly",
+                 "looks good", "is performant", "is maintainable")
+
+        def parse(text):
+            got, key = {}, None
+            for raw in text.splitlines():
+                line = raw.rstrip()
+                if not line.strip():
+                    continue
+                s = line.strip()
+                if s.startswith("-"):
+                    if key is None:
+                        raise BriefError("a bullet before any section: %r" % s[:60])
+                    got.setdefault(key, []).append(s.lstrip("- ").strip())
+                    continue
+                k, sep, v = line.partition(":")
+                k = k.strip().lower()
+                if not sep or k not in SECTIONS:
+                    raise BriefError("%r is not one of: %s" % (s[:60], ", ".join(SECTIONS)))
+                if k in got:
+                    raise BriefError("%s twice" % k)
+                key = k
+                got[k] = [v.strip()] if v.strip() else []
+            return got
+
+        def admit(text):
+            got = parse(text)
+            missing = [s for s in SECTIONS if not got.get(s)]
+            if missing:
+                raise BriefError("the brief says nothing under: " + ", ".join(missing))
+            if len(got["what it does"]) < 3:
+                raise BriefError(
+                    "only %d capabilit%s. A first version with fewer than three things "
+                    "it does is a description of an intention."
+                    % (len(got["what it does"]),
+                       "y" if len(got["what it does"]) == 1 else "ies"))
+            if len(got["done means"]) < 2:
+                raise BriefError(
+                    "fewer than two acceptance criteria, so almost nothing would have "
+                    "to be true for this to count as finished")
+            for line in got["done means"]:
+                low = line.lower()
+                bad = [v for v in VAGUE if v in low]
+                if bad:
+                    raise BriefError(
+                        "%r is a judgement, not an observation (%r). Each of these "
+                        "becomes a test's witness and a test cannot be written for it."
+                        % (line, bad[0]))
+                if len(line.split()) < 4:
+                    raise BriefError("%r is too short to be a criterion" % line)
+            return got
+
+        def render(name, kind, got, source="none"):
+            """The brief as a page somebody reads, saying where it came from.
+
+            The provenance line is not decoration. A brief written from a name
+            alone is a set of guesses, and a reader who does not know that will
+            take it for a record of what they asked for.
+            """
+            came = {"none": "from the name and the kind of thing alone -- "
+                            "everything below is a guess you can overrule",
+                    "input": "from the description given to `genesis`"}.get(
+                        source, "from " + source.replace("file:", ""))
+            lines = ["# %s" % name, "", "*%s. Written by `genesis` %s.*" % (kind, came), ""]
+            for s in SECTIONS:
+                lines.append("## %s" % s.title())
+                for v in got[s]:
+                    lines.append("- %s" % v if len(got[s]) > 1 or s in
+                                 ("what it does", "done means", "not doing") else v)
+                lines.append("")
+            return "\n".join(lines)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            import tempfile
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except BriefError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            # -- the types ------------------------------------------------
+            claim("every kind of thing says what its first version is",
+                  all("first version" in v for v in TYPES.values()))
+            claim("and how anybody would know it works",
+                  all("verify" in v for v in TYPES.values()))
+            claim("a token site is told this machine does not touch funds",
+                  "does not deploy contracts" in TYPES["token"].replace("\\n", " ")
+                  or "does not deploy" in " ".join(TYPES["token"].split()))
+            claim("and is told not to invent audits or endorsements",
+                  "audit" in TYPES["token"] and "endorsement" in TYPES["token"])
+            claim("a business is told not to invent testimonials",
+                  "testimonial" in TYPES["business"])
+            claim("an agent is told its eval must run without a live model",
+                  "stub" in TYPES["agent"])
+            raises("a kind of thing nothing knows is refused",
+                   lambda: type_guidance("spaceship"))
+
+            # -- finding the description ----------------------------------
+            claim("a marked block in a readme is the description",
+                  from_markdown("# T\nbadge\n%s\nthe real thing\n%s\n" % (OPEN, CLOSE))
+                  == "the real thing")
+            claim("without one, the prose under the title is",
+                  from_markdown("# T\n\na paste bin.\n\n## Install\nnope\n")
+                  == "a paste bin.")
+            claim("badges and comments are not a description",
+                  from_markdown("# T\n[![b](x)](y)\n<!-- c -->\n") == "")
+            claim("and a readme with no title yields nothing",
+                  from_markdown("just some words\n") == "")
+
+            with tempfile.TemporaryDirectory() as td:
+                r = Path(td)
+                claim("with nothing anywhere, there is no description",
+                      read(r, ["README.md"], "") == ("none", ""))
+                (r / "README.md").write_text("# T\n\nfrom the readme.\n")
+                claim("a readme is found", read(r, ["README.md"], "")[1] == "from the readme.")
+                (r / "loop").mkdir()
+                (r / "loop/brief.md").write_text("# T\n\nfrom the brief.\n")
+                claim("and an explicit brief file wins over it",
+                      read(r, ["loop/brief.md", "README.md"], "")[1] == "from the brief.")
+                claim("and a dispatch input wins over both",
+                      read(r, ["loop/brief.md", "README.md"], "typed in")[1] == "typed in")
+                claim("and says where it came from",
+                      read(r, ["README.md"], "")[0] == "file:README.md")
+
+            # -- the card -------------------------------------------------
+            c = card("pastebin", "app", "a paste bin", "input")
+            claim("the card carries the name", "pastebin" in c)
+            claim("and what that kind of thing usually needs", "first version" in c)
+            claim("a thin description is called out as a label, not refused",
+                  "label rather than a specification" in c)
+            claim("and a long one is not",
+                  "label rather than a specification" not in
+                  card("x", "app", " ".join(["word"] * 40), "input"))
+            claim("with no description at all, the specification is handed over",
+                  "THEY WROTE NOTHING BUT THE NAME" in card("x", "app", "", "none"))
+            claim("and the card says what happens to each criterion",
+                  "witness of a milestone" in c)
+
+            # -- admission ------------------------------------------------
+            GOOD = textwrap.dedent("""\
+                what it is: A paste bin. Text goes in, a short link comes back.
+                who it is for: Somebody pasting a stack trace into a chat window.
+                what it does:
+                  - stores a body of text and returns an identifier for it
+                  - returns the stored text when given the identifier
+                  - forgets a paste once its time to live has passed
+                done means:
+                  - posting a body returns an identifier that is not empty
+                  - fetching that identifier returns the body that was posted
+                not doing:
+                  - no accounts, no authentication, no per-user history
+                  - no syntax highlighting or rendering of any kind
+                """)
+            got = admit(GOOD)
+            claim("a well-formed brief is admitted", len(got["what it does"]) == 3)
+            claim("and its criteria are kept in order",
+                  got["done means"][0].startswith("posting a body"))
+
+            raises("a brief missing a section is refused",
+                   lambda: admit(GOOD.replace("not doing:", "").replace(
+                       "  - no accounts, no authentication, no per-user history\n", "")
+                       .replace("  - no syntax highlighting or rendering of any kind\n", "")))
+            raises("a brief with fewer than three capabilities is refused",
+                   lambda: admit(GOOD.replace(
+                       "  - forgets a paste once its time to live has passed\n", "")
+                       .replace("  - returns the stored text when given the identifier\n", "")))
+            raises("a brief with one criterion is refused",
+                   lambda: admit(GOOD.replace(
+                       "  - fetching that identifier returns the body that was posted\n", "")))
+            for v in ("it works well", "the service is reliable enough",
+                      "the code is production ready"):
+                raises("a criterion that is a judgement is refused: %r" % v,
+                       lambda v=v: admit(GOOD.replace(
+                           "  - posting a body returns an identifier that is not empty",
+                           "  - " + v)))
+            raises("a section nothing knows is refused",
+                   lambda: admit(GOOD + "vibes: good\n"))
+            raises("a section twice is refused", lambda: admit(GOOD + GOOD))
+            raises("a bullet before any section is refused",
+                   lambda: admit("  - floating\n" + GOOD))
+
+            md = render("pastebin", "app", got, "file:README.md")
+            claim("it renders as something a person reads", md.startswith("# pastebin"))
+            claim("with every section", all(s.title() in md for s in SECTIONS))
+            claim("and says where it came from", "from README.md" in md)
+            claim("a brief invented from a name says so plainly",
+                  "everything below is a guess" in render("x", "app", got, "none"))
+            claim("and one written from a given description says that instead",
+                  "description given to" in render("x", "app", got, "input"))
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd == "types":
+            for k in sorted(TYPES):
+                print("[%s]\n%s" % (k, TYPES[k]))
+            out("why", " ".join(sorted(TYPES)))
+            sys.exit(0)
+
+        root = os.environ.get("ROOT", ".") or "."
+        name = os.environ.get("NAME", "").strip()
+        kind = (os.environ.get("TYPE", "").strip() or "app").lower()
+
+        try:
+            if cmd == "read":
+                found, text = read(root, os.environ["SOURCE"].split(),
+                                   os.environ.get("DESCRIPTION", ""))
+                Path(os.environ["INPUT_OUT"]).write_text(text, encoding="utf-8")
+                words = len(text.split())
+                print("  %s: %d word(s) of description from %s" % (name, words, found))
+                if words == 0:
+                    print("  nothing but a name and a kind, which is enough")
+                elif words < THIN:
+                    print("  a label rather than a specification; it will be built out")
+                out("found", found); out("words", str(words)); out("type", kind)
+                out("why", "%d word(s) from %s" % (words, found))
+            elif cmd == "card":
+                src = Path(os.environ["INPUT_OUT"])
+                text = src.read_text(encoding="utf-8").strip() if src.is_file() else ""
+                Path(os.environ["CARD_OUT"]).write_text(
+                    card(name, kind, text, "file" if text else "none"), encoding="utf-8")
+                Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                print("  asked for a brief for %s (%s)" % (name, kind))
+                out("type", kind); out("why", "a question was written")
+            elif cmd == "admit":
+                reply = Path(os.environ["REPLY"]).read_text(encoding="utf-8")
+                found = FENCE.findall(reply)
+                if not found:
+                    raise BriefError("the reply carries no fenced brief")
+                if len(found) > 1:
+                    raise BriefError("the reply carries %d briefs; a specification is one"
+                                     % len(found))
+                got = admit(found[0])
+                dest = Path(root) / "loop/brief.md"
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(render(name, kind, got,
+                                       os.environ.get("FOUND", "none")),
+                                encoding="utf-8")
+                print("  %s: %d capabilit%s, %d criteri%s, %d thing(s) it will not do"
+                      % (name, len(got["what it does"]),
+                         "y" if len(got["what it does"]) == 1 else "ies",
+                         len(got["done means"]),
+                         "on" if len(got["done means"]) == 1 else "a",
+                         len(got["not doing"])))
+                for line in got["done means"]:
+                    print("    done: %s" % line)
+                out("type", kind); out("why", "wrote " + str(dest))
+            else:
+                raise BriefError("no such command: %r" % cmd)
+        except BriefError as exc:
+            print("::notice::brief %s: %s" % (cmd, exc))
+            out("found", "none"); out("words", "0"); out("type", kind)
+            out("why", str(exc)[:300])
+            sys.exit(1)
+        PYEOF

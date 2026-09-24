@@ -1,12 +1,23 @@
 name: genesis
 
-# **A name and a description, and a repository that runs.**
+# **A name and a kind of thing, and a repository that runs.**
 #
-# Everything else here improves a project that exists. This makes one. You give
-# it what the thing is called and what it should be; it plans, builds phase
-# one, proves the result actually works, writes the config the nightly loop
-# will run against, and commits. After it, `loop-night` has something to do
-# every night and you have nothing to do at all.
+# Everything else here improves a project that exists. This makes one.
+#
+# What you have to supply is a name and what kind of thing it is. Everything
+# past that is optional and has somewhere better to live than a dispatch box:
+#
+#   loop/brief.md   if you have written a specification, it wins
+#   README.md       otherwise, the marked block, or the prose under the title
+#   the input       and if you would rather just type it, type it
+#   nothing         which is fine. A kind of thing carries most of its own
+#                   requirements, and `brief` builds the rest out into a
+#                   document you can read and disagree with before anything
+#                   is written.
+#
+# It then plans, builds phase one, proves the result actually works, writes the
+# config the nightly loop will run against, and commits. After it, `loop-night`
+# has something to do every night and you have nothing to do at all.
 #
 # **It is not finished until the tree it wrote runs.** A scaffold is accepted
 # only when `config` loads what was assembled for it, the harness builds and
@@ -30,9 +41,18 @@ on:
       name:
         description: "what the thing is called"
         required: true
-      description:
-        description: "what it should be. A paragraph. Say what done looks like."
+      type:
+        description: "what kind of thing it is"
+        type: choice
         required: true
+        default: app
+        options: [app, api, agent, token, business, experiment]
+      description:
+        description: >-
+          optional. Leave it empty and the README is read instead; leave that
+          empty too and the name and the kind are enough.
+        required: false
+        default: ""
       autonomous:
         description: "promote its own work to the default branch, with no human"
         type: boolean
@@ -58,6 +78,7 @@ jobs:
       contents: write
     outputs:
       stack: ${{ steps.admit.outputs.stack }}
+      source: ${{ steps.found.outputs.why }}
       verify: ${{ steps.admit.outputs.verify }}
       branch: ${{ steps.branch.outputs.name }}
     steps:
@@ -91,12 +112,51 @@ jobs:
             exit 1
           fi
 
+      # --- the brief: whatever there is, made concrete -------------------
+      - id: found
+        uses: ./.github/actions/brief
+        with:
+          command: read
+          name: ${{ inputs.name }}
+          type: ${{ inputs.type }}
+          description: ${{ inputs.description }}
+          source: loop/brief.md README.md
+          input-out: brief-input.txt
+
+      - uses: ./.github/actions/brief
+        with:
+          command: card
+          name: ${{ inputs.name }}
+          type: ${{ inputs.type }}
+          input-out: brief-input.txt
+          card-out: brief-card.txt
+          system-out: brief-system.txt
+
+      - id: brief-ask
+        uses: ./.github/actions/draft
+        with:
+          command: ask
+          config: ${{ runner.temp }}/ask.json
+          system: brief-system.txt
+          user: brief-card.txt
+          out: brief-reply.txt
+
+      - id: brief
+        uses: ./.github/actions/brief
+        with:
+          command: admit
+          name: ${{ inputs.name }}
+          type: ${{ inputs.type }}
+          found: ${{ steps.found.outputs.found }}
+          reply: brief-reply.txt
+
+      # --- the plan, from the brief rather than from the sentence --------
       - id: card
         uses: ./.github/actions/blueprint
         with:
           command: card
           name: ${{ inputs.name }}
-          description: ${{ inputs.description }}
+          brief: loop/brief.md
           card-out: blueprint-card.txt
           system-out: blueprint-system.txt
 
@@ -133,26 +193,35 @@ jobs:
         shell: bash
         env:
           NAME: ${{ inputs.name }}
-          DESCRIPTION: ${{ inputs.description }}
+          TYPE: ${{ inputs.type }}
         run: |
           set -euo pipefail
           mkdir -p loop
-          # The goal is the operator's own words, kept verbatim. The blueprint
-          # is a reading of them, and a reading can be wrong -- so the sentence
-          # it was read from stays where a later night can compare.
+          # The goal is what was actually written, kept verbatim. The brief is a
+          # reading of it and the blueprint is a reading of that, and both
+          # readings can be wrong -- so whatever they were read from stays
+          # where a later night, and a person, can compare.
           {
-            printf '%s\n\n' "$NAME"
-            printf '%s\n' "$DESCRIPTION"
+            printf '%s (%s)\n\n' "$NAME" "$TYPE"
+            if [ -s brief-input.txt ]; then
+              cat brief-input.txt
+            else
+              printf 'No description was given. The brief in loop/brief.md was\n'
+              printf 'written from the name and the kind of thing alone.\n'
+            fi
           } > loop/goal.txt
           git add loop
-          git commit -q -m "genesis: a plan for $NAME"
+          git commit -q -m "genesis: a brief and a plan for $NAME"
           git push origin HEAD:refs/heads/loop/main
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: genesis-plan
           path: |
+            loop/brief.md
             loop/blueprint.txt
+            brief-input.txt
+            brief-reply.txt
             blueprint-reply.txt
           if-no-files-found: error
           retention-days: 30
@@ -247,11 +316,13 @@ jobs:
           NAME: ${{ inputs.name }}
           STACK: ${{ needs.plan.outputs.stack }}
           AUTONOMOUS: ${{ inputs.autonomous }}
+          SOURCE: ${{ needs.plan.outputs.source }}
         shell: bash
         run: |
           set -euo pipefail
-          body=$(printf '**%s** is born.\n\n```\n%s\n```\n\nStack: %s\n\nThe plan is in `loop/blueprint.txt`; each criterion under each phase becomes a milestone with that sentence as its witness. `loop-night` works the first open one every night.\n\nAutonomous promotion: **%s**. %s\n\nWhat to do now: merge this, apply the protections in `.github/RULESETS.md`, and run `proof` once by hand.\n' \
-            "$NAME" "$(cat loop/blueprint.txt)" "$STACK" "$AUTONOMOUS" \
+          body=$(printf '**%s** is born.\n\n## What it decided to build\n\n%s\n\n<details><summary>The plan</summary>\n\n```\n%s\n```\n\n</details>\n\nStack: %s\n\nEach line under **Done Means** became a phase criterion, and each criterion becomes a milestone whose witness is that sentence. `loop-night` works the first open one every night.\n\n**If the brief above is not what you meant, say so now** -- it was written from %s, and everything after it is built on it.\n\nAutonomous promotion: **%s**. %s\n\nWhat to do now: merge this, apply the protections in `.github/RULESETS.md`, and run `proof` once by hand.\n' \
+            "$NAME" "$(cat loop/brief.md)" "$(cat loop/blueprint.txt)" "$STACK" \
+            "$SOURCE" "$AUTONOMOUS" \
             "$([ "$AUTONOMOUS" = "true" ] \
                && echo 'Nights that get past the judge push to this branch themselves; the audit pull request becomes a record rather than a gate.' \
                || echo 'Nights stop at a pull request you merge.')")
