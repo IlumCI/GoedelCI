@@ -201,15 +201,43 @@ runs:
                     b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
             else:
                 if not base:
+                    if a["provider"] == "local":
+                        raise NoCredential(
+                            "$%s is empty, so the model server never started. The "
+                            "`model` action writes it into $GITHUB_ENV once "
+                            "llama-server answers /health -- a job that asks without "
+                            "running it first has nothing to ask."
+                            % a["base_url_env"])
                     raise NoCredential("no endpoint in $%s" % a["base_url_env"])
                 url = base.rstrip("/") + "/chat/completions"
-                body = {"model": model, "max_tokens": a["max_tokens"],
+                body = {"model": model or "local", "max_tokens": a["max_tokens"],
                         "temperature": temperature,
                         "messages": [{"role": "system", "content": system},
                                      {"role": "user", "content": user}]}
                 if seed is not None:
                     body["seed"] = seed
+                if a["provider"] == "local":
+                    # **Greedy decoding on a long generation can fall into a
+                    # repetition loop**, which the card for these weights says
+                    # outright and shard 0 decodes at 0 by design. The penalty
+                    # is what stops a draw that is syntactically perfect and
+                    # eight hundred lines of the same block.
+                    body["repeat_penalty"] = a["repeat_penalty"]
+                    # **Thinking off HERE as well as at the server.** These
+                    # are the same switch arriving by a second road, so a
+                    # server somebody started without `--reasoning off` -- a
+                    # local run, an operator's own box, a workflow written
+                    # later -- still gets a model that answers. It must be a
+                    # JSON boolean: the runtime refuses the string "false".
+                    body["reasoning_effort"] = "none"
+                    body["chat_template_kwargs"] = {"enable_thinking": False}
                 headers = {"content-type": "application/json"}
+                # **Only when there is something to put in it.** This was
+                # unconditional, from when the endpoint was hosted and a token
+                # was the whole access story. `llama-server` authenticates
+                # nobody, so an `Authorization: Bearer ` header was being sent
+                # to something that ignores it while a gate upstream refused
+                # to start without a credential nothing reads.
                 if key:
                     headers["authorization"] = "Bearer " + key
                 pick = lambda d: d["choices"][0]["message"]["content"] or ""
@@ -217,7 +245,12 @@ runs:
             req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
                                          headers=headers, method="POST")
             try:
-                with urllib.request.urlopen(req, timeout=300) as r:
+                # **Six hundred seconds, not three hundred.** The old value
+                # was chosen for a hosted endpoint that answers in seconds. A
+                # 4B model on four vCPU prefills a whole card and then
+                # generates: the first run against one timed out having
+                # started the server successfully four seconds in.
+                with urllib.request.urlopen(req, timeout=a["timeout"]) as r:
                     data = json.loads(r.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:300]
@@ -225,6 +258,22 @@ runs:
             except Exception as exc:
                 raise NoAnswer("the endpoint did not answer: %s" % exc) from None
             text = pick(data)
+            # **An answer given only inside the think block is not an answer,
+            # and it is not the milestone's fault either.** It means the two
+            # switches above did not reach the template, which is a fact about
+            # how the server was started. Read as an empty reply it would be
+            # refused for carrying no fence, fed back, refused again, and
+            # filed as a balk -- and three balks retire a milestone the model
+            # was never allowed to see.
+            if not text.strip() and a["provider"] != "anthropic":
+                thought = ((data.get("choices") or [{}])[0].get("message") or {}) \
+                    .get("reasoning_content") or ""
+                if thought.strip():
+                    raise NoAnswer(
+                        "the model answered only inside its think block (%d "
+                        "characters of reasoning, no content), so thinking was not "
+                        "switched off -- start llama-server with `--reasoning off`"
+                        % len(thought))
             if not text.strip():
                 # A server that came up and then said nothing is the no-server
                 # case arriving after the health check rather than before it.
@@ -760,6 +809,51 @@ runs:
             claim("a witness kind's envelope carries both patches",
                   "[witness]" in wenv and "[patch]" in wenv)
             claim("a greedy draw records no seed", "seed -" in wenv)
+            # -- the local lane's wire format -----------------------------
+            #
+            # Measured against a real llama-server before these were written.
+            # A request WITHOUT the two switches below, to a server started
+            # without `--reasoning off`, came back with `content` empty and
+            # the whole answer in `reasoning_content` -- which is refused for
+            # carrying no fence, fed back, refused again, and filed as a
+            # balk. Three balks retire a milestone the model never saw.
+            def local_body(key):
+                b = {"model": "local", "messages": []}
+                b["repeat_penalty"] = 1.15
+                b["reasoning_effort"] = "none"
+                b["chat_template_kwargs"] = {"enable_thinking": False}
+                h = {"content-type": "application/json"}
+                if key:
+                    h["authorization"] = "Bearer " + key
+                return b, h
+
+            lbody, lheaders = local_body("")
+            claim("thinking is switched off in the request as well as at the server",
+                  lbody["reasoning_effort"] == "none")
+            claim("and enable_thinking goes as a JSON boolean, which the runtime "
+                  "requires: it refuses the string false-as-text",
+                  lbody["chat_template_kwargs"]["enable_thinking"] is False)
+            claim("greedy decoding carries a repeat penalty, because the card "
+                  "warns it can fall into a repetition loop on long generations",
+                  lbody["repeat_penalty"] > 1.0)
+            claim("no key means no Authorization header at all",
+                  "authorization" not in lheaders,
+                  "llama-server authenticates nobody, and a Bearer header sent "
+                  "to something that ignores it gated the lane on a credential "
+                  "nothing reads")
+            claim("and a key that exists is still sent",
+                  local_body("k")[1]["authorization"] == "Bearer k")
+
+            def only_inside(content, thought):
+                return not content.strip() and bool(thought.strip())
+
+            claim("an answer given only inside the think block is caught",
+                  only_inside("", "Thinking Process: 1. Analyze"))
+            claim("an ordinary answer is not",
+                  not only_inside("x", "some thinking"))
+            claim("and a reply empty both ways is the no-text case, not that one",
+                  not only_inside("", ""))
+
             # -- what a failure to ask MEANS ------------------------------
             #
             # The two are reported differently and exit differently because

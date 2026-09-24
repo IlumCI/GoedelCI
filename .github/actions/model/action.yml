@@ -1,0 +1,329 @@
+name: goedel-model
+description: >-
+  The author, running in the job. Two pinned files fetched and verified, a
+  llama.cpp server started on loopback, and the URL written where `draft`
+  looks for it. No credential is involved at any point.
+
+# **This is the lane, and needing no credential is the whole of why.**
+#
+# The original of this machine was built against GitHub Models, which retired
+# mid-loop -- `HTTP 410 github_models_retirement_brownout` -- and took the
+# loop with it. The property that endpoint was chosen for was "the workflow's
+# own token, no new credential", and a model in the job restores that better
+# than a hosted endpoint ever had it: there is no token at all. A pinned
+# tarball and a pinned GGUF are two files with digests. Files do not get
+# retired, do not rotate keys, and do not bill.
+#
+# It is also the only way the ledger's re-derivability claim survives. A
+# certificate names the night that produced it; an interpreter that moved
+# under the loop would make that name mean nothing. llama.cpp tags a release
+# per commit and `latest` moves several times a day, so the build number is
+# pinned and the bytes are checked against it.
+#
+# What a later run re-derives is the VERDICT, from the patch the envelope
+# carries whole. The draw that wrote the patch is provenance, not a replay:
+# logits move with the runner's CPU and the server's cache, and nothing here
+# needs them not to.
+#
+# CONSUMER: every job that asks the model anything -- `loop-night`'s `plan`
+# and `draft`, `directions`, `genesis`. CANARY: `draft` refuses a reply that
+# arrived entirely inside a think block and says to start the server with
+# `--reasoning off`, which is the failure this action's probe exists to stop.
+
+inputs:
+  command:
+    description: "start | selftest"
+    required: true
+  config:
+    description: "the path config wrote its JSON to"
+    required: false
+    default: ""
+  dir:
+    description: "where the two files live; cached across runs"
+    required: false
+    default: ""
+
+outputs:
+  url:
+    description: "the OpenAI-compatible base the server answers on"
+    value: ${{ steps.serve.outputs.url }}
+  ready:
+    description: "yes when the server answered /health before the warmup ran out"
+    value: ${{ steps.serve.outputs.ready }}
+
+runs:
+  using: composite
+  steps:
+    # --- what to fetch, and what to call the cache ------------------------
+    #
+    # Read here rather than in the fetch step so the cache key exists before
+    # `actions/cache` runs, and so the pins are read in exactly one place.
+    - id: pins
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        CONFIG: ${{ inputs.config }}
+        DIR: ${{ inputs.dir }}
+        RT: ${{ runner.temp }}
+      run: |
+        set -euo pipefail
+        if [ "$COMMAND" = "selftest" ]; then
+          echo "key=none" >> "$GITHUB_OUTPUT"
+          echo "dir=none" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        python3 - <<'PYEOF'
+        import json, os
+        from pathlib import Path
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, str(v).replace("\r", " ").replace("\n", " ")))
+
+        cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+        a = cfg["author"]
+        if a["provider"] != "local":
+            print("  provider is %s; nothing to start here" % a["provider"])
+            out("skip", "yes"); out("key", "none"); out("dir", "none")
+            raise SystemExit(0)
+        loc = a["local"]
+        d = os.environ["DIR"].strip() or os.path.join(os.environ["RT"], "goedel-model")
+        # **Keyed on the digests, so repinning either file misses by
+        # construction.** A key naming the version would collide the day
+        # somebody repins without renaming, and a restored cache is checked
+        # again regardless -- a restore is a transfer too, and this tree does
+        # not trust transfers.
+        out("key", "goedel-model-%s-%s" % (loc["runtime_sha256"][:16],
+                                           loc["weights_sha256"][:16]))
+        out("dir", d)
+        out("skip", "no")
+        for k in ("runtime", "runtime_sha256", "runtime_bytes", "runtime_dir",
+                  "weights", "weights_sha256", "weights_bytes",
+                  "context", "slots", "threads", "port", "warmup_seconds"):
+            out(k.replace("_", "-"), loc[k])
+        print("  %s, served from %s"
+              % (os.path.basename(loc["weights"]), d))
+        PYEOF
+
+    - if: inputs.command == 'start' && steps.pins.outputs.skip != 'yes'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.pins.outputs.dir }}
+        key: ${{ steps.pins.outputs.key }}
+
+    # --- the two files, checked before anything runs them ------------------
+    - id: fetch
+      if: inputs.command == 'start' && steps.pins.outputs.skip != 'yes'
+      shell: bash
+      env:
+        DIR: ${{ steps.pins.outputs.dir }}
+        RUNTIME: ${{ steps.pins.outputs.runtime }}
+        RUNTIME_SHA: ${{ steps.pins.outputs.runtime-sha256 }}
+        RUNTIME_BYTES: ${{ steps.pins.outputs.runtime-bytes }}
+        WEIGHTS: ${{ steps.pins.outputs.weights }}
+        WEIGHTS_SHA: ${{ steps.pins.outputs.weights-sha256 }}
+        WEIGHTS_BYTES: ${{ steps.pins.outputs.weights-bytes }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$DIR"
+
+        # **Size first, then the digest.** The size is free and a short
+        # transfer is the likely failure: a truncated tarball is a
+        # `llama-server` that is not there, and a truncated GGUF is a server
+        # that starts and answers nonsense. Nothing else in the job knows how
+        # long either file should be.
+        #
+        # `curl` rather than a second HTTP client in python. Exactly one
+        # action in this template speaks to a model, and a file fetch with a
+        # digest is not a request client -- but it should not look like one
+        # either. `--retry` covers 408, 429 and the 5xx family, which is
+        # weather; `--fail` makes a 404 or a 403 the error it is, because
+        # asking a wrong URL four more times is four more of the same answer.
+        get() {
+          url="$1"; want="$2"; size="$3"; dest="$DIR/$4"
+          if [ -f "$dest" ]; then
+            got=$(stat -c%s "$dest")
+            if [ "$got" = "$size" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$want" ]; then
+              echo "  $4 is already here and verifies"
+              return 0
+            fi
+            echo "  refetching $4: it is $got bytes or hashes wrong"
+            rm -f "$dest"
+          fi
+          echo "  fetching $4 ($(( size / 1000000 )) MB)"
+          # Written to .part and renamed only once it verifies, so a failed
+          # fetch never leaves behind something the next run reads as a hit.
+          curl -fsSL --retry 4 --retry-delay 2 --retry-connrefused \
+               --connect-timeout 30 --max-time 1800 \
+               -o "$dest.part" "$url"
+          got=$(stat -c%s "$dest.part")
+          if [ "$got" != "$size" ]; then
+            echo "::error::$4 is $got bytes, the pin says $size -- a short transfer,"
+            echo "::error::not a wrong file. Nothing downstream would notice."
+            exit 1
+          fi
+          d=$(sha256sum "$dest.part" | cut -d' ' -f1)
+          if [ "$d" != "$want" ]; then
+            echo "::error::$4 hashes to ${d:0:16}..., the pin says ${want:0:16}..."
+            exit 1
+          fi
+          mv "$dest.part" "$dest"
+          echo "  $4 verifies"
+        }
+
+        get "$RUNTIME" "$RUNTIME_SHA" "$RUNTIME_BYTES" "$(basename "$RUNTIME")"
+        get "$WEIGHTS" "$WEIGHTS_SHA" "$WEIGHTS_BYTES" "$(basename "$WEIGHTS")"
+
+    # --- serve it ---------------------------------------------------------
+    - id: serve
+      if: inputs.command == 'start' && steps.pins.outputs.skip != 'yes'
+      shell: bash
+      env:
+        DIR: ${{ steps.pins.outputs.dir }}
+        RUNTIME: ${{ steps.pins.outputs.runtime }}
+        RUNTIME_DIR: ${{ steps.pins.outputs.runtime-dir }}
+        WEIGHTS: ${{ steps.pins.outputs.weights }}
+        CTX: ${{ steps.pins.outputs.context }}
+        SLOTS: ${{ steps.pins.outputs.slots }}
+        THREADS: ${{ steps.pins.outputs.threads }}
+        PORT: ${{ steps.pins.outputs.port }}
+        WARMUP: ${{ steps.pins.outputs.warmup-seconds }}
+      run: |
+        set -euo pipefail
+        tar -xzf "$DIR/$(basename "$RUNTIME")" -C "$DIR"
+        bin="$DIR/$RUNTIME_DIR"
+        test -x "$bin/llama-server" || chmod +x "$bin"/llama-server "$bin"/llama-quantize
+        # The shared objects ship beside the binary in the tarball, and
+        # nothing guarantees an RPATH survives extraction.
+        export LD_LIBRARY_PATH="$bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+        # **`--reasoning off`, or every answer lands in the wrong field.**
+        # This author descends from a thinking model and opens every reply
+        # with a `<think>` block unless told not to. A grammar does not stop
+        # it: llama.cpp enforces one from the first generated token, and with
+        # thinking on the chat template has already written `<think>` into
+        # the prompt -- so the fence is sampled as reasoning, nothing ever
+        # emits `</think>`, and the whole file arrives in `reasoning_content`
+        # with `content` empty. A perfectly shaped answer that reads as none,
+        # which is then refused for having no fence, fed back, refused again,
+        # and filed as a balk. Three of those retire a milestone the model
+        # was never allowed to see.
+        #
+        # Asked of the binary before it is passed, because a server handed an
+        # argument it does not know exits before `/health` -- and that would
+        # stand the whole lane down to switch off one thing `draft` already
+        # switches off per request.
+        #
+        # Read into a variable and NOT piped: `grep -q` leaves at the first
+        # match, the writer takes a SIGPIPE, and under `pipefail` that reads
+        # as the flag being absent exactly when it is there. The `( |,|$)`
+        # guard is what keeps `--reasoning-format` from matching.
+        help=$("$bin"/llama-server --help 2>&1 || true)
+        think=""
+        if grep -qE -- '--reasoning( |,|$)' <<< "$help"; then
+          think="--reasoning off"
+        else
+          echo "::warning::llama-server has no --reasoning flag; thinking is off per request only"
+        fi
+
+        "$bin"/llama-server \
+          -m "$DIR/$(basename "$WEIGHTS")" $think \
+          -np "$SLOTS" -c "$CTX" -t "$THREADS" --threads-batch "$THREADS" \
+          --host 127.0.0.1 --port "$PORT" \
+          > "$DIR/server.log" 2>&1 &
+        echo $! > "$DIR/server.pid"
+
+        # **No `--no-warmup`.** It defers the weight load to the first
+        # request, so `/health` answers in about four seconds and the
+        # completion then times out: a server that is up by every check
+        # available and cannot answer anything yet. The cost moves into this
+        # wait, where it is visible and where it belongs.
+        for i in $(seq 1 "$WARMUP"); do
+          if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+            echo "  the server answered after ${i}s"
+            echo "GOEDEL_INFERENCE_URL=http://127.0.0.1:$PORT/v1" >> "$GITHUB_ENV"
+            echo "url=http://127.0.0.1:$PORT/v1" >> "$GITHUB_OUTPUT"
+            echo "ready=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! kill -0 "$(cat "$DIR/server.pid")" 2>/dev/null; then
+            echo "::error::llama-server exited before it was ready"
+            tail -40 "$DIR/server.log" || true
+            echo "ready=no" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          sleep 1
+        done
+        echo "::error::llama-server never answered on 127.0.0.1:$PORT within ${WARMUP}s"
+        tail -40 "$DIR/server.log" || true
+        echo "ready=no" >> "$GITHUB_OUTPUT"
+        exit 1
+
+    # --- the claims -------------------------------------------------------
+    - if: inputs.command == 'selftest'
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        # >>> suite -- this action has two programs; see `selftest-all`.
+        import re
+
+        ok = fail = 0
+
+        def claim(s, held, detail=""):
+            global ok, fail
+            if held:
+                ok += 1; print("  ok   " + s)
+            else:
+                fail += 1; print("  FAIL " + s)
+                if detail: print("         " + str(detail))
+
+        # The probe, which is the one piece of logic here rather than plumbing.
+        PROBE = re.compile(r'--reasoning( |,|$)')
+        claim("the reasoning flag is found where the runtime offers it",
+              bool(PROBE.search("-rea,  --reasoning [on|off|auto]   Use reasoning")))
+        claim("and --reasoning-format is not mistaken for it, which would pass "
+              "an argument the server does not know and kill the lane",
+              not PROBE.search("--reasoning-format FORMAT   controls whether"))
+        claim("nor is --reasoning-effort",
+              not PROBE.search("--reasoning-effort LEVEL    reasoning effort level"))
+        claim("nor --reasoning-budget",
+              not PROBE.search("--reasoning-budget N        token budget"))
+        claim("a runtime with no such flag answers no, so the lane warns "
+              "instead of passing it",
+              not PROBE.search("--ctx-size N   size of the prompt context"))
+
+        # The cache key. Two digests, so repinning either file misses.
+        def key(rt, w):
+            return "goedel-model-%s-%s" % (rt[:16], w[:16])
+
+        a, b, c = "1" * 64, "2" * 64, "3" * 64
+        claim("the cache key is keyed on both digests",
+              key(a, b) != key(a, c) and key(a, b) != key(c, b))
+        claim("and the same pins answer the same key, or nothing is ever cached",
+              key(a, b) == key(a, b))
+
+        # Size before digest: the ordering claim, stated as the comparison
+        # the fetch step makes.
+        def verifies(got_size, want_size, got_d, want_d):
+            if got_size != want_size:
+                return "short transfer"
+            return "ok" if got_d == want_d else "wrong file"
+
+        claim("a short transfer is called a short transfer, not a wrong file",
+              verifies(10, 20, a, a) == "short transfer",
+              "a truncated GGUF is a server that starts and answers nonsense")
+        claim("a full transfer of the wrong bytes is called a wrong file",
+              verifies(20, 20, a, b) == "wrong file")
+        claim("and the right file passes", verifies(20, 20, a, a) == "ok")
+
+        # The URL handed to draft is a base, not an endpoint: draft appends
+        # /chat/completions to it.
+        url = "http://127.0.0.1:%d/v1" % 8080
+        claim("the url given out is an OpenAI-compatible BASE",
+              url.endswith("/v1") and not url.endswith("chat/completions"),
+              "draft appends the path; a full endpoint here would double it")
+
+        print("\n%d/%d claims held" % (ok, ok + fail))
+        raise SystemExit(1 if fail else 0)
+        PYEOF

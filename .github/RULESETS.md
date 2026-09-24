@@ -152,8 +152,9 @@ human decisions; merging the pull request it opens is the second.
 
 | where | name | held by | why |
 |---|---|---|---|
-| repository secret | `GOEDEL_INFERENCE_KEY` | `loop-night` (`plan`, `draft`) | the only credential the nightly loop needs |
-| repository variable | `GOEDEL_INFERENCE_URL` | the same | only for a non-default endpoint |
+| *(none)* | — | `loop-night` (`plan`, `draft`) | **the nightly loop needs no credential.** The model runs in the job |
+| repository secret | `GOEDEL_INFERENCE_KEY` | the same | only if you switch `[author] provider` to a hosted one |
+| repository variable | `GOEDEL_INFERENCE_URL` | the same | only for a hosted endpoint that is not the default; the local lane writes it itself |
 | environment `evaluator` | `EVALUATOR_TOKEN` | `boundary`'s write job only | may write `.github/**`; gated on a human |
 
 **`loop-judge` holds no secrets at all** and asks for `contents: read`. It is

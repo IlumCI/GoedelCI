@@ -75,6 +75,8 @@ jobs:
         with: { command: selftest }
       - uses: ./.github/actions/draft
         with: { command: selftest }
+      - uses: ./.github/actions/model
+        with: { command: selftest }
       - uses: ./.github/actions/harness
         with: { command: selftest }
       - uses: ./.github/actions/bench-pair

@@ -123,6 +123,25 @@ jobs:
           source: loop/brief.md README.md
           input-out: brief-input.txt
 
+      # **Before anything asks, not after.** No goedel.toml exists yet, so
+      # `ask` gets an author table built from the same defaults the night
+      # uses -- pins and all. This used to be an inline JSON heredoc written
+      # AFTER the first step that read the file, and hardcoded to a hosted
+      # provider: a repository being born could not use the lane that needs
+      # no credential, and the step before it read a file that did not exist.
+      - id: askcfg
+        uses: ./.github/actions/config
+        with:
+          command: author
+          out: ${{ runner.temp }}/ask.json
+
+      # The author, running in this job. See `.github/actions/model`.
+      - name: The author it will ask
+        uses: ./.github/actions/model
+        with:
+          command: start
+          config: ${{ runner.temp }}/ask.json
+
       - uses: ./.github/actions/brief
         with:
           command: card
@@ -159,20 +178,6 @@ jobs:
           brief: loop/brief.md
           card-out: blueprint-card.txt
           system-out: blueprint-system.txt
-
-      # No config exists yet, and `ask` needs only the [author] table -- so it
-      # gets a minimal one written here rather than a chicken-and-egg.
-      - name: The smallest config that can ask a question
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/ask.json" <<'JSON'
-          {"author": {"provider": "anthropic", "model": "claude-sonnet-5",
-                      "api_key_env": "GOEDEL_INFERENCE_KEY",
-                      "base_url_env": "GOEDEL_INFERENCE_URL",
-                      "attempts": 1, "temperature": 0.0, "max_tokens": 8000,
-                      "shards": 1, "context": []}}
-          JSON
 
       - id: ask
         uses: ./.github/actions/draft

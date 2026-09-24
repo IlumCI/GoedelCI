@@ -20,7 +20,7 @@ line of code.
 
 ## Starting one
 
-Use this template, add one secret (`GOEDEL_INFERENCE_KEY`), and run `genesis`:
+Use this template and run `genesis`. There is nothing to configure first:
 
 | | |
 |---|---|
@@ -143,10 +143,11 @@ letting that go unnoticed.
 who has not seen the project. This is the only thing the machine cannot write
 for itself.
 
-**4. Add one secret.** `GOEDEL_INFERENCE_KEY`, under Settings → Secrets →
-Actions. The default provider is Anthropic; `[author] provider = "openai"` in
-`goedel.toml` points it at any OpenAI-compatible endpoint instead, including a
-llama.cpp server on your own machine via `GOEDEL_INFERENCE_URL`.
+**4. Nothing.** There is no step four. The model runs in the job — a pinned
+llama.cpp build and a pinned GGUF, fetched, digest-checked and cached — so
+there is no key to add and no account to hold. `[author] provider =
+"anthropic"` or `"openai"` in `goedel.toml` points it at a hosted endpoint
+instead if you would rather, and those do want a credential.
 
 **5. Apply the branch protections** in [`.github/RULESETS.md`](.github/RULESETS.md).
 Everything in code refuses; those are the walls GitHub itself holds up.
@@ -157,8 +158,7 @@ certificates to check the claims the epoch rules make about a *sequence* of
 them. It tells you the wiring is right before you let a schedule loose on it.
 Then enable the `loop-night` schedule.
 
-Until step 4, everything still works except `draft` and the ladder: `ci` and
-`proof` are green, and the machine simply has nothing to write with.
+`ci` and `proof` need no model at all and are green from the first push.
 
 ---
 
@@ -196,16 +196,47 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `boundary-judge` | Epoch, Moves, Honest, Remembers |
 | `survey` | what is left: stubs, swallowed failures, unsafe patterns |
 | `directions` | complete alternative plans, for you to pick between |
+| `model` | the author, running in the job: two pinned files and a server |
 | `template-check` | the machine checked against itself |
 | `selftest-all` | runs every suite from disk, for the one gate that needs it |
 
-Every action answers `command: selftest` and `ci` runs all twenty. An action
+Every action answers `command: selftest` and `ci` runs all twenty-one. An action
 that cannot prove itself is refused by `template-check`, because that is how a
 check gets deleted — not by argument, by nobody noticing it went.
 
 ---
 
 ## The parts worth knowing about
+
+### The model runs in the job, and that is why there is no key
+
+`[author] provider = "local"` fetches a pinned llama.cpp build and a pinned
+GGUF, checks both against a size and a digest, caches them, and serves them on
+loopback. `draft` talks to that. Nothing in the nightly loop holds a
+credential, because there is no credential.
+
+The original of this machine was built against a hosted endpoint that retired
+mid-loop — `HTTP 410 github_models_retirement_brownout` — and took the loop
+with it. The property that endpoint had been chosen for was *no new
+credential*; a model in the job has it more completely, and two files with
+digests do not get retired, rotate keys or bill.
+
+It is also what keeps the record meaning something. A certificate names the
+night that produced it. llama.cpp tags a release per commit, so `latest` moves
+several times a day — an interpreter that changed under the loop would make
+every certificate name a night nobody can reproduce.
+
+Two details are worth knowing because they cost a week to find. The server is
+started **without** `--no-warmup`: that defers the weight load to the first
+request, so `/health` answers in four seconds and the completion then times
+out. And it is started **with** `--reasoning off`: these weights open every
+answer inside a `<think>` block otherwise, and a grammar does not stop it —
+measured here, a request without the switch came back with `content` empty and
+the whole answer in `reasoning_content`. A perfectly shaped answer that reads
+as none, which is refused for having no fence, fed back, refused again, and
+filed as a balk. Three balks retire a milestone the model was never allowed to
+see. `draft` asks for the same thing per request, so neither half depends on
+the other being there.
 
 ### It cannot edit its own judge
 

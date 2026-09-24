@@ -82,6 +82,10 @@ runs:
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
+        # The one comment that says "this block is the claim suite", for an
+        # action that cannot be a single program.
+        SUITE = re.compile(r"^\s*# >>> suite\b", re.M)
+
         def program(path):
             """The action's inline program, dedented the way YAML dedents it."""
             text = Path(path).read_text(encoding="utf-8")
@@ -89,9 +93,20 @@ runs:
             if not blocks:
                 raise ShapeError("no `python3 - <<'PYEOF'` program to run")
             if len(blocks) > 1:
-                raise ShapeError(
-                    "%d programs in one action; this runs the suite and cannot tell which "
-                    "of them is it" % len(blocks))
+                # **Marked, not guessed.** An action whose steps cannot be one
+                # program -- `model` reads its pins before `actions/cache` can
+                # use them, and a composite step boundary is the only place a
+                # `uses:` can go -- still has exactly one block that IS the
+                # suite. Saying which is a comment; picking the last one, or
+                # the longest, would be this action deciding what it is
+                # testing.
+                marked = [b for b in blocks if SUITE.search(b)]
+                if len(marked) != 1:
+                    raise ShapeError(
+                        "%d programs in one action and %d marked `# >>> suite`; this "
+                        "runs the suite and will not guess which of them is it"
+                        % (len(blocks), len(marked)))
+                blocks = marked
             lines = blocks[0].split("\n")
             indent = len(lines[0]) - len(lines[0].lstrip())
             for n, line in enumerate(lines, 1):
@@ -121,6 +136,11 @@ runs:
                     return claim(s, False, "wrong error: %r" % exc)
                 return claim(s, False, "it returned instead of refusing")
 
+            def program_of(text):
+                with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as f:
+                    f.write(text)
+                return program(f.name)
+
             good = "    run: |\n      python3 - <<'PYEOF'\n      print(1)\n      PYEOF\n"
             with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as f:
                 f.write(good); path = f.name
@@ -128,8 +148,19 @@ runs:
                   program(path) == "print(1)")
             raises("an action with no program is refused",
                    "    run: |\n      echo hello\n")
-            raises("an action with two programs is refused",
+            raises("an action with two programs and neither marked is refused, "
+                   "because picking one would be this deciding what it tests",
                    good + good)
+            raises("and two programs both marked is refused too",
+                   (good + good).replace("python3 - <<'PYEOF'\n",
+                                         "python3 - <<'PYEOF'\n      # >>> suite\n"))
+            claim("but two programs with exactly one marked is run",
+                  program_of(good + good.replace(
+                      "python3 - <<'PYEOF'\n      print(1)",
+                      "python3 - <<'PYEOF'\n      # >>> suite\n      print(2)"))
+                  .strip().endswith("print(2)"),
+                  "`model` reads its pins before actions/cache can use them, so "
+                  "it cannot be one program and still be one action")
             raises("a program with a flush-left line is refused, not half-run",
                    "    run: |\n      python3 - <<'PYEOF'\n      x = 1\nflush = 2\n      PYEOF\n")
             claim("a blank line inside a program is not a flush-left line",

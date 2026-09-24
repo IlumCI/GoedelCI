@@ -46,9 +46,21 @@ inputs:
     required: false
     default: "."
   command:
-    description: "load | show | assemble | selftest"
+    description: "load | author | show | assemble | selftest"
     required: false
     default: load
+  out:
+    description: "for author: where to write the author-only table"
+    required: false
+    default: ""
+  max-tokens:
+    description: "for author: override the answer budget"
+    required: false
+    default: ""
+  temperature:
+    description: "for author: override the sampling temperature"
+    required: false
+    default: ""
   name:
     description: "for assemble: what the project is called"
     required: false
@@ -110,6 +122,9 @@ runs:
         NAME: ${{ inputs.name }}
         HARNESS_JSON: ${{ inputs.harness-json }}
         AUTONOMOUS: ${{ inputs.autonomous }}
+        OUT: ${{ inputs.out }}
+        MAX_TOKENS: ${{ inputs.max-tokens }}
+        TEMPERATURE: ${{ inputs.temperature }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -284,6 +299,30 @@ runs:
                     "[harness] test is empty: with no test command nothing can count claims, "
                     "and every kind's J2 is a count that may not fall")
 
+            # **The pins are DEFAULTS, not a requirement restated everywhere.**
+            # A repository that says nothing about them still gets a lane
+            # that runs on the runner and still names a digest for every
+            # byte it loads -- which is the property that matters, and it
+            # does not need every goedel.toml to carry seven lines to have
+            # it. `assemble` would otherwise have to write them into every
+            # config it generates, which is the same two files pinned in two
+            # places, drifting.
+            DEFAULT_LOCAL = {
+                "runtime": "https://github.com/ggml-org/llama.cpp/releases/download/"
+                           "b11166/llama-b11166-bin-ubuntu-x64.tar.gz",
+                "runtime_sha256":
+                    "79dccaacf907665a278a9507f583027c294c97f0e93f372364086d9a246e38a5",
+                "runtime_bytes": 17013191,
+                "runtime_dir": "llama-b11166",
+                "weights": "https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF/"
+                           "resolve/main/Qwen3.8-4B-Q4_K_M.gguf",
+                "weights_sha256":
+                    "dec96e8cf2e11b613bb46513dec485377f9ca5a351e71712ee0e244f287c6790",
+                "weights_bytes": 2783446304,
+                "context": 16384, "slots": 1, "threads": 4, "port": 8080,
+                "warmup_seconds": 300,
+            }
+
             a = raw.get("author", {})
             author = {
                 # **Carried, because `draft` reads it.** It was written in
@@ -291,7 +330,7 @@ runs:
                 # so every `draft ask` died on `KeyError: 'provider'` before
                 # it could make a request, with or without a key. A field the
                 # loader silently discards is worse than one it refuses.
-                "provider": str(a.get("provider", "anthropic")).strip().lower(),
+                "provider": str(a.get("provider", "local")).strip().lower(),
                 "base_url_env": str(a.get("base_url_env", "GOEDEL_INFERENCE_URL")),
                 "api_key_env": str(a.get("api_key_env", "GOEDEL_INFERENCE_KEY")),
                 # Defaulted rather than required: a config that says nothing
@@ -304,15 +343,74 @@ runs:
                 "temperature": float(a.get("temperature", 0.0)),
                 "max_tokens": int(a.get("max_tokens", 2600)),
                 "shards": int(a.get("shards", 6)),
+                # Named here so `draft` reads them off the config like
+                # everything else, rather than carrying two magic numbers.
+                "repeat_penalty": float(a.get("repeat_penalty", 1.15)),
+                "timeout": int(a.get("timeout", 600)),
                 "context": list(a.get("context", [])),
             }
             if author["shards"] < 1:
                 raise ConfigError("[author] shards must be at least 1")
-            if author["provider"] not in ("anthropic", "openai"):
+            if author["provider"] not in ("local", "anthropic", "openai"):
                 raise ConfigError(
-                    "[author] provider is 'anthropic' or 'openai' (which covers any "
+                    "[author] provider is 'local' (the model runs on the runner and "
+                    "needs no credential), 'anthropic', or 'openai' (which covers any "
                     "OpenAI-compatible endpoint), not %r" % author["provider"])
-            if not author["model"]:
+
+            # **The pins, and they are only required by the lane that uses
+            # them.** A repository pointed at a hosted endpoint should not
+            # have to carry a GGUF digest to load, and one running the model
+            # on the runner must not be able to start without both files
+            # named to the byte.
+            # Overrides merge onto the defaults, so repinning the weights is
+            # two lines rather than seven, and a half-override cannot leave a
+            # URL pointing at one file and a digest describing another.
+            loc = dict(DEFAULT_LOCAL)
+            for k, v in (a.get("local", {}) or {}).items():
+                if k not in DEFAULT_LOCAL:
+                    raise ConfigError(
+                        "[author.local] has no %r; it takes %s"
+                        % (k, ", ".join(sorted(DEFAULT_LOCAL))))
+                loc[k] = type(DEFAULT_LOCAL[k])(v)
+            if author["provider"] == "local":
+                if loc["runtime"] != DEFAULT_LOCAL["runtime"] \
+                        and loc["runtime_sha256"] == DEFAULT_LOCAL["runtime_sha256"]:
+                    raise ConfigError(
+                        "[author.local] repins runtime and leaves runtime_sha256 at the "
+                        "default, so the URL names one file and the digest describes "
+                        "another. Repin both, or neither.")
+                if loc["weights"] != DEFAULT_LOCAL["weights"] \
+                        and loc["weights_sha256"] == DEFAULT_LOCAL["weights_sha256"]:
+                    raise ConfigError(
+                        "[author.local] repins weights and leaves weights_sha256 at the "
+                        "default, so the URL names one file and the digest describes "
+                        "another. Repin both, or neither.")
+                for k in ("runtime_sha256", "weights_sha256"):
+                    d = str(loc[k]).strip().lower()
+                    if len(d) != 64 or any(c not in "0123456789abcdef" for c in d):
+                        raise ConfigError("[author.local] %s is not a sha256: %r" % (k, d))
+                    loc[k] = d
+                for k in ("runtime", "weights"):
+                    if "://" not in str(loc[k]):
+                        raise ConfigError("[author.local] %s is not a URL: %r" % (k, loc[k]))
+                for k in ("runtime_bytes", "weights_bytes"):
+                    if loc[k] <= 0:
+                        raise ConfigError(
+                            "[author.local] %s must be a positive size: it is checked "
+                            "before the digest, because a short transfer is the likely "
+                            "failure and a size costs nothing to compare" % k)
+                for k in ("context", "slots", "threads", "port", "warmup_seconds"):
+                    if loc[k] <= 0:
+                        raise ConfigError("[author.local] %s must be positive" % k)
+                if not loc["runtime_dir"].strip():
+                    raise ConfigError(
+                        "[author.local] runtime_dir is empty: the directory the tarball "
+                        "extracts to is not derivable from the URL")
+            author["local"] = loc
+            # `local` is exempt: the server is told which weights to load on
+            # its command line, so the name in the request body is a label
+            # that nothing reads.
+            if not author["model"] and author["provider"] != "local":
                 raise ConfigError(
                     "[author] model is empty, so every request would ask for a model "
                     "named nothing and the endpoint would refuse it")
@@ -492,8 +590,11 @@ runs:
                 for k, v in over.items(): d[k] = v
                 return lambda: load(d, ".")
             # --- [author]: what `draft` actually reads off this ------------
+            claim("the default lane is the one that needs no credential",
+                  cfg["author"]["provider"] == "local")
             claim("the provider reaches the loader that draft reads it from",
-                  cfg["author"]["provider"] == "anthropic",
+                  load(dict(base, author={"provider": "anthropic"}),
+                       ".")["author"]["provider"] == "anthropic",
                   "dropping it made every `draft ask` die on KeyError before "
                   "it could make a request, key or no key")
             claim("and a provider written down is the one carried",
@@ -505,9 +606,58 @@ runs:
             raises("a provider nothing implements is refused at load, not at 02:17",
                    bad({"author": {"provider": "acme"}}))
             claim("a config that says nothing about the model still loads",
-                  bool(cfg["author"]["model"]))
-            raises("but an explicitly empty model is refused",
-                   bad({"author": {"model": ""}}))
+                  bool(load(dict(base, author={"provider": "anthropic"}),
+                            ".")["author"]["model"]))
+            raises("but an explicitly empty model is refused where it is read",
+                   bad({"author": {"provider": "anthropic", "model": ""}}))
+            claim("and local is exempt, because the weights are named on a "
+                  "command line and the request body's name is a label",
+                  load(dict(base, author={"model": ""}), ".")["author"]["provider"]
+                  == "local")
+
+            # --- [author.local]: the two files, to the byte -----------------
+            def local(**over):
+                return lambda: load(dict(base, author={"local": over}), ".")
+
+            claim("a config that says nothing about the pins still names a digest "
+                  "for every byte it will load",
+                  len(cfg["author"]["local"]["weights_sha256"]) == 64
+                  and cfg["author"]["local"]["weights_bytes"] > 0)
+            claim("the serving defaults are the ones the original measured",
+                  (cfg["author"]["local"]["context"], cfg["author"]["local"]["slots"])
+                  == (16384, 1))
+            claim("one line repins the context without restating the rest",
+                  load(dict(base, author={"local": {"context": 8192}}),
+                       ".")["author"]["local"]["context"] == 8192)
+            claim("and the digests survive that override",
+                  load(dict(base, author={"local": {"context": 8192}}),
+                       ".")["author"]["local"]["weights_bytes"] > 0)
+            raises("a key [author.local] does not have is refused, not ignored",
+                   local(weight="oops"))
+            raises("new weights with the old digest is refused, because the URL "
+                   "would name one file and the digest describe another",
+                   local(weights="https://example.invalid/other.gguf"))
+            raises("and so is a new runtime with the old digest",
+                   local(runtime="https://example.invalid/other.tar.gz"))
+            claim("repinning both together is accepted",
+                  load(dict(base, author={"local": {
+                      "weights": "https://example.invalid/other.gguf",
+                      "weights_sha256": "b" * 64, "weights_bytes": 1}}),
+                      ".")["author"]["local"]["weights_bytes"] == 1)
+            raises("a digest that is not a sha256 is refused",
+                   local(weights="https://example.invalid/o.gguf", weights_sha256="nope"))
+            raises("a runtime that is not a URL is refused",
+                   local(runtime="rt.tar.gz", runtime_sha256="c" * 64))
+            raises("a size of zero is refused, since size is checked first",
+                   local(weights_bytes=0))
+            raises("an empty runtime_dir is refused: the tarball's directory is "
+                   "not derivable from its URL",
+                   local(runtime_dir=" "))
+            raises("a context of zero is refused", local(context=0))
+            claim("a hosted lane is not held to any of that, because it fetches nothing",
+                  load(dict(base, author={"provider": "anthropic",
+                                          "local": {"weights_bytes": 0}}),
+                       ".")["author"]["provider"] == "anthropic")
             claim("every field draft reads off the author section is present",
                   all(k in cfg["author"] for k in
                       ("provider", "model", "api_key_env", "base_url_env",
@@ -796,6 +946,38 @@ runs:
         try:
             if cmd == "selftest":
                 sys.exit(selftest())
+            if cmd == "author":
+                # **The smallest config that can ask a question.**
+                #
+                # `genesis` needs to ask before a goedel.toml exists, which is
+                # a chicken-and-egg it used to solve by writing an author
+                # table inline in the workflow. That table hardcoded a hosted
+                # provider, so a repository being born could not use the lane
+                # that needs no credential -- and it duplicated defaults that
+                # live here, which is how two files come to disagree about
+                # which model this machine asks.
+                #
+                # Built through the same `load`, so it is the same table the
+                # night gets, pins and all.
+                author_over = {"attempts": 1, "shards": 1}
+                if os.environ.get("MAX_TOKENS", "").strip():
+                    author_over["max_tokens"] = int(os.environ["MAX_TOKENS"])
+                if os.environ.get("TEMPERATURE", "").strip():
+                    author_over["temperature"] = float(os.environ["TEMPERATURE"])
+                cfg = load({"project": {"allow": ["src/**"],
+                                        "evaluator": [".github/**", "goedel.toml"]},
+                            "harness": {"test": "true"},
+                            "kinds": {"feature": {"verb": "create", "j1": "claims"}},
+                            "author": author_over}, root)
+                dest = Path(os.environ.get("OUT", "") or (Path(root) / "ask.json"))
+                dest.write_text(json.dumps({"author": cfg["author"]}, indent=1),
+                                encoding="utf-8")
+                print("  %s: an author table on the %s lane"
+                      % (dest, cfg["author"]["provider"]))
+                out("json", str(dest))
+                out("provider", cfg["author"]["provider"])
+                sys.exit(0)
+
             if cmd == "assemble":
                 hj = Path(os.environ.get("HARNESS_JSON", "scaffold-harness.json"))
                 if not hj.is_file():

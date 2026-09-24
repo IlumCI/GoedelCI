@@ -172,16 +172,32 @@ reads as a machine that proposes nothing.
 Rewriting this file abandons every milestone underneath it, cleanly. Changing
 your mind is one edit.
 
-## 6. Add one secret and one variable
+## 6. Nothing
+
+There is no step six. `[author] provider = "local"` is the default, and it
+runs the model **in the job**: a pinned llama.cpp build and a pinned GGUF,
+fetched once, checked against a size and a digest, cached across runs, served
+on loopback. No key, no account, no rate limit, nothing to rotate.
+
+That is not frugality, it is the same property the ledger rests on. The
+original of this machine was built against a hosted endpoint that retired
+mid-loop — `HTTP 410 github_models_retirement_brownout` — and took the loop
+with it. Two files with digests do not get retired. They also do not move: a
+certificate names the night that produced it, and an interpreter that changed
+underneath would make that name mean nothing, which is why the llama.cpp
+build number is pinned rather than `latest` (it tags a release per commit and
+moves several times a day).
+
+Repinning either file is two lines in `[author.local]` — the URL and its
+digest, which `config` refuses to let you change one of without the other.
+
+If you would rather use a hosted endpoint:
 
 | | where | what |
 |---|---|---|
+| `[author] provider` | `goedel.toml` | `"anthropic"`, or `"openai"` for any OpenAI-compatible endpoint |
 | `GOEDEL_INFERENCE_KEY` | repository secret | your API key |
-| `GOEDEL_INFERENCE_URL` | repository variable | only for a non-default endpoint |
-
-`[author] provider = "anthropic"` is the default. `"openai"` covers any
-OpenAI-compatible endpoint — vLLM, llama.cpp, a gateway — set through
-`GOEDEL_INFERENCE_URL`.
+| `GOEDEL_INFERENCE_URL` | repository variable | the endpoint, for `"openai"` |
 
 Pick the model in `goedel.toml`. A nightly loop that writes a file at a time
 does not need the largest model available, and `shards` buys more than model
