@@ -1,0 +1,360 @@
+name: proof
+
+# **Two drills, end to end, with no model and no pushes.**
+#
+# Every action in this template proves itself against its own claims, and that
+# is not the same as the machine working. A claim suite cannot see a seam: an
+# envelope derived from the wrong tree, a step output nobody reads, a
+# certificate field the judge fills and the ledger refuses. Every one of those
+# has been a real bug here, and none of them was catchable by any unit claim.
+#
+# So this runs a whole night against a candidate written by hand, twice:
+#
+#   adopted    a candidate that adds a module and a test. It must derive
+#              reproducibly, pass both arms, add claims, and end in a
+#              certificate `cert check` accepts and `adopt-decide` lands on
+#              the CANDIDATE's tree.
+#
+#   refused    the same shape, with the module deliberately broken. It must
+#              end `verdict refuse` with the failure named in `why`, in a
+#              certificate that is still a certificate, which `adopt-decide`
+#              lands on the LIVE tree.
+#
+# The second drill is the one that matters, and it is the one the original of
+# this machine could not run: a candidate that would not build took the judge
+# job down, so the drill's expected outcome was a red run -- which is
+# indistinguishable from the drill itself being broken. Under a schedule that
+# is a silent stall, because a red job files nothing and the milestone that
+# produced it never moves.
+#
+# Nothing here writes to a branch. The certificates are rendered, checked and
+# thrown away.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Weekly. The drills are cheap and the thing they guard against is drift
+    # between actions that each still pass their own claims.
+    - cron: "41 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proof-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arm: adopted
+            want: adopt
+            body: "return max(values) - min(values)"
+          - arm: refused
+            want: refuse
+            # Syntactically fine, so `check` passes and the draft would have
+            # been let through; wrong, so the test fails in the candidate arm.
+            # A drill whose candidate fails to PARSE would only prove that the
+            # fast gate works, which is a different claim.
+            body: "return max(values) + min(values)"
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - id: cfg
+        uses: ./.github/actions/config
+        with: { command: load }
+
+      - name: A candidate, as draft would have written one
+        id: write
+        shell: bash
+        env:
+          BODY: ${{ matrix.body }}
+          ARM: ${{ matrix.arm }}
+        run: |
+          set -euo pipefail
+          git config user.name "proof"; git config user.email "proof@local"
+          echo "PARENT=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_ENV"
+
+          mkdir -p src tests
+          cat > src/proof_spread.py <<PYEOF
+          """The spread of a window: its largest value minus its smallest."""
+
+          from src.window import Window
+
+
+          def spread(window: Window) -> float:
+              values = window.values
+              if not values:
+                  raise ValueError("an empty window has no spread")
+              $BODY
+          PYEOF
+          cat > tests/test_proof_spread.py <<'PYEOF'
+          from src.proof_spread import spread
+          from src.window import Window
+
+
+          def test_the_spread_is_the_distance_between_the_extremes():
+              w = Window(4)
+              w.extend([3, 9, 5])
+              assert spread(w) == 6.0, spread(w)
+          PYEOF
+
+          # `add -N` so the new files appear in `git diff` without being
+          # staged. The patch a real draft produces comes from exactly this.
+          git add -N src/proof_spread.py tests/test_proof_spread.py
+          git diff -- src/proof_spread.py tests/test_proof_spread.py > /tmp/patch
+          git reset -q
+          rm -f src/proof_spread.py tests/test_proof_spread.py
+
+          {
+            echo "[envelope] v2"
+            echo "kind feature"
+            echo "verb create"
+            echo "target src/proof_spread.py"
+            echo "lane model"
+            echo "axis src/proof_spread.py"
+            echo "rung 1"
+            echo "corpus 00000000"
+            echo "parent-tree $(git rev-parse 'HEAD^{tree}')"
+            echo "operator clonal"
+            echo "lineage root"
+            echo "seed 0"
+            echo "witness -"
+            echo "title the spread of a window ($ARM drill)"
+            echo "[patch]"
+            cat /tmp/patch
+            echo "[end]"
+          } > envelope.env
+          point=$(sha256sum envelope.env | cut -d' ' -f1)
+          echo "POINT=$point" >> "$GITHUB_ENV"
+          echo "  point ${point:0:16}"
+
+      # Admission is the gate that runs before a runner is spent, so a drill
+      # that skipped it would be proving a path no night takes.
+      - uses: ./.github/actions/envelope
+        with:
+          command: admit
+          file: envelope.env
+          config: ${{ steps.cfg.outputs.json }}
+
+      - name: Mark it tried, exactly as stage does
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p loop/ledger/tried
+          cp envelope.env "loop/ledger/tried/${POINT:0:16}.env"
+          git add loop/ledger/tried
+          git commit -q -m "proof: tried ${POINT:0:16}"
+          echo "MARKED=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_ENV"
+
+      - id: derive
+        uses: ./.github/actions/envelope
+        with:
+          command: derive
+          file: envelope.env
+          parent: ${{ env.MARKED }}
+
+      # The claim the judge makes before it spends a test run, made here too:
+      # deriving twice from the same tree gives the same tree. If it does not,
+      # nothing downstream means anything.
+      - id: rederive
+        uses: ./.github/actions/envelope
+        with:
+          command: derive
+          file: envelope.env
+          parent: ${{ env.MARKED }}
+
+      - name: The candidate is reproducible from the envelope alone
+        shell: bash
+        env:
+          A: ${{ steps.derive.outputs.tree }}
+          B: ${{ steps.rederive.outputs.tree }}
+        run: |
+          set -euo pipefail
+          test "$A" = "$B" || { echo "::error::derive is not deterministic: $A vs $B"; exit 1; }
+          test "$A" != "$MARKED" || { echo "::error::the patch changed nothing"; exit 1; }
+          echo "CAND_TREE=$A" >> "$GITHUB_ENV"
+          echo "  ${A:0:12}, twice"
+
+      - id: base
+        uses: ./.github/actions/harness
+        with:
+          command: run
+          config: ${{ steps.cfg.outputs.json }}
+          arm: a
+          repeats: "1"
+
+      - name: Become the candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          c=$(git commit-tree "$CAND_TREE" -p HEAD -m "proof: candidate")
+          git checkout -qf --detach "$c"
+          echo "CAND_REF=$c" >> "$GITHUB_ENV"
+          test -f src/proof_spread.py || { echo "::error::the candidate tree is missing the module"; exit 1; }
+
+      - id: cand
+        continue-on-error: true
+        uses: ./.github/actions/harness
+        with:
+          command: run
+          config: ${{ steps.cfg.outputs.json }}
+          arm: b
+          repeats: "1"
+
+      - id: rails
+        uses: ./.github/actions/rails
+        with:
+          command: judge
+          before: rails-a.txt
+          after: rails-b.txt
+          claims: "none"
+          kind: feature
+          config: ${{ steps.cfg.outputs.json }}
+          seed: ${{ env.POINT }}
+
+      - id: verdict
+        shell: bash
+        env:
+          A_CLAIMS: ${{ steps.base.outputs.claims }}
+          B_CLAIMS: ${{ steps.cand.outputs.claims }}
+          B_TESTED: ${{ steps.cand.outputs.tested }}
+          B_BUILT: ${{ steps.cand.outputs.built }}
+          B_WHY: ${{ steps.cand.outputs.why }}
+          WORSE: ${{ steps.rails.outputs.worse }}
+        run: |
+          set -euo pipefail
+          if [ "$B_BUILT" != "yes" ]; then
+            echo "verdict=refuse" >> "$GITHUB_OUTPUT"
+            echo "why=the candidate did not build: $B_WHY" >> "$GITHUB_OUTPUT"
+          elif [ "$B_TESTED" != "yes" ]; then
+            echo "verdict=refuse" >> "$GITHUB_OUTPUT"
+            echo "why=the candidate built and its tests did not pass: $B_WHY" >> "$GITHUB_OUTPUT"
+          elif [ "${WORSE:-0}" != "0" ]; then
+            echo "verdict=refuse" >> "$GITHUB_OUTPUT"
+            echo "why=$WORSE rail(s) regressed" >> "$GITHUB_OUTPUT"
+          elif [ "$B_CLAIMS" -le "$A_CLAIMS" ]; then
+            echo "verdict=refuse" >> "$GITHUB_OUTPUT"
+            echo "why=a feature that adds no claim is code nothing exercises" >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=adopt" >> "$GITHUB_OUTPUT"
+            echo "why=it builds, it passes, it added $((B_CLAIMS - A_CLAIMS)) claim(s)" >> "$GITHUB_OUTPUT"
+          fi
+          echo "counts=$A_CLAIMS/$B_CLAIMS" >> "$GITHUB_OUTPUT"
+          echo "NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      # A refused trial's certificate carries `-` for what nobody could count,
+      # and the counts otherwise. `cert emit` checks its own output, so a
+      # combination the ledger would refuse cannot be rendered here either.
+      - id: cert
+        uses: ./.github/actions/cert
+        with:
+          command: emit
+          out: certificate.cert
+          set: |
+            seq=1
+            utc=${{ env.NOW }}
+            point=${{ env.POINT }}
+            kind=feature
+            lane=model
+            operator=clonal
+            lineage=root
+            epoch=0
+            utility=${{ steps.cfg.outputs.utility }}
+            rung=1
+            axis=src/proof_spread.py
+            parent-tree=${{ env.MARKED }}
+            candidate-tree=${{ env.CAND_TREE }}
+            rail=none
+            corpus=00000000
+            claims=${{ steps.verdict.outputs.counts }}
+            why=${{ steps.verdict.outputs.why }}
+            verdict=${{ steps.verdict.outputs.verdict }}
+            runner=${{ github.run_id }}/${{ github.run_attempt }}
+
+      - uses: ./.github/actions/cert
+        with:
+          command: check
+          file: certificate.cert
+
+      - id: decide
+        uses: ./.github/actions/adopt-decide
+        with:
+          command: decide
+          cert: certificate.cert
+          live: ${{ env.MARKED }}
+
+      - name: The drill must have ended the way it was written to
+        shell: bash
+        env:
+          GOT: ${{ steps.verdict.outputs.verdict }}
+          WANT: ${{ matrix.want }}
+          WHY: ${{ steps.verdict.outputs.why }}
+          BASE: ${{ steps.decide.outputs.base }}
+          DECIDED: ${{ steps.decide.outputs.verdict }}
+          ARM: ${{ matrix.arm }}
+        run: |
+          set -euo pipefail
+          echo "  verdict $GOT: $WHY"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::the $ARM drill wanted $WANT and got $GOT -- $WHY"
+            exit 1
+          fi
+          if [ "$DECIDED" != "$WANT" ]; then
+            echo "::error::adopt-decide turned $WANT into $DECIDED against an unmoved tip"
+            exit 1
+          fi
+          # **The claim the refusal drill exists for.** A refusal that built on
+          # the candidate's tree would adopt exactly what was refused, and the
+          # only way to see that is to check which tree came back.
+          if [ "$WANT" = "adopt" ] && [ "$BASE" != "$CAND_TREE" ]; then
+            echo "::error::an adoption built on $BASE, not on the candidate's tree"
+            exit 1
+          fi
+          if [ "$WANT" = "refuse" ] && [ "$BASE" != "$MARKED" ]; then
+            echo "::error::a REFUSAL built on $BASE rather than the live tree."
+            echo "::error::That would file the code that was just refused."
+            exit 1
+          fi
+          echo "  and adopt-decide put it on ${BASE:0:12}, which is the right tree"
+
+      # The staleness case has no runner in it -- it is a pure function of two
+      # trees -- so it is asserted here against the same certificate rather
+      # than given a drill of its own.
+      - id: stale
+        uses: ./.github/actions/adopt-decide
+        with:
+          command: decide
+          cert: certificate.cert
+          live: "0000000000000000000000000000000000000000"
+
+      - name: And a tip that moved is stale, whatever the verdict said
+        shell: bash
+        env:
+          V: ${{ steps.stale.outputs.verdict }}
+          WANT: ${{ matrix.want }}
+        run: |
+          set -euo pipefail
+          test "$V" = "stale" || { echo "::error::a moved tip answered $V"; exit 1; }
+          echo "  a moved tip is stale, and this drill's verdict was $WANT"
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-${{ matrix.arm }}
+          path: |
+            certificate.cert
+            envelope.env
+            judged.txt
+            rails-*.txt
+            harness-*.log
+          if-no-files-found: ignore
+          retention-days: 30
