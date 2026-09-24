@@ -1,0 +1,3 @@
+rail	n	median	p95_rel
+bench.push_ns	4	109.1975	0.021223
+bench.total_ms	4	21.8395	0.021223
