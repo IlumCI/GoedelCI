@@ -276,6 +276,39 @@ each one under the same Beta(1,1) the clades use:
 A portfolio you cannot attribute is one you cannot learn from. With the counts
 recorded, "is this model worth a runner" stops being a matter of taste.
 
+**And the night spends its runners on that.** `archive authors` Thompson-samples
+the assignment against the ledger: shard 0 takes the best posterior mean — it is
+the greedy shard everywhere else here, so the best-known author never misses a
+night — and the rest draw independently from Beta(1+S, 1+F). Measured over forty
+synthetic nights, four shards each:
+
+| the record | runners won |
+|---|---|
+| 7/9 against 1/9 | 160 – 0 |
+| 5/9 against 3/9 | 135 – 25 |
+
+The second row is the interesting one. A contested pair keeps splitting, because
+the challenger's posterior is still wide; a settled one stops, because it is not.
+Nothing is hard-coded about either outcome — the same sampler produces both, and
+what changed is the evidence. The 7/9 author is not permanently safe either: its
+challenger wins about one sampled shard in 385, so it is re-tried, just rarely.
+
+Duplicates are the point rather than a bug. Two shards on the model with the
+record and two on the challenger is the allocation the evidence justifies;
+forcing one shard each would spend the same runners ignoring everything the
+ledger knows. With one author, or none attributed yet, it is uniform — which is
+correct, and is why there is no minimum-evidence floor here as there is on
+`reconsider`. Sampling two identical priors costs nothing; *backtracking* on them
+would move the night somewhere for no reason.
+
+**A record does not expire, and that is a real limitation.** An author is scored
+over every trial it has ever had, so a model that did badly against an old goal
+carries that forever, and a model added tonight starts from the uniform prior
+rather than from anything it has shown. Epoch-scoping the tally would be the
+principled fix — `utility` already changes only at epoch boundaries, and entries
+judged by different criteria are not strictly comparable — but sixteen entries an
+epoch is thin evidence to sample from. It is named here rather than half-solved.
+
 **The cache is the ceiling.** GitHub gives a repository 10 GB of Actions cache,
 evicted least-recently-used, so three 2.78 GB authors fit and four do not. Over
 the limit nothing breaks — a miss is a 55-second download on a runner about to

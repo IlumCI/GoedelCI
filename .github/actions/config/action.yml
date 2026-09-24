@@ -91,6 +91,9 @@ outputs:
   kinds:
     description: "the enabled kinds, space separated"
     value: ${{ steps.run.outputs.kinds }}
+  authors:
+    description: "the local author pool's names, space separated"
+    value: ${{ steps.run.outputs.authors }}
   shards:
     description: "how many author shards a night fans out over"
     value: ${{ steps.run.outputs.shards }}
@@ -1114,6 +1117,7 @@ runs:
             out("epoch_len", str(cfg["judge"]["epoch_len"]))
             out("kinds", " ".join(enabled))
             out("shards", str(cfg["author"]["shards"]))
+            out("authors", " ".join(e["name"] for e in cfg["author"]["local"]["pool"]))
             out("shard_matrix", json.dumps(list(range(cfg["author"]["shards"]))))
             out("json", str(dest))
             out("proof", "yes" if cfg["proof"] else "no")

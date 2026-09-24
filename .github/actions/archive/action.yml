@@ -46,7 +46,7 @@ description: >-
 
 inputs:
   command:
-    description: "report | select | reconsider | selftest"
+    description: "report | select | reconsider | authors | selftest"
     required: true
   root:
     description: "the tree the ledger lives in"
@@ -56,6 +56,14 @@ inputs:
     description: "what makes this night's draw reproducible"
     required: false
     default: ""
+  pool:
+    description: "for authors: the pool's names, space separated"
+    required: false
+    default: ""
+  shards:
+    description: "for authors: how many shards the night fans out over"
+    required: false
+    default: "1"
   min-evidence:
     description: "counted trials below which reconsider always stays"
     required: false
@@ -69,6 +77,9 @@ outputs:
   node:
     description: "the chosen node's certificate name, or `root`"
     value: ${{ steps.run.outputs.node }}
+  assignment:
+    description: "for authors: a JSON array, one author name per shard"
+    value: ${{ steps.run.outputs.assignment }}
   tree:
     description: "the git tree that node is"
     value: ${{ steps.run.outputs.tree }}
@@ -97,6 +108,8 @@ runs:
         COMMAND: ${{ inputs.command }}
         ROOT: ${{ inputs.root }}
         SEED: ${{ inputs.seed }}
+        POOL: ${{ inputs.pool }}
+        SHARDS: ${{ inputs.shards }}
         MIN_EVIDENCE: ${{ inputs.min-evidence }}
         HALF: ${{ inputs.half }}
       run: |
@@ -253,6 +266,57 @@ runs:
             w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
             return "\n".join("  " + "  ".join(c.ljust(x) for c, x in zip(r, w)).rstrip()
                               for r in rows)
+
+        def assign(names, tally, shards, seed):
+            """Which author draws each shard.
+
+            **Shard 0 takes the greedy author, the rest are sampled.** That
+            is the same split shard 0 already has everywhere else here: it is
+            the night the loop would have had anyway, so the best-known
+            author never misses one. Shards 1..N draw independently from
+            Beta(1+S, 1+F), which is Thompson sampling and means a better
+            author wins more runners without a worse one ever being shut out
+            -- its posterior stays wide until it has been tried enough to
+            deserve a narrow one.
+
+            Duplicates are the point, not a bug. Two shards on the author
+            with the record and two on the challenger is the allocation the
+            evidence justifies; forcing one shard each would spend the same
+            runners ignoring everything the ledger knows.
+
+            **With no evidence every author is Beta(1,1)**, so this is
+            uniform -- which is exactly right, and is why there is no
+            minimum-evidence floor here as there is on `reconsider`. Sampling
+            two identical priors costs nothing; BACKTRACKING on them would
+            move the night somewhere for no reason.
+
+            Names come from the config's pool rather than from the ledger, so
+            an author added tonight is in the running tonight.
+
+            **A record does not expire, and that is a known limitation.** An
+            author is scored over every trial it has ever had, so one that
+            did badly against an old goal carries that forever. Epoch-scoping
+            the tally would be the principled fix -- `utility` changes only
+            at epoch boundaries, and entries judged by different criteria are
+            not strictly comparable -- but sixteen entries an epoch is thin
+            evidence to sample from. Named rather than half-solved.
+            """
+            rng = random.Random(hashlib.sha256(("authors" + seed).encode("utf-8")).digest())
+            picks = []
+            for n in range(max(0, shards)):
+                best, best_draw = (names[0] if names else "-"), -1.0
+                for a in names:
+                    s, t, _ = tally.get(a, (0, 0, 0.0))
+                    draw = ((s + 1.0) / (t + 2.0) if n == 0
+                            else rng.betavariate(1 + s, 1 + (t - s)))
+                    # Breaks an exact tie at random rather than by name, so
+                    # that on a record with no evidence -- every author
+                    # Beta(1,1) -- shard 0 is not always the same one.
+                    draw += rng.random() * 1e-9
+                    if draw > best_draw:
+                        best, best_draw = a, draw
+                picks.append(best)
+            return picks
 
         def build(entries):
             """`entries` is a list of plain field mappings, in seq order."""
@@ -445,6 +509,67 @@ runs:
             claim("and says so plainly when nothing has been attributed yet",
                   "no author" in authors_report({}))
 
+            # -- Thompson sampling over the portfolio ----------------------
+
+            T = authors([E("a", "adopt")] * 8 + [E("a", "refuse")] * 2
+
+                        + [E("b", "adopt")] + [E("b", "refuse")] * 9)
+
+            claim("shard 0 takes the author with the best posterior mean",
+
+                  assign(["a", "b"], T, 1, "s")[0] == "a", T)
+
+            many = assign(["a", "b"], T, 400, "s")
+
+            claim("a better author wins more runners",
+
+                  many.count("a") > many.count("b"),
+
+                  (many.count("a"), many.count("b")))
+
+            claim("and a worse one is never shut out, because its posterior stays "
+
+                  "wide until it has been tried enough to deserve a narrow one",
+
+                  many.count("b") > 0, many.count("b"))
+
+            flat = assign(["a", "b"], {}, 400, "s")
+
+            claim("with no evidence at all the assignment is near uniform, which "
+
+                  "is what two identical priors should give",
+
+                  140 < flat.count("a") < 260, flat.count("a"))
+
+            claim("an author with no trials is still drawn, because the names come "
+
+                  "from the pool and not from the ledger",
+
+                  "c" in assign(["a", "b", "c"], T, 200, "s"))
+
+            claim("one author takes every shard",
+
+                  assign(["only"], T, 4, "s") == ["only"] * 4)
+
+            claim("the assignment is deterministic in its seed",
+
+                  assign(["a", "b"], T, 8, "s") == assign(["a", "b"], T, 8, "s"))
+
+            claim("and a different seed is a different night, where the "
+                  "evidence leaves anything to choose",
+                  any(assign(["a", "b"], {}, 8, "s") != assign(["a", "b"], {}, 8, str(k))
+                      for k in range(12)))
+            claim("where it does not, the seed changes nothing: eight shards over "
+                  "8/10 against 1/10 nearly all go to the author with the record",
+                  all(assign(["a", "b"], T, 8, str(k)).count("a") >= 7
+                      for k in range(12)),
+                  [assign(["a", "b"], T, 8, str(k)).count("a") for k in range(12)])
+
+            claim("an empty pool does not crash the night", assign([], T, 3, "s") == ["-"] * 3)
+
+            claim("zero shards asks nobody", assign(["a"], T, 0, "s") == [])
+
+
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
 
@@ -459,6 +584,21 @@ runs:
         explore = os.environ.get("HALF", "explore") != "extend"
         entries = load(root)
         archive = build(entries)
+
+        if cmd == "authors":
+            import json as _json
+            names = os.environ.get("POOL", "").split()
+            try:
+                n = int(os.environ.get("SHARDS", "1") or "1")
+            except ValueError:
+                n = 1
+            tally = authors(entries)
+            picks = assign(names, tally, n, seed)
+            print(authors_report(tally))
+            print("\n  tonight: " + ", ".join(
+                "shard %d %s" % (i, a) for i, a in enumerate(picks)))
+            out("assignment", _json.dumps(picks))
+            sys.exit(0)
 
         if cmd == "report":
             print(archive.report())

@@ -198,6 +198,7 @@ jobs:
       lineage: ${{ steps.node.outputs.node }}
       tip: ${{ steps.tip.outputs.tip }}
       shards: ${{ steps.cfg.outputs.shard-matrix }}
+      authors: ${{ steps.authors.outputs.assignment }}
       minutes: ${{ steps.budget.outputs.minutes }}
       repeats: ${{ steps.budget.outputs.repeats }}
       level: ${{ steps.budget.outputs.level }}
@@ -504,6 +505,19 @@ jobs:
           config: ${{ steps.cfg.outputs.json }}
           emit-env: rung.env
 
+      # **Which author draws which shard, sampled against the record.**
+      # Shard 0 takes the best posterior mean; the rest draw from
+      # Beta(1+S, 1+F) per author, so a model that keeps getting adopted
+      # wins more runners without a worse one ever being shut out. With one
+      # author, or none attributed yet, this is the assignment it always was.
+      - id: authors
+        uses: ./.github/actions/archive
+        with:
+          command: authors
+          pool: ${{ steps.cfg.outputs.authors }}
+          shards: ${{ steps.cfg.outputs.shards }}
+          seed: ${{ github.run_id }}
+
       - id: node
         uses: ./.github/actions/archive
         with:
@@ -572,6 +586,7 @@ jobs:
           command: start
           config: ${{ steps.cfg.outputs.json }}
           shard: ${{ matrix.shard }}
+          author: ${{ fromJSON(needs.plan.outputs.authors)[matrix.shard] }}
 
       - id: draw
         continue-on-error: true
