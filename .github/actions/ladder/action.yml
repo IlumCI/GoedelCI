@@ -356,6 +356,14 @@ runs:
                     "goes through the boundary lane, not the ladder" % target)
             if not matches(target, cfg["allow"]):
                 raise LadderError("%s is outside every writable path" % target)
+            # A kind's own masks, where it declares them. What a milestone may
+            # be ABOUT is narrower than what its patch may touch: a repair's
+            # patch has to write a test, and a milestone aimed at a test is a
+            # milestone about making the numbers go up.
+            if kinds[kind]["targets"] and not matches(target, kinds[kind]["targets"]):
+                raise LadderError(
+                    "kind %s aims only at %s, and %s is not one of them"
+                    % (kind, ", ".join(kinds[kind]["targets"]), target))
             if ".." in Path(target).parts or Path(target).is_absolute():
                 raise LadderError("%s escapes the tree" % target)
             exists = (Path(root) / target).exists()
@@ -444,9 +452,12 @@ runs:
 
             CFG = {"allow": ["src/**"], "evaluator": [".github/**", "goedel.toml"],
                    "goal": "loop/goal.txt",
-                   "kinds": {"feature": {"verb": "create", "j1": "claims", "enabled": True},
-                             "repair": {"verb": "edit", "j1": "witness", "enabled": True},
-                             "off": {"verb": "edit", "j1": "claims", "enabled": False}}}
+                   "kinds": {"feature": {"verb": "create", "j1": "claims", "enabled": True,
+                                         "targets": []},
+                             "repair": {"verb": "edit", "j1": "witness", "enabled": True,
+                                        "targets": []},
+                             "off": {"verb": "edit", "j1": "claims", "enabled": False,
+                                     "targets": []}}}
 
             def rung(**over):
                 r = {"seq": "1", "goal": "g"*16, "kind": "feature", "target": "src/a.py",
@@ -527,6 +538,15 @@ runs:
                 raises("a target in the evaluator is refused", adm(target="goedel.toml"))
                 raises("a target outside every writable path is refused",
                        adm(target="README.md"))
+                NARROW = dict(CFG, kinds=dict(
+                    CFG["kinds"], feature={"verb": "create", "j1": "claims",
+                                           "enabled": True, "targets": ["src/**"]}))
+                raises("a milestone aimed outside its kind's own masks is refused",
+                       lambda: admit({"kind": "feature", "target": "tests/t.py",
+                                      "title": "t", "witness": "w"}, NARROW, root, [], G))
+                claim("and one inside them is admitted",
+                      admit({"kind": "feature", "target": "src/new.py", "title": "t",
+                             "witness": "w"}, NARROW, root, [], G)["kind"] == "feature")
                 raises("a target that escapes the tree is refused",
                        adm(target="src/../../etc/passwd"))
                 raises("a create kind aimed at a file that exists is refused",

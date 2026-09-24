@@ -153,8 +153,13 @@ runs:
                     "kind %s: a witness must build against the PARENT tree, and a file "
                     "being created is by construction absent from it -- so a create kind "
                     "cannot be judged by fail-then-pass" % name)
+            targets = list(row.get("targets", []))
+            for mask in targets:
+                if not mask:
+                    raise ConfigError("kind %s: an empty target mask matches nothing" % name)
             return {
                 "name": name, "verb": verb, "j1": j1, "rail": rail,
+                "targets": targets,
                 "allow_rails": list(row.get("allow_rails", [])),
                 "adrift_rails": list(row.get("adrift_rails", [])),
                 "diff_lines": int(row.get("diff_lines", 400)),
@@ -235,6 +240,19 @@ runs:
             if not kinds_raw:
                 raise ConfigError("[kinds] is empty: the machine has no move it may make")
             kinds = {k: kind_from(k, v) for k, v in kinds_raw.items()}
+            for k, v in kinds.items():
+                # **A kind's targets narrow `allow`; they may not widen it.**
+                # `allow` is the machine's whole boundary, and a kind that
+                # could aim outside it would be a second, quieter boundary
+                # that nothing else in this file checks.
+                bad = [m for m in v["targets"]
+                       if matches(m.replace("**", "x").replace("*", "x"), evaluator)
+                       or not matches(m.replace("**", "x").replace("*", "x"), allow)]
+                if bad:
+                    raise ConfigError(
+                        "kind %s aims at %s, which is not inside [project] allow. A kind's "
+                        "targets narrow the boundary; they cannot widen it."
+                        % (k, ", ".join(bad)))
             if not any(k["enabled"] for k in kinds.values()):
                 raise ConfigError("[kinds] has no enabled row")
 
@@ -318,6 +336,16 @@ runs:
                    bad({"kinds": {"x": {"j1": "rail"}}}))
             raises("a create kind judged by a witness is refused: the witness cannot build",
                    bad({"kinds": {"x": {"verb": "create", "j1": "witness"}}}))
+            raises("a kind aiming outside the project's allow masks is refused",
+                   bad({"kinds": {"x": {"j1": "claims", "targets": ["docs/**"]}}}))
+            raises("a kind aiming at the evaluator is refused",
+                   bad({"kinds": {"x": {"j1": "claims", "targets": [".github/**"]}}}))
+            claim("and a kind narrowing allow is admitted",
+                  load({"project": {"allow": ["src/**", "tests/**"],
+                                    "evaluator": [".github/**"]},
+                        "harness": {"test": "t"},
+                        "kinds": {"x": {"j1": "claims", "targets": ["src/**"]}}},
+                       ".")["kinds"]["x"]["targets"] == ["src/**"])
             raises("a project with no test command is refused: nothing could count a claim",
                    bad({"harness": {}}))
             raises("a config with no kinds is refused", bad({"kinds": {}}))

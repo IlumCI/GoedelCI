@@ -1,0 +1,181 @@
+# The whole of what this machine knows about the project it improves.
+#
+# Adopting the template into a repository is editing THIS FILE and writing one
+# paragraph in `loop/goal.txt`. Nothing under `.github/` should ever need to
+# learn what your project is written in; if something does, that is a gap in
+# this schema and worth reporting rather than working around.
+#
+# What ships here describes the example project in `src/`, which exists so
+# that `ci` is green the moment you clone this and so that the loop has
+# something to practise on. Delete `src/`, `tests/` and `bench/`, point the
+# masks at your own tree, and the machine is yours.
+
+[project]
+name = "goedelci-example"
+goal = "loop/goal.txt"
+
+# **What the machine may write to.** Everything else in the repository is
+# invisible to it.
+allow = ["src/**", "tests/**"]
+
+# **What it may never write to, under any lane but `boundary`.** This is the
+# evaluator: the machine itself, the config that tunes it, the record it
+# reasons from, the runner that counts its tests, and the benchmark that
+# measures it. A loop that can edit any of these has no gate at all.
+#
+# `tools/` and `bench/` are here rather than in `allow` for a specific reason:
+# they decide what a passing test IS and what a rail READS. A machine judged
+# by a count it can redefine is judged by nothing. `tests/` is writable --
+# a repair has to be able to add the failing test that proves it -- but the
+# thing that COUNTS the tests is not.
+evaluator = [".github/**", "goedel.toml", "loop/**", "tools/**", "bench/**"]
+
+[harness]
+# The fast gate a draft is held to between attempts. Seconds, not minutes: it
+# runs up to six times inside one draw, and its refusals are what the next
+# attempt is shown. A typecheck, a lint, a `cargo check` -- whatever answers
+# quickly and is usually right about whether code is broken.
+check = "python3 -m compileall -q src tests"
+
+# The build, if the project has one. Empty is fine; a language with no build
+# step simply has nothing here, and `cost.warnings` is not measured.
+build = ""
+
+# **The only required line in this file.** Every kind's J2 is a count that may
+# not fall, and nothing can count without this.
+test = "python3 tools/testrun.py tests"
+
+# Optional. Anything printing `name.rail value unit lower|higher` lines
+# becomes a rail; everything else it prints is ignored, so a benchmark may log
+# freely.
+bench = "python3 bench/run.py"
+
+# Optional: a built file whose size becomes `cost.artifact_bytes`.
+artifact = ""
+
+# How to read what the test command printed. These are the two lines most
+# worth getting right when you adopt the template: if `claims_re` matches
+# nothing, every kind is refused for a reason that has nothing to do with the
+# code, and `ci` fails loudly rather than letting that go unnoticed.
+suites_re = '(\d+) tests passed'
+claims_re = '^\s*ok\b'
+warnings_re = '^(?:warning|WARN)'
+timeout = 900
+
+[judge]
+# How many entries an epoch holds. The evaluator may change only at a multiple
+# of this, and `ledger fsck` refuses a record where it changed anywhere else.
+epoch_len = 16
+
+# The bootstrap interval's confidence, and the false-discovery rate the
+# `better` claims are corrected at. Regressions are deliberately not
+# corrected: a veto that weakens as you add rails is one an author can dilute.
+confidence = 0.95
+fdr = 0.10
+
+# How many samples each arm takes of each rail. One is honest and gives no
+# interval; three is the smallest number that gives one. A starved trial
+# doubles this rather than giving up.
+repeats = 3
+
+# Counted trials below which the archive never backtracks. A clade comparison
+# over four trials is a comparison of two priors.
+min_evidence = 6
+
+base_minutes = 30
+max_level = 3
+
+# Refusals plus balks after which a milestone is abandoned. Without this a
+# milestone the drafter cannot write is offered again every night, forever.
+balks = 3
+
+[author]
+# `anthropic` or `openai` (which covers any OpenAI-compatible endpoint,
+# including a local llama.cpp server). Neither the key nor the URL is written
+# here -- only the names of the variables they arrive in.
+provider = "anthropic"
+model = "claude-sonnet-5"
+api_key_env = "GOEDEL_INFERENCE_KEY"
+base_url_env = "GOEDEL_INFERENCE_URL"
+
+# Attempts inside ONE draw. Each one is shown the previous attempt's refusal
+# from `harness.check`, which is the only feedback loop inside a single draw
+# and the reason this is six rather than one.
+attempts = 6
+temperature = 0.0
+max_tokens = 8000
+
+# How many independent draws a night fans out over. Shard 0 is greedy -- the
+# night the loop would have had anyway -- and the rest draw at a raised
+# temperature with their index as the declared seed. On a public repository
+# these are free, and they buy wall clock inside a night.
+shards = 4
+
+# Files every card carries besides the target, for house style and idiom.
+context = []
+
+[floors]
+# A movement inside its floor is not a movement. Prefixes, longest match wins.
+# Measure them with the `floors` workflow; change them with a `boundary`
+# proposal that cites the measurement.
+#
+# Cost rails are exact by construction -- one tree, one toolchain -- so their
+# floor is zero and one byte larger really is larger.
+"cost." = 0.0
+"bench." = 0.05
+
+# --- the kinds ------------------------------------------------------------
+#
+# A kind is a shape of change and the primary criterion (J1) that decides it.
+# Every kind also carries the same J2: nothing it did not ask to pay for may
+# read worse, and the test counts may not fall.
+#
+# `targets` narrows where a MILESTONE may be aimed. It does not narrow what a
+# patch may touch -- a repair has to write a test -- and it cannot widen
+# `allow`.
+
+[kinds.feature]
+verb = "create"
+j1 = "claims"
+targets = ["src/**"]
+# A new module pays for its own bytes; that is what it is for. `cost.warnings`
+# is deliberately not allowed: a feature that adds warnings has added code
+# nothing exercises, which is what J1 already refuses.
+allow_rails = ["cost.artifact_bytes"]
+diff_lines = 400
+diff_files = 6
+prompt = """
+Create the module the milestone names, and a test that exercises it. The test
+is what makes this judgeable: a feature that adds no passing claim is code
+nothing runs, and it is refused before anything else is looked at.
+"""
+
+[kinds.repair]
+verb = "edit"
+j1 = "witness"
+targets = ["src/**"]
+diff_lines = 200
+diff_files = 4
+prompt = """
+Write the failing test FIRST, as its own file, and then the smallest change to
+the source that makes it pass. The test is run against the tree as it stands
+before your fix: if it passes there, there was nothing to repair and this is
+refused.
+"""
+
+[kinds.perf]
+verb = "edit"
+j1 = "rail"
+rail = "bench.total_ms"
+targets = ["src/**"]
+diff_lines = 200
+diff_files = 4
+# Off until the project has a benchmark worth believing and floors measured on
+# the runner class that will judge it. A perf kind against an unmeasured floor
+# adopts the weather.
+enabled = false
+prompt = """
+Make `bench.total_ms` smaller without changing what anything returns. Every
+other rail is a veto: if the artifact grows or another measurement regresses,
+this is refused whatever the target rail did.
+"""

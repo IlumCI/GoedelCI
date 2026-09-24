@@ -1,0 +1,32 @@
+Make `src/window.py` a small, dependable streaming-statistics library: a
+fixed-size window that can answer mean, peak, minimum, median, variance and
+rate-of-change over its contents, that refuses rather than inventing an answer
+when it has nothing to summarise, and that stays fast enough to sit in a hot
+loop. Every capability it gains should be observable in a test that would fail
+without it.
+
+--------------------------------------------------------------------------
+
+This paragraph is the whole of what an operator writes. Everything below it --
+what to build next, in what order, and how anybody would know it worked -- is
+the machine's; `ladder` turns this into milestones and `draft` turns those into
+code.
+
+Three things are worth knowing about it.
+
+**It is prose, and it is read by a model.** Write it the way you would brief a
+new colleague who is competent and has not seen the project: what the thing is
+for, what "done" would look like, and what you would refuse. Vagueness here
+comes back as vague milestones, and a vague milestone is one whose witness
+cannot be written, which the ladder refuses.
+
+**Rewriting it abandons every milestone underneath it.** Each rung records a
+digest of this file as it stood when the rung was written, and a rung whose
+digest no longer matches is stale by construction: `next` skips it and the
+machine writes fresh ones. Changing your mind costs one edit and no
+bookkeeping.
+
+**It is a direction, not a specification.** The machine will propose the
+smallest next step toward it, repeatedly, for as long as it is running. If you
+find yourself wanting to describe step four, you want a shorter goal and a
+longer ladder.

@@ -280,6 +280,10 @@ runs:
                     raise EnvelopeError("%s is outside every allow mask" % p)
                 if ".." in Path(p).parts or Path(p).is_absolute():
                     raise EnvelopeError("%s escapes the tree" % p)
+            if row.get("targets") and not matches(fields["target"], row["targets"]):
+                raise EnvelopeError(
+                    "kind %s aims only at %s, and this envelope declares %s"
+                    % (kind, ", ".join(row["targets"]), fields["target"]))
             if fields["target"] not in paths:
                 raise EnvelopeError(
                     "the envelope declares it is about %s and the patch does not touch it"
@@ -419,6 +423,10 @@ runs:
                        "@@ -0,0 +1 @@\n+x\n"
                        "diff --git a/goedel.toml b/goedel.toml\n--- a/goedel.toml\n"
                        "+++ b/goedel.toml\n@@ -1 +1 @@\n-a\n+b\n"), CFG))
+            NARROW = dict(CFG, kinds=dict(CFG["kinds"], feature=dict(
+                CFG["kinds"]["feature"], targets=["src/lib/**"])))
+            raises("an envelope aimed outside its kind's own masks is refused",
+                   lambda: admit(env(), NARROW))
             raises("a declaration the patch does not touch is refused",
                    lambda: admit(env(target="src/other.py"), CFG))
             raises("a binary patch is refused",
