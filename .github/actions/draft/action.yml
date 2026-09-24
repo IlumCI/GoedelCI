@@ -65,6 +65,10 @@ inputs:
     description: "the validated goedel.toml JSON"
     required: false
     default: ""
+  grammar:
+    description: "for ask: a GBNF file whose shape the reply must take"
+    required: false
+    default: ""
   seed:
     description: "this shard's declared draw; empty is the greedy one"
     required: false
@@ -116,6 +120,7 @@ runs:
         SEED: ${{ inputs.seed }}
         LINEAGE: ${{ inputs.lineage }}
         OUT: ${{ inputs.out }}
+        GRAMMAR_FILE: ${{ inputs.grammar }}
         SYSTEM_FILE: ${{ inputs.system }}
         USER_FILE: ${{ inputs.user }}
       run: |
@@ -169,7 +174,7 @@ runs:
         # writes the question and the rules, `ask` answers, and it admits or
         # refuses the answer. So it keeps what a milestone MEANS and this keeps
         # the network, and neither holds a copy of the other.
-        def ask(cfg, system, user, seed=None):
+        def ask(cfg, system, user, seed=None, grammar=""):
             """One request, to whichever provider goedel.toml names.
 
             urllib and nothing else: a loop that needs a package installed
@@ -216,6 +221,21 @@ runs:
                                      {"role": "user", "content": user}]}
                 if seed is not None:
                     body["seed"] = seed
+                # **A grammar, where the caller has one.** Measured: asked
+                # for a milestone in a sentinel block, a 4B wrote the CODE --
+                # it pattern-matched the coding task and ignored the meta-task
+                # -- and the night balked. Three balks retire a milestone the
+                # model was never allowed to see. With the shape constrained,
+                # the same question answered correctly in 22 seconds instead
+                # of four and a half minutes, because the grammar stops it at
+                # the closing sentinel rather than letting it write an essay.
+                #
+                # Only where the shape IS the contract. Drafting a patch is
+                # free-form on purpose: `harness.check` is the feedback loop
+                # there, and a grammar over a unified diff constrains nothing
+                # that matters.
+                if grammar:
+                    body["grammar"] = grammar
                 if a["provider"] == "local":
                     # **Greedy decoding on a long generation can fall into a
                     # repetition loop**, which the card for these weights says
@@ -896,10 +916,13 @@ runs:
             cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
             seed = os.environ.get("SEED", "").strip()
             try:
+                gf = os.environ.get("GRAMMAR_FILE", "").strip()
+                grammar = Path(gf).read_text(encoding="utf-8") if gf and Path(gf).is_file() else ""
                 reply = ask(cfg,
                             Path(os.environ["SYSTEM_FILE"]).read_text(encoding="utf-8"),
                             Path(os.environ["USER_FILE"]).read_text(encoding="utf-8"),
-                            int(seed) if seed else None)
+                            int(seed) if seed else None,
+                            grammar=grammar)
             except NoAnswer as exc:
                 Path(os.environ["OUT"]).write_text("", encoding="utf-8")
                 out("operator", "-"); out("attempts", "0"); out("drew", "no")
