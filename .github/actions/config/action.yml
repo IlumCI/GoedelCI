@@ -94,6 +94,9 @@ outputs:
   authors:
     description: "the local author pool's names, space separated"
     value: ${{ steps.run.outputs.authors }}
+  author-decay:
+    description: "how much an author's trial counts per epoch of age"
+    value: ${{ steps.run.outputs.author_decay }}
   shards:
     description: "how many author shards a night fans out over"
     value: ${{ steps.run.outputs.shards }}
@@ -489,7 +492,26 @@ runs:
                 "base_minutes": int(j.get("base_minutes", 45)),
                 "max_level": int(j.get("max_level", 3)),
                 "balks": int(j.get("balks", 3)),
+                # **How fast an author's record stops counting.** Weight per
+                # epoch, so a trial from `n` epochs ago counts `decay ** n`.
+                #
+                # 1.0 is all-time, which treats a model judged under an old
+                # criterion as evidence about this one. 0.0 counts only the
+                # current epoch, which is the strict reading and leaves about
+                # sixteen entries split across the pool -- Beta at four trials
+                # is nearly uniform, so the sampler would stop concentrating
+                # at all. 0.5 keeps roughly two epochs of memory, which is
+                # thirty-two entries, and is the default for that reason.
+                #
+                # Truncation is the special case of discounting, so both
+                # readings are reachable from one number.
+                "author_decay": float(j.get("author_decay", 0.5)),
             }
+            if not 0.0 <= judge["author_decay"] <= 1.0:
+                raise ConfigError(
+                    "[judge] author_decay is a weight per epoch between 0 and 1: 0 "
+                    "counts only the current epoch, 1 counts every trial ever. %r is "
+                    "neither." % judge["author_decay"])
             if judge["epoch_len"] < 1:
                 raise ConfigError("[judge] epoch_len must be at least 1")
             if not 0.0 < judge["confidence"] < 1.0:
@@ -1118,6 +1140,7 @@ runs:
             out("kinds", " ".join(enabled))
             out("shards", str(cfg["author"]["shards"]))
             out("authors", " ".join(e["name"] for e in cfg["author"]["local"]["pool"]))
+            out("author_decay", "%.4f" % cfg["judge"]["author_decay"])
             out("shard_matrix", json.dumps(list(range(cfg["author"]["shards"]))))
             out("json", str(dest))
             out("proof", "yes" if cfg["proof"] else "no")
