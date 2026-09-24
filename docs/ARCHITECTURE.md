@@ -281,6 +281,33 @@ the trees rather than about the hour.
 
 ---
 
+## When the plan is finished
+
+`blueprint phase` answers `done`, and two things change.
+
+The night's card stops carrying phase criteria and starts carrying what
+`survey` found. A survey finding is not a lint result: each one states **what a
+test of it would have to observe**, because that sentence becomes the
+milestone's witness and a finding without one is a complaint. Findings are
+ordered unsafe → swallowed → stub → mock → validation → untested, deduplicated
+by rule and by location, and capped at five per file so one neglected module
+cannot fill the list.
+
+`directions` proposes 2–5 complete replacement plans, one pull request each,
+and does nothing at all if any are already open. Each carries a whole
+`loop/blueprint.txt` that has already been through `blueprint`'s admission, so
+merging one is sufficient for the next night to start building it. `decided.yml`
+closes the rest on merge and files a `superseded` event in the ledger — a
+change to the blueprint is the most consequential thing that can happen to the
+repository without any code moving, and a record that did not mention it would
+leave an unexplained discontinuity.
+
+**The promotion job selects the audit pull request by head branch.** That is a
+guard, not a lookup: a `direction` pull request asks what the project should
+*become*, and the judge has no opinion about that. It knows whether a change
+made the project worse against a fixed standard; it cannot tell you which
+standard it should have been held to.
+
 ## The boundary
 
 The one lane that may edit the evaluator, and the reason this is a self-improving

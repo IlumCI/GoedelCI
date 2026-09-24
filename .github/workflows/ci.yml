@@ -77,6 +77,10 @@ jobs:
         with: { command: selftest }
       - uses: ./.github/actions/scaffold
         with: { command: selftest }
+      - uses: ./.github/actions/survey
+        with: { command: selftest }
+      - uses: ./.github/actions/directions
+        with: { command: selftest }
       - uses: ./.github/actions/selftest-all
         with: { command: selftest }
       - uses: ./.github/actions/budget

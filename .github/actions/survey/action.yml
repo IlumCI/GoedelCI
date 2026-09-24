@@ -1,0 +1,391 @@
+name: goedel-survey
+description: >-
+  Find what is left: stubs still standing in for the real thing, errors being
+  swallowed, unsafe patterns, source nothing tests. Each with what a test of it
+  would have to observe.
+
+# **What a loop does when the plan is finished.**
+#
+# A blueprint completes and the obvious next move is nothing -- every criterion
+# is met, so there is no open milestone and the night stands down. That is
+# wrong twice over. A project whose plan is finished is not a project with
+# nothing wrong with it: the first version of everything is full of the stub
+# that was put in to get the test passing, the error that is caught and
+# dropped, the input nothing validates, and the function no test names. Those
+# are exactly the things a loop is good at, because each one can be stated as
+# something observable that is currently false.
+#
+# So this scans the writable tree and turns it into a list of milestones
+# somebody could take. Not a lint report -- a lint report says what is wrong,
+# and what the ladder needs is **what a test would have to see**. Every finding
+# carries that sentence, because that sentence becomes the witness and a
+# finding without one is a complaint.
+#
+# **It is deliberately not clever.** Regular expressions over text, no parser,
+# no language server, nothing to install. It will miss things and it will
+# occasionally point at something fine. Both are acceptable: the judge decides
+# whether the change was an improvement, so a bad suggestion costs one refused
+# night, and the alternative -- a real analysis for every language the template
+# might be pointed at -- is a project rather than a file.
+#
+# What it will not do is invent work. A finding names a file and a line, and if
+# the tree is clean the answer is that the tree is clean.
+
+inputs:
+  command:
+    description: "scan | selftest"
+    required: true
+  root:
+    description: "the tree to look at"
+    required: false
+    default: "."
+  config:
+    description: "the validated goedel.toml JSON, for the allow masks"
+    required: false
+    default: ""
+  limit:
+    description: "how many findings to report"
+    required: false
+    default: "40"
+  out:
+    description: "where to write them"
+    required: false
+    default: survey.txt
+
+outputs:
+  findings:
+    description: "how many things were found"
+    value: ${{ steps.run.outputs.findings }}
+  categories:
+    description: "which kinds of thing, space separated"
+    value: ${{ steps.run.outputs.categories }}
+  why:
+    description: "one line for the log"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        CONFIG: ${{ inputs.config }}
+        LIMIT: ${{ inputs.limit }}
+        OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import fnmatch, json, os, re, sys
+        from pathlib import Path
+
+        class SurveyError(Exception): pass
+
+        def out(k, v):
+            v = str(v).replace("\r", " ").replace("\n", " ")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        # (category, pattern, what a test of it would have to observe)
+        #
+        # The third column is the whole value of this file. A grep hit is a
+        # complaint; a grep hit plus the sentence a test would assert is a
+        # milestone. Where the sentence needs the name of the thing, `{}` is
+        # filled with the first capture.
+        RULES = [
+          ("stub", r"\bNotImplementedError\b",
+           "calling this returns a real answer rather than raising"),
+          ("stub", r"#\s*(?:TODO|FIXME|XXX|HACK|TBD)\b[:\s]*(.{0,60})",
+           "the thing this note defers -- {} -- is done and tested"),
+          ("stub", r"//\s*(?:TODO|FIXME|XXX|HACK|TBD)\b[:\s]*(.{0,60})",
+           "the thing this note defers -- {} -- is done and tested"),
+          ("stub", r"\b(?:return|=)\s*(?:None|null|nil|\{\}|\[\]|0|\"\")\s*#\s*(?:stub|placeholder|for now|temporary)",
+           "this returns what it is supposed to rather than a placeholder"),
+          ("mock", r"\b(?:mock|fake|dummy|stub)_?(\w{0,24})\b\s*=",
+           "the real implementation is used here and behaves the same as the mock did"),
+          ("mock", r"\bhard[-_ ]?cod(?:ed?|ing)\b",
+           "this value comes from configuration or from the caller, not from the source"),
+          ("swallowed", r"except\s*(?:\w+\s*)?:\s*(?:pass|\.\.\.)\s*$",
+           "a failure here is reported rather than discarded"),
+          ("swallowed", r"catch\s*\([^)]*\)\s*\{\s*\}",
+           "a failure here is reported rather than discarded"),
+          ("unsafe", r"\bshell\s*=\s*True\b",
+           "a value containing shell metacharacters is handled literally, not executed"),
+          ("unsafe", r"\b(?:eval|exec)\s*\(",
+           "input that would be code if evaluated is refused instead"),
+          ("unsafe", r"\bverify\s*=\s*False\b",
+           "a certificate that does not validate is refused"),
+          ("unsafe", r"\b(?:md5|sha1)\s*\(",
+           "a password or token is hashed with something built for the purpose"),
+          ("unsafe", r"\brandom\.(?:random|randint|choice)\b.{0,40}(?:token|secret|key|password|nonce|salt)",
+           "the value is unpredictable to somebody who can see other values"),
+          ("unsafe", r"^\s*(?:password|secret|api_?key|token)\s*[:=]\s*[\"'][^\"']{6,}[\"']",
+           "no credential appears in the source, and an absent one is refused loudly"),
+          ("unsafe", r"\ballow_origins\s*=\s*\[\s*[\"']\*[\"']",
+           "a request from an unexpected origin is refused"),
+          ("validation", r"\b(?:int|float|json\.loads|parseInt|JSON\.parse)\s*\([^)]*\b(?:request|req|input|argv|body|params|query)\b",
+           "a malformed input is refused with a message rather than raising"),
+        ]
+
+        COMPILED = [(i, c, re.compile(p, re.I | re.M), w)
+                    for i, (c, p, w) in enumerate(RULES)]
+
+        # Anything that looks like a test is somebody's fixture, and a fixture
+        # is SUPPOSED to be full of mocks and dummies.
+        TESTISH = re.compile(r"(^|/)(tests?|spec|__tests__|fixtures?)(/|$)|(^|/)test_|_test\.")
+
+        SOURCEY = (".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".rb",
+                   ".java", ".kt", ".php", ".cs", ".swift", ".sh", ".mjs")
+
+        def matches(path, masks):
+            if path.startswith("./"):
+                path = path[2:]
+            for m in masks:
+                if fnmatch.fnmatch(path, m):
+                    return True
+                if m.endswith("/**") and (path == m[:-3] or path.startswith(m[:-2])):
+                    return True
+            return False
+
+        def files(root, cfg):
+            allow = cfg.get("allow", ["src/**"])
+            evaluator = cfg.get("evaluator", [])
+            found = []
+            for p in sorted(Path(root).rglob("*")):
+                if not p.is_file() or p.is_symlink():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if rel.startswith(".git/") or "/node_modules/" in "/" + rel:
+                    continue
+                if not matches(rel, allow) or matches(rel, evaluator):
+                    continue
+                if p.suffix not in SOURCEY:
+                    continue
+                found.append((rel, p))
+            return found
+
+        def untested(paths):
+            """Source files no test file so much as names.
+
+            Crude on purpose: it looks for the module's stem appearing anywhere
+            under a test path. That misses a test that imports it under an
+            alias and flags one tested only indirectly, and it still finds the
+            file somebody added and never covered, which is the case worth
+            finding.
+            """
+            tests = "\n".join(
+                p.read_text(encoding="utf-8", errors="replace")
+                for rel, p in paths if TESTISH.search(rel))
+            out_ = []
+            for rel, p in paths:
+                if TESTISH.search(rel):
+                    continue
+                stem = Path(rel).stem
+                if stem in ("__init__", "index", "main"):
+                    continue
+                if re.search(r"\b%s\b" % re.escape(stem), tests):
+                    continue
+                out_.append(rel)
+            return out_
+
+        def scan(root, cfg, limit):
+            found = []
+            paths = files(root, cfg)
+            for rel, p in paths:
+                if TESTISH.search(rel):
+                    continue
+                try:
+                    text = p.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                lines = text.splitlines()
+                for rule, cat, rx, witness in COMPILED:
+                    for m in rx.finditer(text):
+                        line = text.count("\n", 0, m.start()) + 1
+                        body = lines[line - 1].strip() if line <= len(lines) else ""
+                        w = witness
+                        if "{}" in w:
+                            note = (m.group(1) or "").strip() if m.groups() else ""
+                            if not note:
+                                continue
+                            w = w.replace("{}", note)
+                        found.append((cat, rel, line, body[:100], w, rule))
+            for rel in untested(paths):
+                found.append(("untested", rel, 0, "",
+                              "a test names %s and exercises what it does"
+                              % Path(rel).stem, -1))
+            # **One per RULE per file, not one per category per file.** Ten
+            # TODOs in one module is one piece of work and collapsing them is
+            # right; a `shell=True` and a credential in the source are both
+            # `unsafe` and are two entirely different jobs, and collapsing
+            # those loses one of them silently. Then at most three per file, so
+            # that one neglected module cannot fill the whole list.
+            # **Ordered before either cut, or the cuts keep the wrong ones.**
+            # Capping per file first kept whichever findings happened to be
+            # discovered first -- which is rule order, not importance -- so a
+            # file with two stubs and a hardcoded credential reported the
+            # stubs and dropped the credential.
+            order = {"unsafe": 0, "swallowed": 1, "stub": 2, "mock": 3,
+                     "validation": 4, "untested": 5}
+            found.sort(key=lambda f: (order.get(f[0], 9), f[1], f[2]))
+
+            # Two keys, because two rules hitting the SAME LINE describe one
+            # thing: `raise NotImplementedError  # TODO: interpolate` is a stub
+            # and a deferred note and is one piece of work. The sort above has
+            # already put the more important reading first, so keeping the
+            # first at a location keeps the right one.
+            seen, at, per_file, kept = set(), set(), {}, []
+            for f in found:
+                key = (f[5], f[1])
+                if key in seen:
+                    continue
+                if f[2] and (f[1], f[2]) in at:
+                    continue
+                seen.add(key)
+                if f[2]:
+                    at.add((f[1], f[2]))
+                # At most five per file. A module with more than five distinct
+                # kinds of problem is a rewrite rather than a maintenance
+                # item, and letting it fill the list hides every other module.
+                if per_file.get(f[1], 0) >= 5:
+                    continue
+                per_file[f[1]] = per_file.get(f[1], 0) + 1
+                kept.append(f)
+            return kept[:limit], len(paths)
+
+        def render(found, n_files):
+            if not found:
+                return ("Nothing found. %d file(s) scanned and none of them carries a "
+                        "stub, a swallowed failure, an unsafe pattern or a name no test "
+                        "mentions.\n" % n_files)
+            lines = ["%d thing(s) worth a milestone, over %d file(s). Each line is a "
+                     "place and what a test of it would have to observe.\n"
+                     % (len(found), n_files)]
+            for cat, rel, line, body, witness, _rule in found:
+                where = "%s:%d" % (rel, line) if line else rel
+                lines.append("[%s] %s" % (cat, where))
+                if body:
+                    lines.append("    %s" % body)
+                lines.append("    a test would show: %s" % witness)
+            return "\n".join(lines) + "\n"
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            import tempfile
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+
+            CFG = {"allow": ["src/**", "tests/**"], "evaluator": [".github/**"]}
+            def cats(found): return {f[0] for f in found}
+
+            with tempfile.TemporaryDirectory() as td:
+                r = Path(td)
+                (r / "src").mkdir(); (r / "tests").mkdir()
+                (r / "src/a.py").write_text(
+                    "def f():\n"
+                    "    raise NotImplementedError\n"
+                    "# TODO: handle the empty case\n"
+                    "def g():\n"
+                    "    try:\n"
+                    "        h()\n"
+                    "    except Exception:\n"
+                    "        pass\n"
+                    "import subprocess\n"
+                    "subprocess.run(cmd, shell=True)\n"
+                    "api_key = 'sk-not-a-real-one-just-shaped-like-it'\n")
+                (r / "tests/test_a.py").write_text(
+                    "from src.a import f\n"
+                    "mock_thing = 1\n"
+                    "def test_a(): pass\n")
+                found, n = scan(r, CFG, 40)
+                c = cats(found)
+                claim("a raise of NotImplementedError is a stub", "stub" in c)
+                claim("a swallowed exception is found", "swallowed" in c)
+                claim("shell=True is found", "unsafe" in c)
+                claim("and a credential in the source is",
+                      any("api_key" in f[3] for f in found))
+                claim("a mock inside a test file is nobody's problem",
+                      not any(f[1].startswith("tests/") for f in found))
+                claim("the unsafe findings come first",
+                      found[0][0] == "unsafe")
+                claim("every finding says what a test would show",
+                      all(f[4] for f in found))
+                claim("and a TODO's finding quotes the note",
+                      any("handle the empty case" in f[4] for f in found))
+                claim("a file is not reported twice for the same rule",
+                      len({(f[5], f[1]) for f in found}) == len(found))
+                claim("nor twice for one line that two rules both matched",
+                      len({(f[1], f[2]) for f in found if f[2]})
+                      == len([f for f in found if f[2]]))
+                claim("but two different unsafe patterns in one file are two jobs",
+                      len([f for f in found if f[0] == "unsafe"]) >= 2)
+                claim("and no single file can fill the whole list",
+                      max(sum(1 for f in found if f[1] == rel)
+                          for rel in {f[1] for f in found}) <= 5)
+
+                (r / "src/b.py").write_text("def lonely():\n    return 1\n")
+                found, _ = scan(r, CFG, 40)
+                claim("a source file no test names is found",
+                      any(f[0] == "untested" and f[1] == "src/b.py" for f in found))
+                claim("and one a test does name is not",
+                      not any(f[0] == "untested" and f[1] == "src/a.py" for f in found))
+
+                (r / "src/__init__.py").write_text("")
+                found, _ = scan(r, CFG, 40)
+                claim("an __init__ is not an untested file",
+                      not any(f[1] == "src/__init__.py" for f in found))
+
+                (r / "README.md").write_text("# TODO: everything\n")
+                found, _ = scan(r, CFG, 40)
+                claim("a path outside the allow masks is not scanned",
+                      not any(f[1] == "README.md" for f in found))
+
+                found, _ = scan(r, CFG, 2)
+                claim("the limit is respected", len(found) == 2)
+
+            with tempfile.TemporaryDirectory() as td:
+                r = Path(td); (r / "src").mkdir()
+                (r / "src/clean.py").write_text("def add(a, b):\n    return a + b\n")
+                (r / "tests").mkdir()
+                (r / "tests/test_clean.py").write_text("from src.clean import add\n")
+                found, n = scan(r, CFG, 40)
+                claim("a clean tree finds nothing rather than inventing work",
+                      found == [], found)
+                claim("and says so plainly", "Nothing found" in render(found, n))
+
+            text = render([("unsafe", "src/a.py", 4, "run(x, shell=True)",
+                            "a value containing shell metacharacters is handled literally",
+                            0)], 1)
+            claim("the report names the place", "src/a.py:4" in text)
+            claim("and quotes the line", "shell=True" in text)
+            claim("and says what a test would show", "a test would show" in text)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd != "scan":
+            print("::error::survey: no such command: %r" % cmd)
+            sys.exit(1)
+
+        cfg = {}
+        if os.environ.get("CONFIG"):
+            cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+        found, n_files = scan(os.environ.get("ROOT", ".") or ".", cfg,
+                              int(os.environ.get("LIMIT", "40") or "40"))
+        text = render(found, n_files)
+        Path(os.environ["OUT"]).write_text(text, encoding="utf-8")
+        sys.stdout.write(text)
+        out("findings", str(len(found)))
+        out("categories", " ".join(sorted({f[0] for f in found})))
+        out("why", "%d finding(s) over %d file(s)" % (len(found), n_files))
+        PYEOF

@@ -45,6 +45,38 @@ because it has no way to know which of those are true.
 
 ---
 
+## When the plan is finished
+
+Nothing stops. Two things start.
+
+**It maintains.** A finished plan is not a finished project: the first version
+of everything is full of the stub put in to get a test passing, the error
+caught and dropped, the input nothing validates, and the module no test names.
+`survey` finds those and states each one as *what a test of it would have to
+observe* — so they become ordinary milestones, judged by the ordinary judge.
+
+**It asks you one question.** `directions` proposes two to five genuinely
+different things the project could become, each as its own pull request, each
+carrying a **complete replacement plan** rather than a suggestion. Merging one
+replaces `loop/blueprint.txt`, and the next night starts building it. The
+others close automatically with a comment saying which one won.
+
+It proposes once and then waits — indefinitely, without degrading, because the
+maintenance nights carry on the whole time. Close them all without merging and
+it proposes a fresh set.
+
+**Autonomous promotion never touches a direction pull request.** It merges only
+the audit PR, by head branch, as a guard rather than a lookup. What a thing
+should *become* is not a question the judge can answer: it knows whether a
+change made the project worse against a fixed standard, and has no opinion
+about which standard it should have been held to. A loop that picks its own
+next objective is one whose record stops meaning anything, because every
+verdict would be relative to a goal it chose partly because it was reachable.
+
+That is the one decision left to you, and it is the only one.
+
+---
+
 ## What it does in one night
 
 ```
@@ -139,6 +171,8 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `loop-night.yml` | the night — follow, reconsider, ladder, draft, judge, adopt, tidy |
 | `loop-judge.yml` | the two-arm gate, called by the night and runnable by hand |
 | `proof.yml` | two drills end to end, plus a synthetic epoch; no model, no pushes |
+| `directions.yml` | when the plan is done: 2-5 competing plans, one PR each |
+| `decided.yml` | one was merged, so the others close |
 | `boundary.yml` | the only lane that may change the evaluator itself |
 | `floors.yml` | measures this runner class's own noise, as data |
 | **Actions** | |
@@ -155,6 +189,8 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `budget` | how much a starved trial gets to spend next time |
 | `adopt-decide` | which tree a commit is built on, as a pure function |
 | `boundary-judge` | Epoch, Moves, Honest, Remembers |
+| `survey` | what is left: stubs, swallowed failures, unsafe patterns |
+| `directions` | complete alternative plans, for you to pick between |
 | `template-check` | the machine checked against itself |
 | `selftest-all` | runs every suite from disk, for the one gate that needs it |
 

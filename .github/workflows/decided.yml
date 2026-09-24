@@ -1,0 +1,159 @@
+name: decided
+
+# **A direction was merged, so the others are answered.**
+#
+# The competing pull requests are alternatives, not a queue. Leaving the losers
+# open after one is merged would be leaving four plans sitting against a
+# project that has already committed to a fifth -- and the next time
+# `directions` runs it would see them open and propose nothing, so the machine
+# would stop asking for good.
+#
+# So the moment one merges, the rest close with a comment saying which one won
+# and why. They are not deleted: the branch stays, the body stays, and a
+# closed pull request is a readable record of the option that was not taken.
+# That record is worth more later than it costs now.
+#
+# It also notes the change in the ledger. The blueprint is what every
+# certificate's milestone was drawn from, so a change to it is the single most
+# consequential thing that can happen to this repository without any code
+# moving, and a record that did not mention it would leave an unexplained
+# discontinuity for anybody reading it afterwards.
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decided
+  cancel-in-progress: false
+
+jobs:
+  close-the-others:
+    # `pull_request_target` runs against the BASE branch's workflows, which is
+    # what makes it safe to give this the token it needs: nothing from the
+    # merged head is executed here. It only reads labels and closes things.
+    if: >-
+      github.event.pull_request.merged == true &&
+      contains(github.event.pull_request.labels.*.name, 'direction')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - id: close
+        name: Close the alternatives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WON: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          closed=0
+          for n in $(gh pr list --label direction --state open --json number --jq '.[].number'); do
+            if [ "$n" = "$WON" ]; then continue; fi
+            gh pr comment "$n" --body "Closed because [#$WON]($(gh pr view "$WON" --json url --jq .url)) was merged instead: **$TITLE**.
+
+Nothing is wrong with this one. It was an alternative, and one alternative was taken. The branch is left in place and this body is the record of the option that was not chosen.
+
+The next set of directions is proposed once the new plan is finished."
+            gh pr close "$n"
+            closed=$((closed + 1))
+            echo "  closed #$n"
+          done
+          echo "closed=$closed" >> "$GITHUB_OUTPUT"
+          echo "  $closed alternative(s) closed; #$WON is the plan now"
+
+      - id: cfg
+        uses: ./.github/actions/config
+        with: { command: load }
+
+      - name: The plan the project is now working to
+        uses: ./.github/actions/blueprint
+        with:
+          command: show
+          config: ${{ steps.cfg.outputs.json }}
+
+      # --- and note it in the record -------------------------------------
+      #
+      # Filed on loop/main rather than here, because that is where the ledger
+      # is and `fsck` is what checks it. The sequence and the epoch are read
+      # under the same lock every other writer uses.
+      - id: note
+        name: Note the change where the record is
+        env:
+          WON: ${{ github.event.pull_request.number }}
+          TITLE: ${{ github.event.pull_request.title }}
+          CLOSED: ${{ steps.close.outputs.closed }}
+          EPOCH_LEN: ${{ steps.cfg.outputs.epoch-len }}
+          UTILITY: ${{ steps.cfg.outputs.utility }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git rev-parse --verify --quiet origin/loop/main >/dev/null; then
+            echo "::notice::no loop/main yet; nothing to note"
+            echo "go=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -qf -B loop/main origin/loop/main
+          n=0
+          if [ -d loop/ledger/entries ]; then
+            n=$(find loop/ledger/entries -name '*.cert' | wc -l)
+          fi
+          test "${EPOCH_LEN:-0}" -gt 0 || { echo "::error::no epoch length"; exit 1; }
+          {
+            echo "SEQ=$(( n + 1 ))"
+            echo "EPOCH=$(( n / EPOCH_LEN ))"
+            echo "NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "POINT=$(printf 'direction %s merged as %s' "$WON" "$TITLE" \
+                          | sha256sum | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
+          echo "go=yes" >> "$GITHUB_OUTPUT"
+
+      - if: steps.note.outputs.go == 'yes'
+        uses: ./.github/actions/cert
+        with:
+          command: emit
+          out: direction.cert
+          set: |
+            seq=${{ env.SEQ }}
+            utc=${{ env.NOW }}
+            point=${{ env.POINT }}
+            kind=event
+            lane=event
+            epoch=${{ env.EPOCH }}
+            utility=${{ steps.cfg.outputs.utility }}
+            rung=0
+            axis=none
+            why=a new direction was chosen: ${{ github.event.pull_request.title }} (#${{ github.event.pull_request.number }}), ${{ steps.close.outputs.closed }} alternative(s) closed
+            verdict=superseded
+            runner=${{ github.run_id }}/${{ github.run_attempt }}
+
+      - name: File it
+        if: steps.note.outputs.go == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(sha256sum direction.cert | cut -c1-16)
+          mkdir -p loop/ledger/entries
+          mv direction.cert "loop/ledger/entries/$name.cert"
+          git add loop/ledger/entries
+          git commit -q -m "loop: a new direction was chosen"
+          git push origin HEAD:refs/heads/loop/main
+
+      - name: And the record still holds together
+        if: steps.note.outputs.go == 'yes'
+        uses: ./.github/actions/ledger
+        with:
+          command: fsck
+          epoch-len: ${{ steps.cfg.outputs.epoch-len }}

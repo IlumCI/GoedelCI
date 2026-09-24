@@ -393,13 +393,36 @@ jobs:
           config: ${{ steps.cfg.outputs.json }}
           criteria-out: blueprint-criteria.txt
 
-      - name: A finished plan is not a failed night
+      # **A finished plan is not a finished project.** Every criterion is met,
+      # and the tree is still full of the stub put in to get a test passing,
+      # the error caught and dropped, and the input nothing validates. Those
+      # are what the night does now, and it keeps doing them for as long as
+      # nobody chooses a new direction -- so an undecided repository is a
+      # maintained one rather than a stalled one.
+      - id: survey
+        if: steps.phase.outputs.done == 'yes'
+        uses: ./.github/actions/survey
+        with:
+          command: scan
+          config: ${{ steps.cfg.outputs.json }}
+          out: survey.txt
+
+      - name: Say what the night is doing instead
         if: steps.phase.outputs.done == 'yes'
         shell: bash
+        env:
+          FOUND: ${{ steps.survey.outputs.findings }}
+          CATS: ${{ steps.survey.outputs.categories }}
         run: |
-          echo "::notice::every phase of the blueprint is met. The loop will keep the"
-          echo "::notice::project green and will propose nothing new until the plan is"
-          echo "::notice::extended -- which is a boundary proposal at an epoch edge."
+          set -euo pipefail
+          if [ "${FOUND:-0}" = "0" ]; then
+            echo "::notice::the plan is met and the survey found nothing to fix. The"
+            echo "::notice::night will stand down. `directions` proposes where to go"
+            echo "::notice::next; merging one of its pull requests starts the machine"
+            echo "::notice::again."
+          else
+            echo "  the plan is met; maintaining instead ($FOUND finding(s): $CATS)"
+          fi
 
       - id: card
         name: Ask for the next milestone
@@ -408,6 +431,7 @@ jobs:
           command: card
           config: ${{ steps.cfg.outputs.json }}
           criteria: blueprint-criteria.txt
+          survey: survey.txt
           card-out: ladder-card.txt
           system-out: ladder-system.txt
 
@@ -979,8 +1003,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # **By head branch, and that is a guard rather than a lookup.** The
+          # only thing this may ever auto-merge is the audit pull request,
+          # whose head is `loop/main`. A `direction` pull request is a question
+          # put to a person -- what should this BECOME -- and a machine that
+          # answered it by merging one would be choosing its own objective,
+          # which is the one thing this whole arrangement is built to not do.
           num=$(gh pr list --head loop/main --base "$DEFAULT" --state open \
-                  --json number --jq '.[0].number // empty')
+                  --json number,labels \
+                  --jq '[.[] | select([.labels[].name] | index("direction") | not)][0].number // empty')
           if [ -z "$num" ]; then
             echo "::notice::no open audit pull request to promote"
             exit 0

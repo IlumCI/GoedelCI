@@ -108,6 +108,23 @@ Two further things are worth setting before you walk away:
   nothing, the loop stands down instead of spending a runner a night forever
   on a milestone it cannot write. Zero means never.
 
+## The `direction` label
+
+`directions` opens competing pull requests carrying that label, and
+`decided.yml` closes the losers when one is merged. Two things make it work:
+
+- **Create the label** (`gh label create direction`) or the first run fails
+  when it tries to apply one.
+- **Do not add `direction` to any auto-merge rule.** The promotion job already
+  refuses to touch them — it merges only the audit pull request, selected by
+  head branch — but a repository-level automerge rule would go around that and
+  let the machine choose its own objective, which is the one thing this whole
+  arrangement exists to prevent.
+
+`decided.yml` runs on `pull_request_target`, which executes the *base*
+branch's workflow rather than the merged head's. That is what makes it safe to
+give it write permission: nothing from the merged branch runs.
+
 ## Environment `evaluator`
 
 Only needed once you intend to use the `boundary` lane.

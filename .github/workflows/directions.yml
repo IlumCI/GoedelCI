@@ -1,0 +1,181 @@
+name: directions
+
+# **The one decision left to a person.**
+#
+# When every phase of the blueprint is met, the machine does not choose what to
+# do next. It writes two to five complete alternatives, opens each as a pull
+# request, and waits -- indefinitely, without degrading, because nights carry
+# on maintaining the project while you think.
+#
+# It does not choose because it cannot. The judge knows whether a change made
+# the project worse against a fixed standard; it has no opinion about which
+# standard it ought to have been measured against. A loop that picks its own
+# next objective is one whose whole record stops meaning anything: every
+# verdict would be relative to a goal the machine chose partly because it was
+# reachable.
+#
+# **It proposes once.** With direction pull requests already open it does
+# nothing, so a week of undecided nights is a week of quiet maintenance rather
+# than thirty-five pull requests. Closing them all without merging one makes it
+# propose again on the next run, which is how you ask for a different set.
+#
+# CONSUMER: you, once. CANARY: `decided.yml` closes the losers the moment one
+# is merged, and asserts it closed at least one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "how many to propose (2-5)"
+        default: "4"
+  schedule:
+    # Weekly, and it does nothing at all unless the plan is finished and
+    # nothing is already open. The night could call it, but a decision put in
+    # front of somebody at 02:17 every night is a decision they learn to
+    # ignore.
+    - cron: "23 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: directions
+  cancel-in-progress: false
+
+env:
+  GOEDEL_INFERENCE_KEY: ${{ secrets.GOEDEL_INFERENCE_KEY }}
+  GOEDEL_INFERENCE_URL: ${{ vars.GOEDEL_INFERENCE_URL }}
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: loop/main
+          fetch-depth: 0
+
+      - id: cfg
+        uses: ./.github/actions/config
+        with: { command: load }
+
+      - id: phase
+        continue-on-error: true
+        uses: ./.github/actions/blueprint
+        with:
+          command: phase
+          config: ${{ steps.cfg.outputs.json }}
+          criteria-out: blueprint-criteria.txt
+
+      - id: gate
+        name: Only when the plan is done and nothing is already open
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DONE: ${{ steps.phase.outputs.done }}
+        run: |
+          set -euo pipefail
+          if [ "$DONE" != "yes" ]; then
+            echo "  the plan is not finished; there is nothing to propose past it"
+            echo "go=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          open=$(gh pr list --label direction --state open --json number --jq length)
+          if [ "$open" != "0" ]; then
+            echo "  $open direction(s) already waiting on a decision; proposing nothing"
+            echo "  Merge one, or close them all to be asked again."
+            echo "go=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "go=yes" >> "$GITHUB_OUTPUT"
+
+      # What is still wrong with the project goes into the card as CONTEXT --
+      # it is being fixed on its own and is explicitly not a direction. A
+      # proposal that amounted to "fix the bugs" would be asking for a decision
+      # about work that is already happening.
+      - id: survey
+        if: steps.gate.outputs.go == 'yes'
+        uses: ./.github/actions/survey
+        with:
+          command: scan
+          config: ${{ steps.cfg.outputs.json }}
+          out: survey.txt
+
+      - if: steps.gate.outputs.go == 'yes'
+        uses: ./.github/actions/directions
+        with:
+          command: card
+          config: ${{ steps.cfg.outputs.json }}
+          count: ${{ inputs.count || '4' }}
+          survey: survey.txt
+          card-out: directions-card.txt
+          system-out: directions-system.txt
+
+      - id: ask
+        if: steps.gate.outputs.go == 'yes'
+        uses: ./.github/actions/draft
+        with:
+          command: ask
+          config: ${{ steps.cfg.outputs.json }}
+          system: directions-system.txt
+          user: directions-card.txt
+          out: directions-reply.txt
+
+      - id: admit
+        if: steps.gate.outputs.go == 'yes'
+        uses: ./.github/actions/directions
+        with:
+          command: admit
+          config: ${{ steps.cfg.outputs.json }}
+          reply: directions-reply.txt
+          out-dir: directions
+
+      # Each direction is a branch off the DEFAULT branch carrying one file:
+      # the replacement plan. Off the default branch rather than off loop/main
+      # so that merging it is an ordinary merge with no ledger history in it --
+      # what changes is what the machine is aiming at, and nothing else.
+      - name: One branch and one pull request each
+        if: steps.admit.outputs.count != '0' && steps.admit.outputs.count != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUGS: ${{ steps.admit.outputs.slugs }}
+          NAME: ${{ steps.cfg.outputs.name }}
+          BLUEPRINT: ${{ steps.cfg.outputs.blueprint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          default=$(git remote show origin | sed -n 's/.*HEAD branch: //p')
+          git fetch origin "$default"
+          opened=0
+          for s in $SLUGS; do
+            title=$(cat "directions/$s/title.txt")
+            git checkout -qf -B "direction/$s" "origin/$default"
+            mkdir -p "$(dirname "$BLUEPRINT")"
+            cp "directions/$s/blueprint.txt" "$BLUEPRINT"
+            git add "$BLUEPRINT"
+            git commit -q -m "direction: $title"
+            git push -q -f origin "direction/$s"
+            gh pr create --head "direction/$s" --base "$default" \
+              --label direction \
+              --title "direction: $title" \
+              --body-file "directions/$s/body.md"
+            opened=$((opened + 1))
+            echo "  #$opened  $title"
+          done
+          echo "  $opened direction(s) waiting on a decision."
+          echo "  Merging one closes the rest. Until then the project is maintained."
+
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: directions-${{ github.run_id }}
+          path: |
+            directions
+            directions-reply.txt
+            survey.txt
+          if-no-files-found: ignore
+          retention-days: 90

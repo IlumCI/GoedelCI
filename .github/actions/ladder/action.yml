@@ -72,6 +72,14 @@ inputs:
       wandering into work the plan did not ask for.
     required: false
     default: ""
+  survey:
+    description: >-
+      what `survey` found, used when no phase criteria are open. A finished
+      plan is not a finished project: the first version of everything is full
+      of the stub put in to get a test passing, the error caught and dropped,
+      and the input nothing validates. Those are what a loop does next.
+    required: false
+    default: ""
   card-out:
     description: "for card: where to write the question"
     required: false
@@ -121,6 +129,7 @@ runs:
         EMIT_ENV: ${{ inputs.emit-env }}
         REPLY: ${{ inputs.reply }}
         CRITERIA: ${{ inputs.criteria }}
+        SURVEY: ${{ inputs.survey }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
       run: |
@@ -311,6 +320,9 @@ runs:
             return False
 
         def admit(fields, cfg, root, rungs, goal, criteria=()):
+            """`criteria` empty means maintenance: the witness is free, because
+            there is no phase left for it to complete. It is still refused if
+            it is missing or is a dash, which is the check that matters."""
             kinds = cfg["kinds"]
             kind = fields["kind"]
             if kind not in kinds or not kinds[kind]["enabled"]:
@@ -370,7 +382,8 @@ runs:
                 raise LadderError("this exact milestone is already on the ladder")
             return rung
 
-        def card(cfg, root, rungs, entries, goal_body, balk_limit, goal, criteria=()):
+        def card(cfg, root, rungs, entries, goal_body, balk_limit, goal, criteria=(),
+                 survey=""):
             kinds = ["  %s (%s, judged by %s)" % (k, v["verb"], v["j1"])
                      for k, v in sorted(cfg["kinds"].items()) if v["enabled"]]
             done, gone = [], []
@@ -396,6 +409,24 @@ runs:
                     "THE PHASE BEING BUILT RIGHT NOW. Your milestone's witness must be "
                     "ONE of these sentences, copied word for word:\n"
                     + "\n".join("  " + c for c in criteria))
+            elif survey.strip():
+                # **The plan is finished and the project is not.** Nothing is
+                # owed to a phase any more, so the witness is free -- but it is
+                # still a witness, and it should come from something actually
+                # observed in the tree rather than from an idea about it.
+                parts.append(
+                    "THE PLAN IS FINISHED. Every phase of the blueprint is met, so there "
+                    "is no criterion to satisfy and the work now is keeping this thing "
+                    "correct: replacing what is still standing in for the real "
+                    "implementation, closing what is unsafe, reporting failures that are "
+                    "currently discarded, and testing what nothing tests.\n\n"
+                    "Here is what was found in the tree. Take ONE of these, and make its "
+                    "`a test would show` line your witness -- it is already written as "
+                    "something observable:\n\n" + survey.strip()
+                    + "\n\nPrefer the unsafe findings, then the swallowed failures, then "
+                      "the stubs. Do not propose work that is not on this list: a "
+                      "milestone nothing observed is a guess about a codebase you are "
+                      "seeing one file of.")
             parts += [
                      "THE KINDS OF MILESTONE AVAILABLE\n" + "\n".join(kinds),
                      "THE PATHS YOU MAY AIM AT\n" + "\n".join("  " + m for m in cfg["allow"])]
@@ -548,6 +579,30 @@ runs:
                 claim("the card puts the open criteria first", "word for word" in c)
                 claim("and lists them", OPEN[1] in c)
 
+                SURVEY = ("[unsafe] src/a.py:4\n    run(x, shell=True)\n"
+                          "    a test would show: a value containing shell "
+                          "metacharacters is handled literally\n")
+                m = card(CFG, root, [], [], "a goal", 3, G, (), SURVEY)
+                claim("with no criteria open the card turns to maintenance",
+                      "THE PLAN IS FINISHED" in m)
+                claim("and carries what was actually found in the tree",
+                      "shell=True" in m)
+                claim("and tells it to take a witness from the findings",
+                      "a test would show" in m)
+                claim("and not to invent work that was not observed",
+                      "not on this list" in m)
+                claim("a maintenance milestone's witness is free of any phase",
+                      admit({"kind": "feature", "target": "src/new.py", "title": "t",
+                             "witness": "a value with a semicolon in it is not executed"},
+                            CFG, root, [], G, ())["witness"].startswith("a value"))
+                raises("but a maintenance milestone still needs one",
+                       lambda: admit({"kind": "feature", "target": "src/new.py",
+                                      "title": "t", "witness": "-"},
+                                     CFG, root, [], G, ()))
+                with_survey = card(CFG, root, [], [], "a goal", 3, G, OPEN, SURVEY)
+                claim("an open phase still wins over the survey",
+                      "THE PLAN IS FINISHED" not in with_survey)
+
                 claim("and one inside them is admitted",
                       admit({"kind": "feature", "target": "src/new.py", "title": "t",
                              "witness": "w"}, NARROW, root, [], G)["kind"] == "feature")
@@ -607,6 +662,10 @@ runs:
         if cpath and Path(cpath).is_file():
             criteria = tuple(l.strip() for l in
                              Path(cpath).read_text(encoding="utf-8").splitlines() if l.strip())
+        survey = ""
+        spath = os.environ.get("SURVEY", "").strip()
+        if spath and Path(spath).is_file():
+            survey = Path(spath).read_text(encoding="utf-8")
         try:
             body = goal_text(root, cfg)
             if not body:
@@ -671,7 +730,7 @@ runs:
                     out("have", "yes"); out("point", openr["point"]); out("why", "already open")
                     sys.exit(0)
                 Path(os.environ["CARD_OUT"]).write_text(
-                    card(cfg, root, rungs, entries, body, limit, goal, criteria),
+                    card(cfg, root, rungs, entries, body, limit, goal, criteria, survey),
                     encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
                 print("  asked for the next milestone")

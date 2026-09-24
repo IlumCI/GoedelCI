@@ -1,0 +1,376 @@
+name: goedel-directions
+description: >-
+  When the plan is finished, propose where this could go next -- two to five
+  of them, each a complete replacement plan, each its own pull request for you
+  to pick between.
+
+# **The one decision that is left.**
+#
+# Everything else here was arranged so that nobody has to be in the loop. This
+# is the exception, deliberately: what a thing should BECOME is not a question
+# the judge can answer. The judge knows whether a change made the project worse
+# against a fixed standard; it has no opinion about which standard it ought to
+# have been measured against, and a loop that picks its own next objective is
+# one whose record stops meaning anything -- every verdict would be relative to
+# a goal the machine chose because it was reachable.
+#
+# So when the blueprint completes, the machine does not choose. It writes two
+# to five complete alternatives, opens each as a pull request whose body
+# explains what that direction is and what it gives up, and waits. Merging one
+# is the whole of your involvement.
+#
+# **Each direction is a whole plan, not a suggestion.** A pull request that
+# said "we could add billing" would leave the real work -- deciding what that
+# means and in what order -- for later and for nobody. So a direction carries
+# a replacement `loop/blueprint.txt`, already through `blueprint`'s admission:
+# phases numbered, criteria observable, nothing that cannot be tested. Merging
+# it is enough for the next night to start building it.
+#
+# **Meanwhile the project is maintained.** Nights carry on against the survey
+# -- stubs, swallowed failures, unsafe patterns, untested modules -- so an
+# undecided repository is a maintained one rather than a stalled one. There is
+# no deadline on you, and nothing degrades while you think.
+
+inputs:
+  command:
+    description: "card | admit | selftest"
+    required: true
+  root:
+    description: "the tree"
+    required: false
+    default: "."
+  config:
+    description: "the validated goedel.toml JSON"
+    required: false
+    default: ""
+  count:
+    description: "how many to ask for"
+    required: false
+    default: "4"
+  survey:
+    description: "for card: what the tree still has wrong with it"
+    required: false
+    default: ""
+  reply:
+    description: "for admit: the file `draft ask` wrote"
+    required: false
+    default: reply.txt
+  out-dir:
+    description: "for admit: where to write one directory per direction"
+    required: false
+    default: directions
+  card-out:
+    required: false
+    default: directions-card.txt
+  system-out:
+    required: false
+    default: directions-system.txt
+
+outputs:
+  count:
+    description: "how many directions were admitted"
+    value: ${{ steps.run.outputs.count }}
+  slugs:
+    description: "their branch-safe names, space separated"
+    value: ${{ steps.run.outputs.slugs }}
+  why:
+    description: "one line for the log"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        CONFIG: ${{ inputs.config }}
+        COUNT: ${{ inputs.count }}
+        SURVEY: ${{ inputs.survey }}
+        REPLY: ${{ inputs.reply }}
+        OUT_DIR: ${{ inputs.out-dir }}
+        CARD_OUT: ${{ inputs.card-out }}
+        SYSTEM_OUT: ${{ inputs.system-out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import json, os, re, sys, textwrap
+        from pathlib import Path
+
+        FENCE = re.compile(r"<<<DIRECTION>>>\s*(.*?)\s*<<<END>>>", re.S)
+        HEAD = ("title", "because", "gives up")
+        BP_OPEN, BP_CLOSE = "[blueprint] v1", "[end]"
+
+        MIN, MAX = 2, 5
+
+        class DirectionError(Exception): pass
+
+        def out(k, v):
+            v = str(v).replace("\r", " ").replace("\n", " ")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def slug(title):
+            s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            return (s[:40].rstrip("-") or "direction")
+
+        def split(text):
+            """One direction: a head, then the blueprint it would replace with."""
+            if BP_OPEN not in text:
+                raise DirectionError("a direction carries a whole replacement plan, "
+                                     "and this one has no %s" % BP_OPEN)
+            head_text, _, bp = text.partition(BP_OPEN)
+            head = {}
+            for line in head_text.splitlines():
+                if not line.strip():
+                    continue
+                k, sep, v = line.partition(":")
+                k = k.strip().lower()
+                if not sep or k not in HEAD:
+                    raise DirectionError("%r is not one of: %s"
+                                         % (line.strip()[:60], ", ".join(HEAD)))
+                if k in head:
+                    raise DirectionError("%s twice" % k)
+                head[k] = v.strip()
+            missing = [k for k in HEAD if not head.get(k)]
+            if missing:
+                raise DirectionError("the direction says nothing under: "
+                                     + ", ".join(missing))
+            if len(head["because"].split()) < 6:
+                raise DirectionError(
+                    "%r is not a reason. This is the one thing a person reads before "
+                    "committing a project to a new direction." % head["because"])
+            return head, BP_OPEN + bp
+
+        def parse(reply):
+            found = FENCE.findall(reply)
+            if not found:
+                raise DirectionError("the reply carries no fenced direction")
+            if len(found) < MIN:
+                raise DirectionError(
+                    "only %d direction. A single option is not a choice, and this is the "
+                    "one place the machine is asking somebody to make one." % len(found))
+            if len(found) > MAX:
+                raise DirectionError(
+                    "%d directions. More than %d is a list to be skimmed rather than a "
+                    "decision to be made." % (len(found), MAX))
+            out_ = []
+            seen = set()
+            for block in found:
+                head, bp = split(block)
+                s = slug(head["title"])
+                if s in seen:
+                    raise DirectionError("two directions called %r" % head["title"])
+                seen.add(s)
+                out_.append((s, head, bp))
+            return out_
+
+        # -- the question -------------------------------------------------
+
+        SYSTEM = textwrap.dedent("""\
+            A project has finished everything its plan asked for and still works. You
+            propose where it could go next. A person will read what you write and
+            merge exactly one of them; that is the only decision they make about this
+            project, so make the options genuinely different from each other.
+
+            Answer with between two and five fenced blocks and nothing else. Each one:
+
+            <<<DIRECTION>>>
+            title: <a few words, what this direction is>
+            because: <one or two sentences. Why this is worth doing NOW, given what
+                      the thing already is. This is what they read before deciding.>
+            gives up: <what choosing this costs or forecloses. Every direction costs
+                       something; one that claims not to is not being honest about
+                       itself.>
+            [blueprint] v1
+            name <the project, possibly renamed if the direction warrants it>
+            stack <the stack after this direction, one line>
+            verify <ONE shell command that exits 0 when the built thing works>
+            summary <one line: what it does once this direction is finished>
+            [phase] 1 <title>
+              done <something that can be OBSERVED when this phase is finished>
+              done <another>
+            [phase] 2 <title>
+              done <...>
+            [end]
+            <<<END>>>
+
+            Rules that are checked mechanically and will refuse your answer:
+            - Each direction carries a WHOLE replacement plan, already buildable. A
+              direction that only names an idea leaves the real work -- deciding what
+              it means and in what order -- for later and for nobody.
+            - Every `done` is an OBSERVATION, not a judgement. "the export endpoint
+              returns a file the importer accepts" is a criterion; "it scales well"
+              is refused outright.
+            - Phase 1 of each plan must be buildable from the project AS IT IS NOW.
+              You are not starting again.
+            - Make them different. Two directions that differ only in emphasis waste
+              the one decision anybody is being asked for. Deepening what exists,
+              widening to a neighbouring use, and changing who it is for are three
+              genuinely different answers; three flavours of "add more features" are
+              one.
+            - `gives up` must be real. If a direction forecloses another, say so.
+            - Do not propose work that depends on facts you do not have -- a market,
+              a user count, a competitor, a deadline. You have the code and the plan
+              it came from, and nothing else.
+            """)
+
+        def card(name, brief, blueprint, survey, count):
+            parts = ["THE PROJECT\n" + name]
+            if brief:
+                parts.append("WHAT IT WAS FOR\n" + brief.strip())
+            parts.append("THE PLAN IT HAS NOW FINISHED\n" + blueprint.strip())
+            if survey.strip():
+                parts.append(
+                    "WHAT IS STILL WRONG WITH IT\nThis is being fixed on its own, night "
+                    "by night, and is NOT a direction. It is here so you know what "
+                    "state the thing is actually in:\n\n" + survey.strip())
+            parts.append(
+                "ASK FOR %d\nPropose %d genuinely different directions. Somebody will "
+                "merge one of them and the others will close." % (count, count))
+            return "\n\n".join(parts)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            import tempfile
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except DirectionError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            def one(title="Go deeper on search", because="the thing people do most is "
+                    "search and it is the weakest part", gives="no mobile client"):
+                return textwrap.dedent("""\
+                    <<<DIRECTION>>>
+                    title: %s
+                    because: %s
+                    gives up: %s
+                    [blueprint] v1
+                    name thing
+                    stack python, sqlite
+                    verify bash scripts/verify.sh
+                    summary it does the thing
+                    [phase] 1 first
+                      done querying for a known term returns the document containing it
+                      done querying for an absent term returns an empty result
+                    [end]
+                    <<<END>>>""") % (title, because, gives)
+
+            two = one() + "\n" + one(title="Open it to other teams")
+            got = parse(two)
+            claim("two directions parse", len(got) == 2)
+            claim("each carries a whole replacement plan", BP_OPEN in got[0][2])
+            claim("and a reason somebody can read", "weakest part" in got[0][1]["because"])
+            claim("and what it costs", got[0][1]["gives up"] == "no mobile client")
+            claim("titles become branch-safe names", got[1][0] == "open-it-to-other-teams")
+
+            raises("one direction is not a choice", lambda: parse(one()))
+            raises("six is a list to skim rather than a decision",
+                   lambda: parse("\n".join(one(title="T%d" % i) for i in range(6))))
+            raises("a reply with no fence is refused",
+                   lambda: parse("I would suggest a few things."))
+            raises("two directions with the same title are refused",
+                   lambda: parse(one() + "\n" + one()))
+            raises("a direction with no replacement plan is refused",
+                   lambda: parse(two.replace("[blueprint] v1", "maybe later", 1)))
+            raises("a direction with no reason is refused",
+                   lambda: parse(two.replace(
+                       "because: the thing people do most is search and it is the "
+                       "weakest part", "because:", 1)))
+            raises("a one-word reason is refused",
+                   lambda: parse(two.replace(
+                       "because: the thing people do most is search and it is the "
+                       "weakest part", "because: growth", 1)))
+            raises("a direction with no cost is refused",
+                   lambda: parse(two.replace("gives up: no mobile client", "gives up:", 1)))
+            raises("a head field nothing knows is refused",
+                   lambda: parse(two.replace("title:", "vibes:", 1)))
+
+            claim("a title with punctuation still makes a branch name",
+                  slug("Go *deeper* on search!!") == "go-deeper-on-search")
+            claim("and an empty one does not make an empty branch", slug("!!!") == "direction")
+
+            c = card("thing", "it was for X", "[blueprint] v1\nname thing\n[end]",
+                     "[unsafe] src/a.py:4", 4)
+            claim("the card carries what the project was for", "it was for X" in c)
+            claim("and the plan it finished", "[blueprint] v1" in c)
+            claim("and says the survey is not a direction", "NOT a direction" in c)
+            claim("and asks for the number it was told to", "ASK FOR 4" in c)
+            claim("the rules tell it each plan starts from the project as it is",
+                  "not starting again" in SYSTEM)
+            claim("and to make them genuinely different", "genuinely different" in SYSTEM)
+            claim("and not to invent facts about the world",
+                  "facts you do not have" in SYSTEM)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+
+        root = Path(os.environ.get("ROOT", ".") or ".")
+        cfg = {}
+        if os.environ.get("CONFIG"):
+            cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+        count = max(MIN, min(MAX, int(os.environ.get("COUNT", "4") or "4")))
+
+        try:
+            if cmd == "card":
+                bp = root / cfg.get("blueprint", "loop/blueprint.txt")
+                if not bp.is_file():
+                    raise DirectionError("no plan at %s, so there is nothing finished" % bp)
+                brief = root / "loop/brief.md"
+                survey = ""
+                sp = os.environ.get("SURVEY", "").strip()
+                if sp and Path(sp).is_file():
+                    survey = Path(sp).read_text(encoding="utf-8")
+                Path(os.environ["CARD_OUT"]).write_text(
+                    card(cfg.get("name", root.name),
+                         brief.read_text(encoding="utf-8") if brief.is_file() else "",
+                         bp.read_text(encoding="utf-8"), survey, count),
+                    encoding="utf-8")
+                Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                print("  asked for %d direction(s)" % count)
+                out("count", "0"); out("slugs", ""); out("why", "a question was written")
+            elif cmd == "admit":
+                got = parse(Path(os.environ["REPLY"]).read_text(encoding="utf-8"))
+                d = Path(os.environ["OUT_DIR"])
+                d.mkdir(parents=True, exist_ok=True)
+                for s, head, bp in got:
+                    sub = d / s
+                    sub.mkdir(exist_ok=True)
+                    (sub / "blueprint.txt").write_text(bp.rstrip("\n") + "\n",
+                                                       encoding="utf-8")
+                    (sub / "title.txt").write_text(head["title"] + "\n", encoding="utf-8")
+                    (sub / "body.md").write_text(
+                        "## %s\n\n%s\n\n**What this gives up.** %s\n\n"
+                        "Merging this replaces `loop/blueprint.txt` with the plan below, "
+                        "and the next night starts building it. The other directions "
+                        "close automatically.\n\n<details><summary>The plan</summary>\n\n"
+                        "```\n%s\n```\n\n</details>\n"
+                        % (head["title"], head["because"], head["gives up"], bp.strip()),
+                        encoding="utf-8")
+                print("  %d direction(s):" % len(got))
+                for s, head, _ in got:
+                    print("    %-40s %s" % (s, head["title"]))
+                out("count", str(len(got)))
+                out("slugs", " ".join(s for s, _, _ in got))
+                out("why", "%d direction(s) written to %s" % (len(got), d))
+            else:
+                raise DirectionError("no such command: %r" % cmd)
+        except DirectionError as exc:
+            print("::notice::directions %s: %s" % (cmd, exc))
+            out("count", "0"); out("slugs", ""); out("why", str(exc)[:300])
+            sys.exit(1)
+        PYEOF
