@@ -1,0 +1,536 @@
+name: goedel-envelope
+description: >-
+  The proposal: a declaration and a patch, admitted before anything runs it,
+  and derived into a candidate tree by git plumbing that never touches the
+  worktree.
+
+# An envelope is the unit of work this machine trades in. It is a whole file
+# with a digest -- its `point` -- and that digest is what the ledger's tried
+# marker is named for, what the certificate carries, and what makes "this is
+# the proposal that was judged" a checkable claim rather than a story:
+#
+#     [envelope] v2
+#     kind repair
+#     verb edit
+#     target src/cache.py
+#     lane model
+#     ...
+#     [witness]
+#     <a unified diff that must FAIL on the parent>
+#     [patch]
+#     <a unified diff that must make it pass>
+#     [end]
+#
+# **Two patches, not one, and that is the three-tree shape.** A bugfix with one
+# patch is a diff with a story attached. With the witness separated out, the
+# judge can build three trees -- parent, parent+witness, parent+witness+fix --
+# and record that the witness failed on the second and passed on the third.
+# That is what makes a certificate a certificate.
+#
+# **Admission is a refusal machine and runs before a runner is spent.** Every
+# check here is cheap and every one of them has to pass. In particular the path
+# masks are checked against EVERY file the diff touches, not against the
+# declared `target`: a patch that names `src/a.py` in its header and edits
+# `.github/workflows/ci.yml` in a hunk is exactly the shape of the mistake the
+# masks exist to stop, and checking the declaration rather than the diff would
+# not see it.
+#
+# **`derive` uses a temporary index and never the worktree.** `git apply
+# --cached` against `GIT_INDEX_FILE` produces a tree without any file on disk
+# changing, so there is no deleted-file or stale-file class of mistake to make
+# and the judge's checkout stays the baseline's until it deliberately becomes
+# the candidate.
+
+inputs:
+  command:
+    description: "point | admit | derive | show | selftest"
+    required: true
+  file:
+    description: "the envelope"
+    required: false
+    default: ""
+  parent:
+    description: "for derive/admit: the git tree the patch applies to"
+    required: false
+    default: ""
+  witness-only:
+    description: "for derive: apply the witness patch and not the fix"
+    required: false
+    default: "false"
+  config:
+    description: "the validated goedel.toml JSON, for the masks and the budgets"
+    required: false
+    default: ""
+
+outputs:
+  point:
+    description: "sha256 of the whole envelope"
+    value: ${{ steps.run.outputs.point }}
+  tree:
+    description: "for derive: the tree the patch produces"
+    value: ${{ steps.run.outputs.tree }}
+  kind:
+    description: "the kind the envelope declares"
+    value: ${{ steps.run.outputs.kind }}
+  target:
+    description: "the path it declares it is about"
+    value: ${{ steps.run.outputs.target }}
+  files:
+    description: "how many files the patch touches"
+    value: ${{ steps.run.outputs.files }}
+  lines:
+    description: "how many lines it adds and removes"
+    value: ${{ steps.run.outputs.lines }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        FILE: ${{ inputs.file }}
+        PARENT: ${{ inputs.parent }}
+        WITNESS_ONLY: ${{ inputs.witness-only }}
+        CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import fnmatch, hashlib, json, os, re, subprocess, sys, tempfile
+        from pathlib import Path
+
+        HEADER = "[envelope] v2"
+        WITNESS, PATCH, END = "[witness]", "[patch]", "[end]"
+        KEYS = ("kind", "verb", "target", "lane", "axis", "rung", "corpus",
+                "parent-tree", "operator", "lineage", "seed", "witness", "title")
+        REQUIRED = ("kind", "verb", "target", "lane", "rung", "parent-tree")
+
+        class EnvelopeError(Exception): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def parse(text):
+            """Header fields, then an optional witness diff, then the patch."""
+            lines = text.split("\n")
+            if not lines or lines[0].strip() != HEADER:
+                raise EnvelopeError("an envelope opens with %r" % HEADER)
+            fields, witness, patch = {}, [], []
+            where = "head"
+            for n, line in enumerate(lines[1:], 2):
+                stripped = line.strip()
+                if stripped == WITNESS:
+                    if where != "head":
+                        raise EnvelopeError("line %d: the witness section comes first" % n)
+                    where = "witness"; continue
+                if stripped == PATCH:
+                    if where == "patch":
+                        raise EnvelopeError("line %d: two patch sections is two proposals" % n)
+                    where = "patch"; continue
+                if stripped == END:
+                    where = "done"; continue
+                if where == "head":
+                    if not stripped:
+                        continue
+                    k, _, v = line.partition(" ")
+                    if k not in KEYS:
+                        raise EnvelopeError("line %d: %r is not an envelope field" % (n, k))
+                    if k in fields:
+                        raise EnvelopeError("line %d: %s again; the last of a pair is a guess"
+                                            % (n, k))
+                    fields[k] = v
+                elif where == "witness":
+                    witness.append(line)
+                elif where == "patch":
+                    patch.append(line)
+                elif stripped:
+                    raise EnvelopeError("line %d: content after [end]" % n)
+            if where != "done":
+                raise EnvelopeError(
+                    "an envelope closes with %r; without it a truncated transfer reads as a "
+                    "shorter patch, which applies cleanly and is not the proposal" % END)
+            missing = [k for k in REQUIRED if k not in fields]
+            if missing:
+                raise EnvelopeError("the envelope declares no " + ", ".join(missing))
+            if not "".join(patch).strip():
+                raise EnvelopeError("an envelope with no patch proposes nothing")
+            return fields, "\n".join(witness).strip("\n"), "\n".join(patch).strip("\n")
+
+        def point(text):
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        # -- what a diff touches ----------------------------------------
+
+        DIFF_GIT = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+        NEW_OLD = re.compile(r"^(?:\+\+\+|---) (?:[ab]/)?(.+?)(?:\t.*)?$")
+
+        def touched(diff):
+            """Every path a unified diff writes to, and its line budget."""
+            paths, added, removed = [], 0, 0
+            binary = False
+            for line in diff.split("\n"):
+                m = DIFF_GIT.match(line)
+                if m:
+                    for p in m.groups():
+                        if p not in paths and p != "/dev/null":
+                            paths.append(p)
+                    continue
+                if line.startswith("+++ ") or line.startswith("--- "):
+                    m = NEW_OLD.match(line)
+                    if m and m.group(1) != "/dev/null" and m.group(1) not in paths:
+                        paths.append(m.group(1))
+                    continue
+                if line.startswith("GIT binary patch") or line.startswith("Binary files"):
+                    binary = True
+                elif line.startswith("+"):
+                    added += 1
+                elif line.startswith("-"):
+                    removed += 1
+            return paths, added + removed, binary
+
+        def normalize(diff):
+            """Put back the mode lines a hand-written diff leaves out.
+
+            `git apply` decides a file is being CREATED from the `new file
+            mode` line, not from `--- /dev/null`. Without it, `-p1` strips the
+            leading slash off `/dev/null` and the apply dies on `dev/null:
+            does not exist in index` -- a message that reads like a broken
+            patch and is really a missing header. Diffs this machine writes
+            itself come from `git diff` and always carry it; diffs a model
+            writes very often do not, and refusing those would refuse most
+            correct proposals for a reason that has nothing to do with whether
+            they are correct.
+
+            Nothing here changes which paths or which lines the patch touches,
+            so admission's masks and budgets see exactly what applies.
+            """
+            lines = diff.split("\n")
+            out_lines, i = [], 0
+            while i < len(lines):
+                line = lines[i]
+                out_lines.append(line)
+                m = DIFF_GIT.match(line)
+                if not m:
+                    i += 1
+                    continue
+                head, j = [], i + 1
+                while j < len(lines) and not lines[j].startswith("@@"):
+                    head.append(lines[j]); j += 1
+                blob = "\n".join(head)
+                has_mode = any(h.startswith(("new file mode", "deleted file mode",
+                                             "old mode", "new mode", "similarity index"))
+                               for h in head)
+                if not has_mode:
+                    if any(h.startswith("--- /dev/null") for h in head):
+                        out_lines.append("new file mode 100644")
+                    elif any(h.startswith("+++ /dev/null") for h in head):
+                        out_lines.append("deleted file mode 100644")
+                out_lines.extend(head)
+                i = j
+            return "\n".join(out_lines)
+
+        def matches(path, masks):
+            if path.startswith("./"):
+                path = path[2:]
+            for m in masks:
+                if fnmatch.fnmatch(path, m):
+                    return True
+                if m.endswith("/**") and (path == m[:-3] or path.startswith(m[:-2])):
+                    return True
+            return False
+
+        # -- admission ---------------------------------------------------
+
+        def admit(text, cfg, parent=None):
+            fields, witness, patch = parse(text)
+            kinds = cfg.get("kinds", {})
+            kind = fields["kind"]
+            if kind not in kinds:
+                raise EnvelopeError("%r is not a kind this project has" % kind)
+            row = kinds[kind]
+            if not row["enabled"]:
+                raise EnvelopeError("the kind %r is disabled" % kind)
+            if fields["verb"] != row["verb"]:
+                raise EnvelopeError("kind %s is a %s, and this envelope declares %s"
+                                    % (kind, row["verb"], fields["verb"]))
+            if row["j1"] == "witness" and not witness.strip():
+                raise EnvelopeError(
+                    "kind %s is judged by fail-then-pass and the envelope carries no witness: "
+                    "a bugfix without one is a diff with a story" % kind)
+            if row["j1"] != "witness" and witness.strip():
+                raise EnvelopeError(
+                    "kind %s is not judged by a witness, so a witness section here would be "
+                    "run and never read" % kind)
+
+            allow, evaluator = cfg.get("allow", []), cfg.get("evaluator", [])
+            paths, lines, binary = touched(witness + "\n" + patch if witness else patch)
+            if binary:
+                raise EnvelopeError(
+                    "a binary patch is not reviewable and not derivable from the text this "
+                    "record keeps")
+            if not paths:
+                raise EnvelopeError("the patch names no file")
+            for p in paths:
+                if matches(p, evaluator):
+                    raise EnvelopeError(
+                        "%s is the evaluator: the machine does not get to edit what judges it "
+                        "outside the boundary lane" % p)
+                if not matches(p, allow):
+                    raise EnvelopeError("%s is outside every allow mask" % p)
+                if ".." in Path(p).parts or Path(p).is_absolute():
+                    raise EnvelopeError("%s escapes the tree" % p)
+            if fields["target"] not in paths:
+                raise EnvelopeError(
+                    "the envelope declares it is about %s and the patch does not touch it"
+                    % fields["target"])
+            if len(paths) > row["diff_files"]:
+                raise EnvelopeError("%d files, and this kind's budget is %d"
+                                    % (len(paths), row["diff_files"]))
+            if lines > row["diff_lines"]:
+                raise EnvelopeError("%d changed lines, and this kind's budget is %d"
+                                    % (lines, row["diff_lines"]))
+            if parent and fields["parent-tree"] != parent:
+                raise EnvelopeError(
+                    "the envelope was written against %s and the tree here is %s"
+                    % (fields["parent-tree"][:12], parent[:12]))
+            return fields, witness, patch, paths, lines
+
+        # -- derivation --------------------------------------------------
+
+        def git(*args, **kw):
+            r = subprocess.run(["git"] + list(args), capture_output=True, text=True, **kw)
+            if r.returncode:
+                raise EnvelopeError("git %s: %s" % (" ".join(args), (r.stderr or r.stdout).strip()))
+            return r.stdout.strip()
+
+        def derive(text, parent, witness_only=False, cwd=None):
+            """apply(parent, patch) as a tree, through a temporary index.
+
+            Nothing on disk changes. `git apply --cached` needs the blobs the
+            patch's context refers to, which a `read-tree` of the parent puts
+            in the index, so the whole operation is index-only.
+            """
+            fields, witness, patch = parse(text)
+            diff = witness if witness_only else ("\n".join(x for x in (witness, patch) if x))
+            if not diff.strip():
+                raise EnvelopeError("nothing to apply")
+            env = dict(os.environ)
+            with tempfile.TemporaryDirectory() as td:
+                env["GIT_INDEX_FILE"] = os.path.join(td, "index")
+                p = Path(td) / "d.patch"
+                p.write_text(normalize(diff) + "\n", encoding="utf-8")
+                def g(*a):
+                    r = subprocess.run(["git"] + list(a), capture_output=True, text=True,
+                                       env=env, cwd=cwd)
+                    if r.returncode:
+                        raise EnvelopeError("git %s: %s"
+                                            % (" ".join(a), (r.stderr or r.stdout).strip()))
+                    return r.stdout.strip()
+                g("read-tree", parent)
+                g("apply", "--cached", "--whitespace=nowarn", str(p))
+                return g("write-tree")
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s)
+                    if detail: print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except EnvelopeError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            CFG = {"allow": ["src/**"], "evaluator": [".github/**", "goedel.toml"],
+                   "kinds": {"repair": {"verb": "edit", "j1": "witness", "enabled": True,
+                                        "diff_files": 10, "diff_lines": 400},
+                             "feature": {"verb": "create", "j1": "claims", "enabled": True,
+                                         "diff_files": 2, "diff_lines": 20}}}
+
+            def env(kind="feature", verb="create", target="src/new.py", patch=None,
+                    witness=None, extra=""):
+                patch = patch if patch is not None else (
+                    "diff --git a/src/new.py b/src/new.py\n"
+                    "--- /dev/null\n+++ b/src/new.py\n@@ -0,0 +1,2 @@\n+one\n+two\n")
+                body = [HEADER, "kind " + kind, "verb " + verb, "target " + target,
+                        "lane model", "axis grid", "rung 1", "corpus 0123abcd",
+                        "parent-tree " + "c"*40, "operator clonal", "lineage root",
+                        "seed 0", "witness -", "title a title"]
+                if extra:
+                    body.append(extra)
+                if witness:
+                    body += [WITNESS, witness.rstrip("\n")]
+                body += [PATCH, patch.rstrip("\n"), END, ""]
+                return "\n".join(body)
+
+            create = ("diff --git a/src/n.py b/src/n.py\n--- /dev/null\n+++ b/src/n.py\n"
+                      "@@ -0,0 +1 @@\n+x\n")
+            claim("a creation diff with no mode line gets one, or the apply dies on dev/null",
+                  "new file mode 100644" in normalize(create))
+            claim("a deletion diff gets its mode line too",
+                  "deleted file mode 100644" in normalize(
+                      "diff --git a/src/n.py b/src/n.py\n--- a/src/n.py\n+++ /dev/null\n"
+                      "@@ -1 +0,0 @@\n-x\n"))
+            claim("a diff that already carries one is left alone",
+                  normalize(create.replace("--- /dev/null", "new file mode 100644\n--- /dev/null"))
+                  .count("new file mode") == 1)
+            claim("normalising changes neither the paths nor the line count",
+                  touched(normalize(create))[:2] == touched(create)[:2])
+
+            text = env()
+            f, w, p = parse(text)
+            claim("an envelope parses into fields and a patch", f["kind"] == "feature" and p)
+            claim("its point is the digest of the whole file",
+                  point(text) == hashlib.sha256(text.encode()).hexdigest())
+            claim("a byte anywhere in it changes the point",
+                  point(text.replace("title a title", "title b title")) != point(text))
+
+            raises("an envelope with no [end] is refused, not read short",
+                   lambda: parse(text.replace("[end]\n", "")))
+            raises("an envelope with no header is refused", lambda: parse(text[10:]))
+            raises("an invented field is refused",
+                   lambda: parse(env(extra="vibes good")))
+            raises("a repeated field is refused",
+                   lambda: parse(env(extra="kind repair")))
+            raises("two patch sections is refused as two proposals",
+                   lambda: parse(text.replace("[end]", "[patch]\nx\n[end]")))
+            raises("an envelope with no patch proposes nothing",
+                   lambda: parse(env(patch="\n")))
+
+            claim("admission passes a well-formed proposal",
+                  admit(env(), CFG)[3] == ["src/new.py"])
+            raises("a patch touching the evaluator is refused",
+                   lambda: admit(env(target=".github/x.yml", patch=
+                       "diff --git a/.github/x.yml b/.github/x.yml\n--- a/.github/x.yml\n"
+                       "+++ b/.github/x.yml\n@@ -1 +1 @@\n-a\n+b\n"), CFG))
+            raises("a patch outside every allow mask is refused",
+                   lambda: admit(env(target="README.md", patch=
+                       "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+                       "@@ -1 +1 @@\n-a\n+b\n"), CFG))
+            raises("a patch whose hunks reach past the declared target is refused",
+                   lambda: admit(env(patch=
+                       "diff --git a/src/new.py b/src/new.py\n--- /dev/null\n+++ b/src/new.py\n"
+                       "@@ -0,0 +1 @@\n+x\n"
+                       "diff --git a/goedel.toml b/goedel.toml\n--- a/goedel.toml\n"
+                       "+++ b/goedel.toml\n@@ -1 +1 @@\n-a\n+b\n"), CFG))
+            raises("a declaration the patch does not touch is refused",
+                   lambda: admit(env(target="src/other.py"), CFG))
+            raises("a binary patch is refused",
+                   lambda: admit(env(patch=
+                       "diff --git a/src/a.bin b/src/a.bin\nGIT binary patch\nliteral 1\n"), CFG))
+            raises("a kind this project does not have is refused",
+                   lambda: admit(env(kind="mystery"), CFG))
+            raises("the wrong verb for a kind is refused",
+                   lambda: admit(env(kind="feature", verb="edit"), CFG))
+            raises("a witness kind with no witness is refused",
+                   lambda: admit(env(kind="repair", verb="edit", target="src/a.py", patch=
+                       "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+                       "@@ -1 +1 @@\n-a\n+b\n"), CFG))
+            raises("a non-witness kind carrying a witness is refused",
+                   lambda: admit(env(witness=
+                       "diff --git a/src/t.py b/src/t.py\n--- a/src/t.py\n+++ b/src/t.py\n"
+                       "@@ -1 +1 @@\n-a\n+b\n"), CFG))
+            big = ("diff --git a/src/new.py b/src/new.py\n--- /dev/null\n+++ b/src/new.py\n"
+                   "@@ -0,0 +1,50 @@\n" + "+line\n" * 50)
+            raises("a patch over the kind's line budget is refused",
+                   lambda: admit(env(patch=big), CFG))
+            raises("an envelope written against another parent is refused",
+                   lambda: admit(env(), CFG, parent="d"*40))
+            claim("and accepted against its own", bool(admit(env(), CFG, parent="c"*40)))
+
+            # -- derive, against a real repository -----------------------
+            with tempfile.TemporaryDirectory() as td:
+                r = Path(td)
+                def g(*a):
+                    return subprocess.run(["git"] + list(a), cwd=r, capture_output=True,
+                                          text=True, check=True).stdout.strip()
+                g("init", "-q", "-b", "main")
+                g("config", "user.email", "t@t"); g("config", "user.name", "t")
+                (r / "src").mkdir()
+                (r / "src/a.py").write_text("one\ntwo\n")
+                g("add", "-A"); g("commit", "-qm", "base")
+                parent = g("rev-parse", "HEAD^{tree}")
+                patch = ("diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n"
+                         "@@ -1,2 +1,2 @@\n one\n-two\n+three\n")
+                e = env(kind="feature", verb="create", target="src/a.py", patch=patch)
+                e = e.replace("parent-tree " + "c"*40, "parent-tree " + parent)
+                tree = derive(e, parent, cwd=r)
+                claim("derive produces a tree", len(tree) == 40 and tree != parent)
+                claim("deriving twice gives the same tree", derive(e, parent, cwd=r) == tree)
+                claim("and the worktree was never touched",
+                      (r / "src/a.py").read_text() == "one\ntwo\n")
+                claim("the derived tree holds what the patch says",
+                      g("cat-file", "-p", tree + ":src/a.py") == "one\nthree")
+
+                wit = ("diff --git a/src/t.py b/src/t.py\n--- /dev/null\n+++ b/src/t.py\n"
+                       "@@ -0,0 +1 @@\n+witness\n")
+                e2 = env(kind="repair", verb="edit", target="src/a.py",
+                         patch=patch, witness=wit)
+                e2 = e2.replace("parent-tree " + "c"*40, "parent-tree " + parent)
+                wtree = derive(e2, parent, witness_only=True, cwd=r)
+                ctree = derive(e2, parent, cwd=r)
+                claim("the witness arm is the parent plus the witness alone",
+                      g("cat-file", "-p", wtree + ":src/a.py") == "one\ntwo")
+                claim("and the candidate is the parent plus both",
+                      g("cat-file", "-p", ctree + ":src/a.py") == "one\nthree")
+                claim("the two arms are different trees", wtree != ctree)
+
+                bad = e.replace("+three", "+four")
+                raises("a patch whose context does not match the parent is refused",
+                       lambda: derive(
+                           env(kind="feature", verb="create", target="src/a.py", patch=
+                               "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n"
+                               "+++ b/src/a.py\n@@ -1,2 +1,2 @@\n nope\n-two\n+three\n"),
+                           parent, cwd=r))
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        try:
+            if cmd == "selftest":
+                sys.exit(selftest())
+            text = Path(os.environ["FILE"]).read_text(encoding="utf-8")
+            cfg = {}
+            if os.environ.get("CONFIG"):
+                cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+            if cmd == "point":
+                print(point(text))
+                out("point", point(text))
+            elif cmd == "show":
+                fields, w, p = parse(text)
+                for k in KEYS:
+                    if k in fields:
+                        print("%s %s" % (k, fields[k]))
+                print("  witness: %d line(s), patch: %d line(s)"
+                      % (len(w.splitlines()), len(p.splitlines())))
+                out("point", point(text))
+                out("kind", fields["kind"]); out("target", fields["target"])
+            elif cmd == "admit":
+                fields, w, p, paths, lines = admit(text, cfg, os.environ.get("PARENT") or None)
+                print("  admitted: %s %s, %d file(s), %d changed line(s)"
+                      % (fields["kind"], fields["target"], len(paths), lines))
+                for path in paths:
+                    print("    %s" % path)
+                out("point", point(text)); out("kind", fields["kind"])
+                out("target", fields["target"]); out("files", str(len(paths)))
+                out("lines", str(lines))
+            elif cmd == "derive":
+                parent = os.environ["PARENT"]
+                tree = derive(text, parent,
+                              os.environ.get("WITNESS_ONLY", "false") == "true")
+                print(tree)
+                out("tree", tree); out("point", point(text))
+            else:
+                raise EnvelopeError("no such command: %r" % cmd)
+        except EnvelopeError as exc:
+            print("::error::envelope %s: %s" % (cmd, exc))
+            sys.exit(1)
+        PYEOF

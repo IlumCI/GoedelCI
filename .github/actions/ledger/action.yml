@@ -1,0 +1,373 @@
+name: goedel-ledger
+description: >-
+  The append-only record of every trial, and the fsck that is the whole of the
+  trust in it.
+
+#     loop/ledger/entries/<name>.cert    one certificate, named by its digest
+#     loop/ledger/tried/<point>.env      the envelope a night committed to
+#     loop/ledger/anchors/<name>/        archived comparisons, for `boundary`
+#
+# `fsck` runs before the night reads the ledger and again after the night
+# writes it. Not because corruption is expected, but because the ledger is the
+# machine's memory, and a machine reasoning from a corrupted memory reaches
+# confident conclusions -- which is worse than halting, and looks the same from
+# outside until it is much worse.
+#
+# **This action does not know what a certificate field means.** It reads each
+# entry with a `key value` split and checks only the claims the DIRECTORY
+# makes: that a file is named by its own digest, that the sequence is a
+# permutation of 1..N, that lineage points backwards at something real, and
+# that epochs behave. Per-field validity is `cert`'s job and is delegated
+# there with `check-dir`, so the field table exists in exactly one place.
+#
+# **The epoch claims are the Red Queen ones.** A self-improving system whose
+# evaluator also changes has no fixed meaning for "better" unless the change is
+# confined to epoch boundaries (arXiv:2606.26294). That confinement is a
+# property of this directory, so it is checked here: entries in one epoch carry
+# one utility digest, epochs advance by exactly one, and only at a boundary.
+# Without those three, two certificates are two machines' opinions and
+# comparing them is a category error nothing downstream can detect.
+
+inputs:
+  command:
+    description: "fsck | tail | count | seq | report | selftest"
+    required: true
+  root:
+    description: "the tree the ledger lives in"
+    required: false
+    default: "."
+  epoch-len:
+    description: "how many entries an epoch holds"
+    required: false
+    default: "16"
+  n:
+    description: "for tail: how many entries"
+    required: false
+    default: "10"
+
+outputs:
+  count:
+    description: "how many entries the ledger holds"
+    value: ${{ steps.run.outputs.count }}
+  seq:
+    description: "the sequence number the next entry takes"
+    value: ${{ steps.run.outputs.seq }}
+  epoch:
+    description: "the epoch the next entry belongs to"
+    value: ${{ steps.run.outputs.epoch }}
+  boundary:
+    description: "yes when the ledger sits exactly at an epoch edge"
+    value: ${{ steps.run.outputs.boundary }}
+  tip:
+    description: "the name of the newest adopted entry, or `root`"
+    value: ${{ steps.run.outputs.tip }}
+
+runs:
+  using: composite
+  steps:
+    # Per-field validity first, and by the action that owns the field table.
+    # fsck below assumes every file parses; this is what makes that true.
+    - if: inputs.command == 'fsck'
+      uses: ./.github/actions/cert
+      with:
+        command: check-dir
+        dir: ${{ inputs.root }}/loop/ledger/entries
+
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        EPOCH_LEN: ${{ inputs.epoch-len }}
+        TAIL_N: ${{ inputs.n }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import hashlib, os, re, sys
+        from pathlib import Path
+
+        NAME16 = re.compile(r"\A[0-9a-f]{16}\Z")
+
+        class LedgerError(Exception): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def read(p):
+            """A certificate as a plain mapping. `cert check-dir` already said
+            it is one; this only needs the values."""
+            f = {}
+            for line in p.read_text(encoding="utf-8").splitlines():
+                k, _, v = line.partition(" ")
+                f[k] = v
+            return f
+
+        class Entry:
+            __slots__ = ("name", "path", "f")
+            def __init__(self, name, path, f):
+                self.name, self.path, self.f = name, path, f
+            def __getitem__(self, k):
+                try:
+                    return self.f[k]
+                except KeyError:
+                    raise LedgerError("%s.cert carries no %s" % (self.name, k)) from None
+            @property
+            def seq(self): return int(self["seq"])
+            @property
+            def epoch(self): return int(self["epoch"])
+            @property
+            def counted(self):
+                # A rollback or a supersession is something that happened TO
+                # the record, not an attempt the machine made. Scoring a
+                # lineage for surviving an operator's override would reward
+                # the wrong thing.
+                return self["verdict"] in ("adopt", "refuse", "stale")
+            @property
+            def adopted(self): return self["verdict"] == "adopt"
+
+        def entries_dir(root): return Path(root) / "loop/ledger/entries"
+
+        def load(root):
+            d = entries_dir(root)
+            if not d.is_dir():
+                return []
+            es = []
+            for p in sorted(d.iterdir()):
+                if p.name.startswith("."):
+                    continue
+                if p.suffix != ".cert" or not p.is_file():
+                    raise LedgerError("%s is under entries/ and is not a certificate" % p.name)
+                es.append(Entry(p.stem, p, read(p)))
+            es.sort(key=lambda e: e.seq)
+            return es
+
+        def count(root):
+            d = entries_dir(root)
+            return sum(1 for p in d.iterdir() if p.suffix == ".cert") if d.is_dir() else 0
+
+        def fsck(root, epoch_len):
+            es = load(root)
+
+            for e in es:
+                want = hashlib.sha256(e.path.read_bytes()).hexdigest()[:16]
+                if e.name != want:
+                    raise LedgerError(
+                        "%s.cert names itself %s and hashes to %s: somebody edited a "
+                        "certificate after it was filed" % (e.name, e.name, want))
+                if not NAME16.match(e.name):
+                    raise LedgerError("%s.cert is not named by a digest" % e.name)
+
+            seqs = [e.seq for e in es]
+            if seqs != list(range(1, len(es) + 1)):
+                dupes = sorted({s for s in seqs if seqs.count(s) > 1})
+                raise LedgerError(
+                    "the sequence is %s and should be 1..%d%s"
+                    % (seqs[:8], len(es), ("; repeated: %s" % dupes) if dupes else ""))
+
+            for a, b in zip(es, es[1:]):
+                if b["utc"] < a["utc"]:
+                    raise LedgerError("seq %d is stamped %s, before seq %d at %s"
+                                      % (b.seq, b["utc"], a.seq, a["utc"]))
+
+            by_name = {e.name: e for e in es}
+            for e in es:
+                parent = e["lineage"]
+                if parent == "root":
+                    continue
+                if parent not in by_name:
+                    raise LedgerError("seq %d descends from %s, which is not in the ledger"
+                                      % (e.seq, parent))
+                if by_name[parent].seq >= e.seq:
+                    raise LedgerError("seq %d descends from seq %d, which came after it"
+                                      % (e.seq, by_name[parent].seq))
+                if not by_name[parent].adopted:
+                    raise LedgerError(
+                        "seq %d descends from seq %d, which was %s: a tree that was never "
+                        "adopted is not a state anything could have been built from"
+                        % (e.seq, by_name[parent].seq, by_name[parent]["verdict"]))
+
+            # --- the epoch claims ---------------------------------------
+            for a, b in zip(es, es[1:]):
+                if b.epoch == a.epoch:
+                    if b["utility"] != a["utility"]:
+                        raise LedgerError(
+                            "seq %d and seq %d are both in epoch %d and were judged by "
+                            "different evaluators; within an epoch the criterion is fixed"
+                            % (a.seq, b.seq, a.epoch))
+                    continue
+                if b.epoch != a.epoch + 1:
+                    raise LedgerError("the epoch jumps from %d to %d at seq %d"
+                                      % (a.epoch, b.epoch, b.seq))
+                if a.seq % epoch_len != 0:
+                    raise LedgerError(
+                        "the epoch advances at seq %d, which is not an epoch boundary "
+                        "(epoch_len %d); the criterion may change only at one"
+                        % (b.seq, epoch_len))
+
+            # --- the tried markers --------------------------------------
+            td = Path(root) / "loop/ledger/tried"
+            if td.is_dir():
+                for p in sorted(td.iterdir()):
+                    if p.name.startswith("."):
+                        continue
+                    if p.suffix != ".env":
+                        raise LedgerError("%s is under tried/ and is not an envelope" % p.name)
+                    got = hashlib.sha256(p.read_bytes()).hexdigest()
+                    if p.stem != got[:16]:
+                        raise LedgerError(
+                            "tried/%s is named for a point the file does not hash to" % p.name)
+            return es
+
+        def tip(es):
+            for e in reversed(es):
+                if e.adopted:
+                    return e.name
+            return "root"
+
+        def tail(es, n):
+            es = es[-n:]
+            if not es:
+                return "(the ledger is empty)"
+            short = {"clonal": "cl", "reaction-norm": "rn", "cross-lineage": "xl", "-": "-"}
+            rows = [("seq", "utc", "kind", "lane", "op", "moved", "verdict", "why")]
+            for e in es:
+                rows.append((str(e.seq), e["utc"][5:16].replace("T", " "), e["kind"][:10],
+                             e["lane"][:8], short.get(e["operator"], "?"), e["moved"][:8],
+                             e["verdict"][:10], e["why"][:52]))
+            w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+            return "\n".join("  ".join(c.ljust(x) for c, x in zip(r, w)).rstrip() for r in rows)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            import tempfile
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s)
+                    if detail: print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except LedgerError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            FIELDS = ("version seq utc point kind lane operator lineage epoch utility rung axis "
+                      "ladder parent-tree candidate-tree rail corpus alpha-k bar fdr minutes half "
+                      "level trials queries suites claims checks witness moved effect interval q "
+                      "why verdict runner").split()
+            BASE = dict(version="2", seq="1", utc="2026-01-02T03:04:05Z", point="a"*64,
+                        kind="repair", lane="model", operator="clonal", lineage="root",
+                        epoch="0", utility="b"*64, rung="1", axis="grid", ladder="-",
+                        **{"parent-tree": "c"*40, "candidate-tree": "d"*40},
+                        rail="none", corpus="0123abcd", **{"alpha-k": "0"}, bar="-", fdr="-",
+                        minutes="45", half="extend", level="0", trials="1", queries="0",
+                        suites="-", claims="-", checks="-", witness="-", moved="-",
+                        effect="-", interval="-", q="-", why="a scratch entry",
+                        verdict="refuse", runner="1/1")
+
+            def write(root, **over):
+                f = dict(BASE); f["seq"] = str(count(root) + 1); f.update(over)
+                f.setdefault("point", hashlib.sha256(repr(sorted(f.items())).encode()).hexdigest())
+                f["point"] = hashlib.sha256(repr(sorted(f.items())).encode()).hexdigest()
+                text = "\n".join("%s %s" % (k, f[k]) for k in FIELDS) + "\n"
+                name = hashlib.sha256(text.encode()).hexdigest()[:16]
+                d = entries_dir(root); d.mkdir(parents=True, exist_ok=True)
+                (d / (name + ".cert")).write_text(text, encoding="utf-8")
+                return name
+
+            with tempfile.TemporaryDirectory() as td:
+                claim("an absent ledger holds nothing rather than failing", count(td) == 0)
+                claim("fsck is happy with nothing", fsck(td, 16) == [])
+                a = write(td, verdict="adopt")
+                write(td, lineage=a)
+                claim("entries load in sequence order", [e.seq for e in load(td)] == [1, 2])
+                claim("fsck accepts a well-formed ledger", len(fsck(td, 16)) == 2)
+                claim("the tip is the newest adopted entry", tip(load(td)) == a)
+                p = entries_dir(td) / (sorted(x.name for x in entries_dir(td).iterdir())[0])
+                p.write_text(p.read_text().replace("trials 1", "trials 9"))
+                raises("a corrupted ledger halts the night rather than being reasoned from",
+                       lambda: fsck(td, 16))
+
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, seq="3")
+                raises("a gap in the sequence is refused", lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td, utc="2026-02-02T00:00:00Z"); write(td, utc="2026-01-01T00:00:00Z")
+                raises("an entry stamped before its predecessor is refused", lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td, lineage="0"*16)
+                raises("descent from an entry that does not exist is refused", lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                a = write(td, verdict="refuse"); write(td, lineage=a)
+                raises("descent from a tree that was never adopted is refused",
+                       lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, utility="e"*64)
+                raises("two evaluators inside one epoch is refused: within an epoch the bar is fixed",
+                       lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, epoch="1", utility="e"*64)
+                raises("the criterion may not change away from an epoch boundary",
+                       lambda: fsck(td, 16))
+                claim("at a boundary of one, it may", len(fsck(td, 1)) == 2)
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, epoch="2", utility="e"*64)
+                raises("an epoch that skips a number is refused", lambda: fsck(td, 1))
+            with tempfile.TemporaryDirectory() as td:
+                d = Path(td) / "loop/ledger/tried"; d.mkdir(parents=True)
+                (d / ("0"*16 + ".env")).write_bytes(b"not what this names")
+                raises("a tried marker that is not the envelope it names is refused",
+                       lambda: fsck(td, 16))
+
+            claim("genesis is not an epoch boundary", not is_boundary(0, 16))
+            claim("sixteen entries is one", is_boundary(16, 16))
+            claim("seventeen is not", not is_boundary(17, 16))
+            claim("the first entry belongs to epoch zero", 0 // 16 == 0)
+            claim("the seventeenth belongs to epoch one", 16 // 16 == 1)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        def is_boundary(n, epoch_len):
+            # Genesis is deliberately not a boundary. A criterion with no track
+            # record to gate against is a criterion nothing has tested, and
+            # letting the first evaluator change through for free is the one
+            # moment the gate would have cost nothing to pass.
+            return n > 0 and n % epoch_len == 0
+
+        cmd = os.environ["COMMAND"].strip()
+        root = os.environ.get("ROOT", ".")
+        epoch_len = int(os.environ.get("EPOCH_LEN", "16") or "16")
+        try:
+            if cmd == "selftest":
+                sys.exit(selftest())
+            if cmd == "fsck":
+                es = fsck(root, epoch_len)
+                n = len(es)
+                print("  the ledger holds %d entr%s and every claim it makes about itself holds"
+                      % (n, "y" if n == 1 else "ies"))
+            else:
+                es = load(root)
+                n = len(es)
+            if cmd == "tail":
+                print(tail(es, int(os.environ.get("TAIL_N", "10") or "10")))
+            elif cmd == "report":
+                adopted = sum(1 for e in es if e.adopted)
+                counted = sum(1 for e in es if e.counted)
+                print("  %d entries, %d counted trials, %d adopted, epoch %d"
+                      % (n, counted, adopted, n // epoch_len))
+                print(tail(es, 10))
+            elif cmd not in ("fsck", "count", "seq"):
+                raise LedgerError("no such command: %r" % cmd)
+            out("count", str(n))
+            out("seq", str(n + 1))
+            out("epoch", str(n // epoch_len))
+            out("boundary", "yes" if is_boundary(n, epoch_len) else "no")
+            out("tip", tip(es))
+        except LedgerError as exc:
+            print("::error::ledger %s: %s" % (cmd, exc))
+            sys.exit(1)
+        PYEOF

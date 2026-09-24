@@ -1,0 +1,406 @@
+name: goedel-cert
+description: >-
+  The certificate: what a night decided, and everything it decided it from.
+  Renders one, checks one, names one, or checks every one in a directory.
+
+# One file, one line per field, `key value`. Content-named by its own digest,
+# so a hand-edited certificate stops being the file the ledger says it is and
+# `ledger fsck` says so. It is the only artifact of a night that outlives the
+# runner, and it is deliberately readable by `awk`: the workflows do read it
+# with awk, and a record whose consumers need this action are a record that
+# stops being checkable the day this action changes.
+#
+# **Every field is required and every field is checked.** A certificate with a
+# field missing is not a certificate with a gap in it; it is a file this
+# machine declines to call a certificate, because the missing one is always the
+# one that mattered. `-` is how to say "nobody counted this", and it is a
+# different fact from `0`, which says somebody counted and got none.
+#
+# THIS ACTION IS THE ONLY PLACE THE FIELD TABLE LIVES. Every other action
+# reads a certificate with a `key value` split and never needs to know what a
+# field means; `ledger` delegates per-file validity here with `check-dir` so
+# that the table is not copied anywhere. A second copy of it would be two
+# definitions of a certificate that have to agree and eventually will not.
+#
+# Three fields are new since the GLaDOS original, and each closes a hole the
+# literature names:
+#
+#   `lineage`   which certificate this one descends from. Without it the
+#               record is a list and not a tree, and clade-level
+#               metaproductivity (Huxley-Goedel, arXiv:2510.21614) has
+#               nothing to aggregate over.
+#
+#   `operator`  which comparative evidence authored the patch: clonal,
+#               reaction-norm or cross-lineage (Mendel-Goedel,
+#               arXiv:2608.07645). A night that cannot say which of the three
+#               it used cannot learn which of the three works.
+#
+#   `utility`   the digest of the evaluator that produced this verdict. Two
+#               certificates from different epochs were judged by different
+#               machines, and comparing them as though they were not is the
+#               error the Red Queen Goedel Machine (arXiv:2606.26294) is
+#               organised around avoiding.
+
+inputs:
+  command:
+    description: "emit | check | name | check-dir | fields | selftest"
+    required: true
+  file:
+    description: "the certificate to check or name"
+    required: false
+    default: ""
+  dir:
+    description: "for check-dir: the directory of .cert files"
+    required: false
+    default: ""
+  set:
+    description: "for emit: newline-separated `key=value` pairs"
+    required: false
+    default: ""
+  out:
+    description: "for emit: where to write the certificate"
+    required: false
+    default: certificate.cert
+
+outputs:
+  name:
+    description: "the certificate's content name (first 16 of its digest)"
+    value: ${{ steps.run.outputs.name }}
+  verdict:
+    description: "the verdict the certificate carries"
+    value: ${{ steps.run.outputs.verdict }}
+  count:
+    description: "for check-dir: how many certificates were checked"
+    value: ${{ steps.run.outputs.count }}
+
+runs:
+  using: composite
+  steps:
+    # `env:` and never `${{ }}` inside `run:`. An expression is pasted into
+    # the script before bash sees it, so a `why` carrying a quote would end
+    # the string and the rest of the reason would be shell. Everything a
+    # caller controls arrives as an environment variable.
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        FILE: ${{ inputs.file }}
+        DIR: ${{ inputs.dir }}
+        SET: ${{ inputs.set }}
+        OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import hashlib, os, re, sys
+        from pathlib import Path
+
+        VERSION = "2"
+        VERDICTS = ("adopt", "refuse", "stale", "rollback", "superseded")
+        MOVED = ("better", "worse", "same", "unstable", "absent", "-")
+        OPERATORS = ("clonal", "reaction-norm", "cross-lineage", "-")
+        LANES = ("grid", "template", "model", "event")
+        HALVES = ("extend", "explore")
+
+        HEX40 = re.compile(r"\A[0-9a-f]{40}\Z")
+        HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+        HEX8  = re.compile(r"\A[0-9a-f]{8}\Z")
+        NAME16 = re.compile(r"\A[0-9a-f]{16}\Z")
+        UTC   = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+        PAIR  = re.compile(r"\A(\d+)/(\d+)\Z")
+
+        class CertError(Exception): pass
+
+        def is_int(v):   return v.isdigit()
+        def is_free(v):  return bool(v) and "\n" not in v
+        def is_float(v):
+            try: float(v)
+            except ValueError: return False
+            return True
+        def is_iv(v):
+            lo, sep, hi = v.partition(",")
+            return bool(sep) and is_float(lo) and is_float(hi) and float(lo) <= float(hi)
+        def dash(fn):    return lambda v: v == "-" or fn(v)
+
+        # The order is the file's order, and it is not alphabetical: a human
+        # reading a certificate reads the identity, then the claim, then the
+        # measurement, then the decision, in that order.
+        FIELDS = (
+          ("version",        lambda v: v == VERSION),
+          ("seq",            is_int),
+          ("utc",            lambda v: bool(UTC.match(v))),
+          ("point",          lambda v: bool(HEX64.match(v))),
+          ("kind",           is_free),
+          ("lane",           lambda v: v in LANES),
+          ("operator",       lambda v: v in OPERATORS),
+          ("lineage",        lambda v: v == "root" or bool(NAME16.match(v))),
+          ("epoch",          is_int),
+          ("utility",        lambda v: bool(HEX64.match(v))),
+          ("rung",           is_int),
+          ("axis",           is_free),
+          ("ladder",         dash(lambda v: bool(HEX64.match(v)))),
+          ("parent-tree",    dash(lambda v: bool(HEX40.match(v)))),
+          ("candidate-tree", dash(lambda v: bool(HEX40.match(v)))),
+          ("rail",           is_free),
+          ("corpus",         lambda v: bool(HEX8.match(v))),
+          ("alpha-k",        is_int),
+          ("bar",            dash(is_float)),
+          ("fdr",            dash(is_float)),
+          ("minutes",        is_int),
+          ("half",           lambda v: v in HALVES),
+          ("level",          is_int),
+          ("trials",         is_int),
+          ("queries",        is_int),
+          ("suites",         dash(lambda v: bool(PAIR.match(v)))),
+          ("claims",         dash(lambda v: bool(PAIR.match(v)))),
+          ("checks",         dash(lambda v: bool(PAIR.match(v)))),
+          ("witness",        lambda v: v in ("fail-then-pass", "-")),
+          ("moved",          lambda v: v in MOVED),
+          ("effect",         dash(is_float)),
+          ("interval",       dash(is_iv)),
+          ("q",              dash(is_float)),
+          ("why",            is_free),
+          ("verdict",        lambda v: v in VERDICTS),
+          ("runner",         is_free),
+        )
+        KEYS = tuple(k for k, _ in FIELDS)
+        CHECK = dict(FIELDS)
+
+        # What a field means when nothing measured it. `emit` fills these in,
+        # so a caller naming only what it knows still renders a whole file.
+        DEFAULTS = {
+          "version": VERSION, "lane": "event", "operator": "-", "lineage": "root",
+          "axis": "none", "ladder": "-", "parent-tree": "-", "candidate-tree": "-",
+          "rail": "none", "corpus": "00000000", "alpha-k": "0", "bar": "-",
+          "fdr": "-", "minutes": "0", "half": "extend", "level": "0", "trials": "0",
+          "queries": "0", "suites": "-", "claims": "-", "checks": "-",
+          "witness": "-", "moved": "-", "effect": "-", "interval": "-", "q": "-",
+          "runner": "-",
+        }
+
+        def render(f):
+            missing = [k for k in KEYS if k not in f]
+            if missing:
+                raise CertError("a certificate with fields missing is not one: " + ", ".join(missing))
+            extra = [k for k in f if k not in CHECK]
+            if extra:
+                raise CertError("a certificate may not carry fields nothing checks: " + ", ".join(extra))
+            out = []
+            for k in KEYS:
+                v = str(f[k])
+                if "\n" in v:
+                    raise CertError(k + " carries a newline, and the format is one line per field")
+                out.append(k + " " + v)
+            return "\n".join(out) + "\n"
+
+        def parse(text):
+            f = {}
+            for n, line in enumerate(text.splitlines(), 1):
+                if not line.strip():
+                    raise CertError("line %d is blank; the format has no blank lines" % n)
+                k, _, v = line.partition(" ")
+                if not k:
+                    raise CertError("line %d has no key" % n)
+                if k in f:
+                    raise CertError("line %d repeats %s; the last of a pair is a guess" % (n, k))
+                if k not in CHECK:
+                    raise CertError("line %d names %s, which nothing checks" % (n, k))
+                f[k] = v
+            if list(f) != [k for k in KEYS if k in f]:
+                raise CertError("the fields are out of order, so this is not the file that was rendered")
+            check(f)
+            return f
+
+        def check(f):
+            missing = [k for k in KEYS if k not in f]
+            if missing:
+                raise CertError("missing: " + ", ".join(missing))
+            for k in KEYS:
+                if not CHECK[k](f[k]):
+                    raise CertError("%s is %r, which is not a %s" % (k, f[k], k))
+            coherent(f)
+            return f
+
+        def coherent(f):
+            """The claims a single field cannot make about itself."""
+            verdict, moved = f["verdict"], f["moved"]
+            cand, parent = f["candidate-tree"], f["parent-tree"]
+            if verdict == "adopt":
+                if cand == "-":
+                    raise CertError("an adoption with no candidate tree adopted nothing")
+                if cand == parent:
+                    raise CertError("an adoption whose candidate tree is its parent changed nothing")
+                if moved == "worse":
+                    raise CertError("an adoption may not record that the thing it claimed got worse")
+                if moved == "unstable":
+                    raise CertError("an adoption may not rest on an unstable comparison: unstable "
+                                    "is the word for a measurement that did not say anything")
+            if verdict == "stale" and cand == "-":
+                raise CertError("a stale verdict is about a candidate, and names none")
+            if f["witness"] == "fail-then-pass" and verdict not in ("adopt", "refuse", "stale"):
+                raise CertError("a witness result on a %s entry describes a trial that was not one" % verdict)
+            if verdict in ("rollback", "superseded") and f["lane"] != "event":
+                raise CertError("a %s is something that happened to the ledger, so its lane is event" % verdict)
+            for key in ("suites", "claims", "checks"):
+                if f[key] == "-":
+                    continue
+                a, b = (int(x) for x in PAIR.match(f[key]).groups())
+                if verdict == "adopt" and b < a:
+                    raise CertError(
+                        "an adoption may not reduce %s (%d -> %d); the count that may not fall "
+                        "is the only thing standing between this machine and deleting its own "
+                        "tests" % (key, a, b))
+            if verdict == "adopt" and f["interval"] != "-":
+                lo, _, hi = f["interval"].partition(",")
+                if float(lo) <= 0.0 <= float(hi):
+                    raise CertError("an adoption whose confidence interval straddles zero adopted on noise")
+
+        def emit(pairs):
+            f = dict(DEFAULTS)
+            for k, v in pairs:
+                if k not in CHECK:
+                    raise CertError("%s is not a certificate field" % k)
+                f[k] = v
+            text = render(f)
+            parse(text)     # rendered files are checked before anybody is handed one
+            return text
+
+        def name_of(text):
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            sys.path.insert(0, os.environ.get("GOEDEL_CLAIMS", ".github/actions"))
+            ok = fail = 0
+            def claim(sentence, held, detail=""):
+                nonlocal ok, fail
+                if held:
+                    ok += 1; print("  ok   " + sentence)
+                else:
+                    fail += 1; print("  FAIL " + sentence)
+                    if detail: print("         " + str(detail))
+            def raises(sentence, fn):
+                try:
+                    fn()
+                except CertError:
+                    return claim(sentence, True)
+                except Exception as exc:
+                    return claim(sentence, False, "refused with the wrong error: %r" % exc)
+                return claim(sentence, False, "it returned instead of refusing")
+
+            good = [
+              ("seq","1"), ("utc","2026-01-02T03:04:05Z"), ("point","a"*64),
+              ("kind","repair"), ("lane","model"), ("operator","clonal"),
+              ("lineage","root"), ("epoch","0"), ("utility","b"*64), ("rung","1"),
+              ("axis","grid"), ("parent-tree","c"*40), ("candidate-tree","d"*40),
+              ("rail","host.retrieval"), ("corpus","0123abcd"), ("minutes","45"),
+              ("trials","3"), ("suites","4/4"), ("claims","10/11"), ("checks","2/2"),
+              ("witness","fail-then-pass"), ("moved","better"), ("effect","-0.12"),
+              ("interval","-0.20,-0.04"), ("q","0.01"),
+              ("why","the witness failed on the baseline and passes with the fix"),
+              ("verdict","adopt"), ("runner","1/1"),
+            ]
+            def mut(**over):
+                d = dict(good); d.update(over); return emit(d.items())
+
+            text = emit(good)
+            f = parse(text)
+            claim("a certificate round-trips through render and parse", render(f) == text)
+            claim("a hand-edited certificate no longer names itself",
+                  name_of(text.replace("verdict adopt", "verdict refuse")) != name_of(text))
+
+            raises("an invented verdict is refused", lambda: mut(verdict="ship-it"))
+            raises("an invented field is refused", lambda: emit(list(good) + [("vibes","good")]))
+            raises("a missing field is refused rather than defaulted at parse",
+                   lambda: parse("\n".join(l for l in text.splitlines() if not l.startswith("why ")) + "\n"))
+            raises("a repeated field is refused, not resolved to the last one",
+                   lambda: parse(text + "verdict refuse\n"))
+            raises("fields out of order are refused: that is not the file that was rendered",
+                   lambda: parse("\n".join(reversed(text.splitlines())) + "\n"))
+            raises("a blank line is refused", lambda: parse(text + "\n"))
+            raises("an adoption that changed nothing is refused",
+                   lambda: mut(**{"candidate-tree": "c"*40}))
+            raises("an adoption with no candidate tree is refused",
+                   lambda: mut(**{"candidate-tree": "-"}))
+            raises("an adoption on a worse reading is refused", lambda: mut(moved="worse"))
+            raises("an adoption on an unstable comparison is refused", lambda: mut(moved="unstable"))
+            raises("an adoption whose interval straddles zero is refused as noise",
+                   lambda: mut(interval="-0.10,0.30"))
+            raises("an adoption that reduces the claim count is refused", lambda: mut(claims="11/10"))
+            raises("a rollback is an event and may not claim a lane",
+                   lambda: mut(verdict="rollback", lane="model", moved="-"))
+
+            r = parse(mut(verdict="refuse", moved="worse", witness="-", claims="11/10",
+                          interval="-", effect="-", q="-"))
+            claim("a refusal MAY record that things got worse", r["verdict"] == "refuse")
+            d = parse(mut(verdict="refuse", moved="-", witness="-", suites="-", claims="-",
+                          checks="-", **{"candidate-tree": "-"},
+                          why="the candidate did not build", interval="-", effect="-", q="-"))
+            claim("a certificate may say nobody counted, for a candidate that died",
+                  d["claims"] == "-")
+            claim("emit fills what nobody measured with a dash",
+                  parse(emit([("seq","1"), ("utc","2026-01-02T03:04:05Z"), ("point","a"*64),
+                              ("kind","event"), ("epoch","0"), ("utility","b"*64),
+                              ("rung","0"), ("why","x"), ("verdict","refuse")]))["moved"] == "-")
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        try:
+            if cmd == "fields":
+                print("\n".join(KEYS))
+            elif cmd == "selftest":
+                sys.exit(selftest())
+            elif cmd == "emit":
+                pairs = []
+                for line in os.environ.get("SET", "").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    k, sep, v = line.partition("=")
+                    if not sep:
+                        raise CertError("--set wants `key=value`, got %r" % line)
+                    pairs.append((k.strip(), v))
+                text = emit(pairs)
+                Path(os.environ["OUT"]).write_text(text, encoding="utf-8")
+                sys.stdout.write(text)
+                out("name", name_of(text))
+                out("verdict", dict(pairs).get("verdict", ""))
+            elif cmd == "check":
+                p = Path(os.environ["FILE"])
+                f = parse(p.read_text(encoding="utf-8"))
+                print("  %s is a certificate: %s %s" % (p.name, f["verdict"], f["why"][:60]))
+                out("name", name_of(p.read_text(encoding="utf-8")))
+                out("verdict", f["verdict"])
+            elif cmd == "name":
+                text = Path(os.environ["FILE"]).read_text(encoding="utf-8")
+                print(name_of(text))
+                out("name", name_of(text))
+            elif cmd == "check-dir":
+                d = Path(os.environ["DIR"])
+                n = 0
+                if d.is_dir():
+                    for p in sorted(d.iterdir()):
+                        if p.name.startswith("."):
+                            continue
+                        if p.suffix != ".cert":
+                            raise CertError("%s is under %s and is not a certificate" % (p.name, d))
+                        try:
+                            parse(p.read_text(encoding="utf-8"))
+                        except CertError as exc:
+                            raise CertError("%s: %s" % (p.name, exc)) from None
+                        n += 1
+                print("  %d certificate(s) in %s, every field checked" % (n, d))
+                out("count", str(n))
+            else:
+                raise CertError("no such command: %r" % cmd)
+        except CertError as exc:
+            print("::error::cert %s: %s" % (cmd, exc))
+            sys.exit(1)
+        PYEOF

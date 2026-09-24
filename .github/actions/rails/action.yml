@@ -1,0 +1,574 @@
+name: goedel-rails
+description: >-
+  The measurements, and the only thing that decides whether one of them moved.
+
+# A rail is a named number with a unit and a direction. The file format is
+# deliberately flat text -- a shell can write one with `echo` and a human can
+# read one without this action -- and it carries SAMPLES rather than a value:
+#
+#     [rail] v2
+#     host.query 41.2,40.8,41.9 ms lower
+#     cost.artifact_bytes 184320 B lower
+#     [rail] end
+#
+# **Why samples.** The original of this file compared one number against one
+# number and declared a movement real when it exceeded a hand-written noise
+# floor. That floor had been measured once, on one machine, and was wrong by up
+# to seven times; worse, a single pair of readings cannot tell a change in the
+# code from the day the runner was having. This version keeps the floor -- it
+# is cheap and it catches the obvious -- and puts a real interval behind it, so
+# that "is this bigger than nothing" is answered by the data rather than by a
+# constant somebody typed.
+#
+# **Four gates, in this order, and the order is the design.**
+#
+#   1. *The floor.* A movement inside its declared floor is not a movement.
+#      First, because it is the one gate that needs no samples, and because a
+#      rail whose floor is 5% should not produce a confident 0.4% discovery
+#      however many times it is measured.
+#
+#   2. *The run's own wobble.* `again-*` supplies a second reading of the SAME
+#      artifact in each arm. Whatever that pair disagrees by is this run's
+#      measured noise, and a between-arm effect no larger than it is not
+#      comparable -- `unstable`, which is a refusal and not a pass. This is the
+#      gate that catches the day rather than the change.
+#
+#   3. *The interval.* With three or more samples an arm gets a percentile
+#      bootstrap interval on the relative difference of medians and a
+#      permutation p-value. An effect whose interval straddles zero is
+#      `unstable` too.
+#
+#   4. *The correction.* Judging twenty rails at once means roughly one
+#      spurious discovery at the 5% level, so `better` claims are
+#      Benjamini-Hochberg corrected across the rails in one comparison and a
+#      claim that does not survive is demoted to `same`.
+#
+# **The FDR asymmetry is deliberate and is the safety property.** `worse`
+# claims are NOT corrected. A veto that gets weaker the more things you measure
+# is a veto an author can dilute by adding rails, and this machine's whole
+# defence against gaming its own judge is that the veto direction is the cheap
+# one.
+
+inputs:
+  command:
+    description: "compare | judge | spread | selftest"
+    required: true
+  before:
+    description: "the baseline arm's rail file"
+    required: false
+    default: before.txt
+  after:
+    description: "the candidate arm's rail file"
+    required: false
+    default: after.txt
+  again-before:
+    description: "a second reading of the SAME baseline artifact"
+    required: false
+    default: ""
+  again-after:
+    description: "a second reading of the SAME candidate artifact"
+    required: false
+    default: ""
+  claims:
+    description: "for judge: the one rail this candidate claimed to move"
+    required: false
+    default: ""
+  allow:
+    description: "rails this kind may pay for: priced, not vetoed on"
+    required: false
+    default: ""
+  adrift:
+    description: "rails nothing here controls for: reported, not attributed"
+    required: false
+    default: ""
+  config:
+    description: "the validated goedel.toml JSON, for floors and the bar"
+    required: false
+    default: ""
+  seed:
+    description: "makes the resampling reproducible; the point, usually"
+    required: false
+    default: ""
+  out:
+    description: "where to write the comparison table"
+    required: false
+    default: judged.txt
+
+outputs:
+  moved:
+    description: "the claimed rail's verdict: better | worse | same | unstable | absent"
+    value: ${{ steps.run.outputs.moved }}
+  why:
+    description: "one line naming what moved and by how much"
+    value: ${{ steps.run.outputs.why }}
+  worse:
+    description: "how many rails regressed"
+    value: ${{ steps.run.outputs.worse }}
+  unstable:
+    description: "how many were not comparable"
+    value: ${{ steps.run.outputs.unstable }}
+  better:
+    description: "how many improved past their floor and survived the correction"
+    value: ${{ steps.run.outputs.better }}
+  effect:
+    description: "the claimed rail's relative movement"
+    value: ${{ steps.run.outputs.effect }}
+  interval:
+    description: "its confidence interval, `lo,hi`, or `-`"
+    value: ${{ steps.run.outputs.interval }}
+  q:
+    description: "its FDR-adjusted p-value, or `-`"
+    value: ${{ steps.run.outputs.q }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        BEFORE: ${{ inputs.before }}
+        AFTER: ${{ inputs.after }}
+        AGAIN_BEFORE: ${{ inputs.again-before }}
+        AGAIN_AFTER: ${{ inputs.again-after }}
+        CLAIMS: ${{ inputs.claims }}
+        ALLOW: ${{ inputs.allow }}
+        ADRIFT: ${{ inputs.adrift }}
+        CONFIG: ${{ inputs.config }}
+        SEED: ${{ inputs.seed }}
+        OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import hashlib, json, os, random, re, statistics, sys
+        from pathlib import Path
+
+        HEADER, FOOTER = "[rail] v2", "[rail] end"
+        DIRECTIONS = ("lower", "higher")
+        BETTER, WORSE, SAME, UNSTABLE, ABSENT = "better", "worse", "same", "unstable", "absent"
+        NAME = re.compile(r"\A[a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+\Z")
+        RESAMPLES = 2000
+
+        class RailError(Exception): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        class Rail:
+            __slots__ = ("name", "samples", "unit", "direction")
+            def __init__(self, name, samples, unit, direction):
+                self.name, self.samples = name, tuple(samples)
+                self.unit, self.direction = unit, direction
+            @property
+            def value(self): return statistics.median(self.samples)
+            def line(self):
+                return "%s %s %s %s" % (self.name, ",".join(num(v) for v in self.samples),
+                                        self.unit, self.direction)
+
+        def num(v):
+            """Round-trippable and not noisy: integers stay integers."""
+            if v == int(v) and abs(v) < 1e15:
+                return str(int(v))
+            return repr(round(v, 6))
+
+        def render(rails):
+            body = "\n".join(rails[n].line() for n in sorted(rails))
+            return HEADER + "\n" + (body + "\n" if body else "") + FOOTER + "\n"
+
+        def parse(text):
+            lines = [l for l in text.splitlines() if l.strip()]
+            if not lines or lines[0].strip() != HEADER:
+                raise RailError("a rail file opens with %r" % HEADER)
+            if lines[-1].strip() != FOOTER:
+                raise RailError(
+                    "a rail file closes with %r; without it a truncated transfer reads as "
+                    "a shorter set of rails" % FOOTER)
+            rails = {}
+            for n, line in enumerate(lines[1:-1], 2):
+                parts = line.split()
+                if len(parts) != 4:
+                    raise RailError("line %d: a rail is `name samples unit direction`, got %r"
+                                    % (n, line))
+                name, vals, unit, direction = parts
+                if not NAME.match(name):
+                    raise RailError("line %d: %r is not a dotted rail name" % (n, name))
+                if name in rails:
+                    raise RailError("line %d: %s again; two readings of one rail is not one rail"
+                                    % (n, name))
+                if direction not in DIRECTIONS:
+                    raise RailError("line %d: direction is lower or higher, not %r" % (n, direction))
+                try:
+                    samples = [float(v) for v in vals.split(",")]
+                except ValueError:
+                    raise RailError("line %d: %r is not a comma-separated list of numbers"
+                                    % (n, vals)) from None
+                if not samples:
+                    raise RailError("line %d: a rail with no samples measured nothing" % n)
+                rails[name] = Rail(name, samples, unit, direction)
+            return rails
+
+        def read(path):
+            return parse(Path(path).read_text(encoding="utf-8")) if path else {}
+
+        # -- statistics -------------------------------------------------
+
+        def rel(a, b):
+            """Relative movement from a to b, absolute when a is zero.
+
+            A zero baseline has no relative change -- 0 to 1 is not an infinite
+            regression -- so the absolute difference is the honest answer, and
+            the floor for such a rail has to be written in the rail's units.
+            """
+            return (b - a) if a == 0.0 else (b - a) / abs(a)
+
+        def bootstrap_ci(a, b, confidence, rng):
+            diffs = []
+            for _ in range(RESAMPLES):
+                ra = [rng.choice(a) for _ in a]
+                rb = [rng.choice(b) for _ in b]
+                diffs.append(rel(statistics.median(ra), statistics.median(rb)))
+            diffs.sort()
+            alpha = (1.0 - confidence) / 2.0
+            lo = diffs[max(0, int(alpha * len(diffs)) - 1)]
+            hi = diffs[min(len(diffs) - 1, int((1 - alpha) * len(diffs)))]
+            return lo, hi
+
+        def permutation_p(a, b, rng):
+            """Two-sided p for "the arms are the same", by relabelling.
+
+            **The test statistic is NOT `rel`, and that is the whole of this
+            function's subtlety.** `rel` divides by the baseline, so swapping
+            the labels of two arms changes its magnitude: 100 against 80 reads
+            20% and 80 against 100 reads 25%. A permutation test asks how often
+            a relabelling is at least as extreme, and half of all relabellings
+            are exactly the label swap -- so a genuinely separated pair scored
+            `worse` than itself 53% of the time and every real effect came back
+            p ~ 0.5. Measured, on a pair whose bootstrap interval was nowhere
+            near zero.
+
+            The statistic here is the absolute gap between the medians over a
+            pooled scale that every permutation shares, which is symmetric
+            under the swap by construction. `rel` stays what gets REPORTED --
+            it is the interpretable quantity, "this got 20% faster" -- and it
+            is not what gets tested.
+
+            The +1s are Davison and Hinkley's correction and are not cosmetic:
+            without them a test that never saw a more extreme relabelling
+            reports p = 0, which is a claim no finite resampling can make.
+            """
+            pool = list(a) + list(b)
+            scale = abs(statistics.median(pool)) or 1.0
+            def stat(x, y):
+                return abs(statistics.median(x) - statistics.median(y)) / scale
+            observed = stat(a, b)
+            na, hits = len(a), 0
+            for _ in range(RESAMPLES):
+                rng.shuffle(pool)
+                if stat(pool[:na], pool[na:]) >= observed:
+                    hits += 1
+            return (hits + 1) / (RESAMPLES + 1)
+
+        def benjamini_hochberg(ps, level):
+            m = len(ps)
+            if m == 0:
+                return []
+            order = sorted(range(m), key=lambda i: ps[i])
+            keep, cutoff = [False] * m, -1
+            for rank, i in enumerate(order, 1):
+                if ps[i] <= level * rank / m:
+                    cutoff = rank
+            for rank, i in enumerate(order, 1):
+                if rank <= cutoff:
+                    keep[i] = True
+            return keep
+
+        # -- comparison -------------------------------------------------
+
+        class Row:
+            def __init__(self, **kw): self.__dict__.update(kw)
+            def line(self):
+                iv = ("[%+.4f,%+.4f]" % self.interval) if self.interval else "[-]"
+                q = ("q=%.3f" % self.q) if self.q is not None else "q=-"
+                base = "  %s %s %g->%g%s %+.2f%% floor=%.2f%% wobble=%.2f%% %s %s" % (
+                    self.name, self.verdict, self.before, self.after, self.unit,
+                    self.effect * 100, self.floor * 100, self.wobble * 100, iv, q)
+                return base + ("  (%s)" % self.note if self.note else "")
+
+        def compare(before, after, floor_for, again_before=None, again_after=None,
+                    allow=(), adrift=(), confidence=0.95, fdr=0.10, seed=""):
+            rng = random.Random(hashlib.sha256(seed.encode("utf-8")).digest())
+            rows = []
+            for name in sorted(set(before) | set(after)):
+                if name not in before or name not in after:
+                    side = "the candidate" if name in after else "the baseline"
+                    rows.append(Row(name=name, unit="", direction="", before=float("nan"),
+                                    after=float("nan"), effect=0.0, floor=0.0, wobble=0.0,
+                                    verdict=ABSENT, interval=None, p=None, q=None,
+                                    note="only %s measured it" % side))
+                    continue
+                a, b = before[name], after[name]
+                if a.direction != b.direction:
+                    raise RailError("%s: the arms disagree about which way is better" % name)
+                floor, wobble = floor_for(name), 0.0
+                if again_before and name in again_before:
+                    wobble = max(wobble, abs(rel(a.value, again_before[name].value)))
+                if again_after and name in again_after:
+                    wobble = max(wobble, abs(rel(b.value, again_after[name].value)))
+                effect = rel(a.value, b.value)
+                interval = p = None
+                if len(a.samples) >= 3 and len(b.samples) >= 3:
+                    interval = bootstrap_ci(list(a.samples), list(b.samples), confidence, rng)
+                    p = permutation_p(list(a.samples), list(b.samples), rng)
+                row = Row(name=name, unit=a.unit, direction=a.direction, before=a.value,
+                          after=b.value, effect=effect, floor=floor, wobble=wobble,
+                          verdict=SAME, interval=interval, p=p, q=None, note="")
+                good = effect < 0 if a.direction == "lower" else effect > 0
+                if abs(effect) <= floor:
+                    row.verdict, row.note = SAME, "inside its declared floor"
+                elif wobble > 0 and abs(effect) <= wobble:
+                    row.verdict = UNSTABLE
+                    row.note = "no larger than this run's own second reading"
+                elif interval is not None and interval[0] <= 0.0 <= interval[1]:
+                    row.verdict, row.note = UNSTABLE, "the interval straddles zero"
+                else:
+                    row.verdict = BETTER if good else WORSE
+                rows.append(row)
+
+            discoveries = [r for r in rows if r.verdict == BETTER and r.p is not None]
+            if discoveries:
+                ps = [r.p for r in discoveries]
+                keep = benjamini_hochberg(ps, fdr)
+                m = len(discoveries)
+                ranked = sorted(range(m), key=lambda i: ps[i])
+                rank_of = {i: r + 1 for r, i in enumerate(ranked)}
+                for i, r in enumerate(discoveries):
+                    r.q = min(1.0, r.p * m / rank_of[i])
+                    if not keep[i]:
+                        r.verdict = SAME
+                        r.note = "does not survive FDR %g across %d discovery claim(s)" % (fdr, m)
+
+            for r in rows:
+                if r.name in allow and r.verdict == WORSE:
+                    r.verdict = SAME
+                    r.note = "priced rather than vetoed on: this kind may pay for it"
+                if r.name in adrift and r.verdict in (BETTER, WORSE):
+                    r.verdict = SAME
+                    r.note = ("reported, not attributed: nothing here controls for the two "
+                              "arms being two different artifacts")
+            return rows
+
+        def table(rows, seed):
+            head = "[compare] %d rail(s), seed %s" % (len(rows), (seed or "-")[:12])
+            return "\n".join([head] + [r.line() for r in rows]) + "\n"
+
+        def by_name(rows, name):
+            for r in rows:
+                if r.name == name:
+                    return r
+            return None
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s)
+                    if detail: print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except RailError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+            zero = lambda _n: 0.0
+            def R(name, samples, unit="ms", d="lower"): return {name: Rail(name, samples, unit, d)}
+            def v(rows, n): return by_name(rows, n).verdict
+
+            text = render(R("host.q", [41.2, 40.8, 41.9]))
+            claim("a rail file round-trips", render(parse(text)) == text)
+            claim("a rail's value is the median of its samples", parse(text)["host.q"].value == 41.2)
+            raises("a file with no footer is refused, not read short",
+                   lambda: parse(HEADER + "\nhost.q 1 ms lower\n"))
+            raises("an undotted rail name is refused",
+                   lambda: parse("%s\nq 1 ms lower\n%s\n" % (HEADER, FOOTER)))
+            raises("an invented direction is refused",
+                   lambda: parse("%s\nhost.q 1 ms sideways\n%s\n" % (HEADER, FOOTER)))
+            raises("one rail measured twice is refused",
+                   lambda: parse("%s\nhost.q 1 ms lower\nhost.q 2 ms lower\n%s\n" % (HEADER, FOOTER)))
+
+            a, b = R("host.q", [100.0]), R("host.q", [98.0])
+            claim("a 2% movement inside a 5% floor is not a movement",
+                  v(compare(a, b, lambda _n: 0.05, seed="t"), "host.q") == SAME)
+            claim("and outside it, it is",
+                  v(compare(a, b, lambda _n: 0.01, seed="t"), "host.q") == BETTER)
+            claim("a rise on a lower-is-better rail is worse",
+                  v(compare(a, R("host.q", [104.0]), zero, seed="t"), "host.q") == WORSE)
+            claim("a rise on a higher-is-better rail is better",
+                  v(compare(R("host.n", [100.0], "n", "higher"),
+                            R("host.n", [104.0], "n", "higher"), zero, seed="t"), "host.n") == BETTER)
+
+            rows = compare(a, b, zero, again_before=R("host.q", [90.0]), seed="t")
+            claim("an effect smaller than the run's own second reading is not comparable",
+                  v(rows, "host.q") == UNSTABLE)
+            claim("and it says so", "second reading" in by_name(rows, "host.q").note)
+
+            noisy = compare(R("host.q", [100, 90, 110, 95, 105]),
+                            R("host.q", [98, 92, 108, 94, 103]), zero, seed="t")
+            claim("two noisy arms that overlap are not a discovery", v(noisy, "host.q") == UNSTABLE)
+            claim("and an interval is reported for them", by_name(noisy, "host.q").interval is not None)
+
+            clean = compare(R("host.q", [100, 100.4, 99.6, 100.2, 99.8]),
+                            R("host.q", [80, 80.4, 79.6, 80.2, 79.8]), zero, seed="t")
+            claim("a separated pair of arms is a discovery", v(clean, "host.q") == BETTER)
+            claim("whose interval excludes zero", by_name(clean, "host.q").interval[1] < 0)
+            claim("and whose effect is the relative movement of the medians",
+                  abs(by_name(clean, "host.q").effect + 0.2) < 1e-6)
+
+            hi5 = [100, 100.4, 99.6, 100.2, 99.8]
+            lo5 = [80, 80.4, 79.6, 80.2, 79.8]
+            # The two orderings differ only by Monte Carlo noise once the
+            # statistic is symmetric. Under the asymmetric one they differed by
+            # two orders of magnitude -- one ordering read p ~ 0.002 and the
+            # other p ~ 0.53 -- so "both are small" is the claim that catches
+            # it, and a tolerance on their difference would not.
+            claim("a clearly separated pair is improbable whichever arm is named first",
+                  permutation_p(hi5, lo5, random.Random(1)) < 0.05
+                  and permutation_p(lo5, hi5, random.Random(1)) < 0.05,
+                  "p=%.4f one way, %.4f the other: the statistic is not symmetric under "
+                  "relabelling, so half of all relabellings beat the observed effect and "
+                  "nothing separated is ever a discovery"
+                  % (permutation_p(hi5, lo5, random.Random(1)),
+                     permutation_p(lo5, hi5, random.Random(1))))
+
+            claim("comparison is deterministic in its seed",
+                  table(compare(R("host.q", [1, 2, 3]), R("host.q", [4, 5, 6]), zero, seed="k"), "k")
+                  == table(compare(R("host.q", [1, 2, 3]), R("host.q", [4, 5, 6]), zero, seed="k"), "k"))
+
+            gone = compare(a, R("host.other", [1], "n"), zero, seed="t")
+            claim("a rail only one arm measured is absent", v(gone, "host.q") == ABSENT)
+            claim("an allowed rail is priced rather than vetoed on",
+                  v(compare(a, R("host.q", [104.0]), zero, allow=("host.q",), seed="t"), "host.q") == SAME)
+            drift = compare(a, R("host.q", [104.0]), zero, adrift=("host.q",), seed="t")
+            claim("an adrift rail is reported and not attributed", v(drift, "host.q") == SAME)
+            claim("and says that is what happened", "not attributed" in by_name(drift, "host.q").note)
+
+            z = compare(R("cost.warnings", [0], "n"), R("cost.warnings", [3], "n"), zero, seed="t")
+            claim("a rise from zero is worse, counted absolutely", v(z, "cost.warnings") == WORSE)
+            claim("with the absolute difference as the effect",
+                  abs(by_name(z, "cost.warnings").effect - 3.0) < 1e-9)
+
+            claim("BH keeps nothing when nothing is small",
+                  benjamini_hochberg([0.9, 0.8, 0.7], 0.1) == [False, False, False])
+            claim("BH keeps the clearly-small one",
+                  benjamini_hochberg([0.001, 0.9, 0.8], 0.1) == [True, False, False])
+            claim("BH is a step-up: a big one rides on the smaller ones behind it",
+                  benjamini_hochberg([0.01, 0.02, 0.03], 0.1) == [True, True, True])
+            claim("BH over nothing is nothing", benjamini_hochberg([], 0.1) == [])
+
+            # Twenty rails, one real effect and nineteen coin flips.
+            rng = random.Random(7)
+            wa, wb = {}, {}
+            for i in range(19):
+                n = "noise.r%d" % i
+                wa[n] = Rail(n, [rng.gauss(100, 3) for _ in range(6)], "n", "lower")
+                wb[n] = Rail(n, [rng.gauss(100, 3) for _ in range(6)], "n", "lower")
+            wa["real.r"] = Rail("real.r", [100, 100.2, 99.8, 100.1, 99.9, 100.0], "n", "lower")
+            wb["real.r"] = Rail("real.r", [70, 70.2, 69.8, 70.1, 69.9, 70.0], "n", "lower")
+            loose = compare(wa, wb, zero, fdr=0.999, seed="w")
+            tight = compare(wa, wb, zero, fdr=0.05, seed="w")
+            nb = lambda rr: sum(1 for r in rr if r.verdict == BETTER)
+            claim("the real effect survives the correction", v(tight, "real.r") == BETTER)
+            claim("and the correction removes discoveries the uncorrected run made",
+                  nb(tight) <= nb(loose))
+            claim("a corrected-away claim names the correction that removed it",
+                  all("FDR" in by_name(tight, r.name).note
+                      for r in loose if r.verdict == BETTER and v(tight, r.name) == SAME))
+            claim("a regression survives any FDR level, because a diluted veto is not one",
+                  v(compare(R("x.a", [100, 100.2, 99.8], "n"), R("x.a", [140, 140.2, 139.8], "n"),
+                            zero, fdr=0.0001, seed="t"), "x.a") == WORSE)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        try:
+            if cmd == "selftest":
+                sys.exit(selftest())
+
+            cfg = {}
+            if os.environ.get("CONFIG"):
+                cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+            floors = cfg.get("floors", {})
+            judge = cfg.get("judge", {})
+
+            def floor_for(rail):
+                """The longest matching prefix wins.
+
+                Longest rather than first, because `host.` and `host.query.`
+                are both prefixes of `host.query.p95` and only one of them was
+                measured about it. Taking the first match makes the answer
+                depend on the config file's key order, which is nobody's
+                decision.
+                """
+                best, best_len = 0.0, -1
+                for prefix, value in floors.items():
+                    if (rail == prefix or rail.startswith(prefix)) and len(prefix) > best_len:
+                        best, best_len = float(value), len(prefix)
+                return best
+
+            if cmd == "spread":
+                # The between-run spread of one artifact, for evidence-floors.
+                rails = read(os.environ["BEFORE"])
+                print("rail\tn\tmedian\tp95_rel")
+                for name in sorted(rails):
+                    r = rails[name]
+                    med = r.value
+                    devs = sorted(abs(rel(med, s)) for s in r.samples)
+                    p95 = devs[min(len(devs) - 1, int(0.95 * len(devs)))]
+                    print("%s\t%d\t%s\t%.6f" % (name, len(r.samples), num(med), p95))
+                sys.exit(0)
+
+            rows = compare(
+                read(os.environ["BEFORE"]), read(os.environ["AFTER"]), floor_for,
+                again_before=read(os.environ.get("AGAIN_BEFORE", "")) or None,
+                again_after=read(os.environ.get("AGAIN_AFTER", "")) or None,
+                allow=tuple(os.environ.get("ALLOW", "").split()),
+                adrift=tuple(os.environ.get("ADRIFT", "").split()),
+                confidence=float(judge.get("confidence", 0.95)),
+                fdr=float(judge.get("fdr", 0.10)),
+                seed=os.environ.get("SEED", ""))
+
+            text = table(rows, os.environ.get("SEED", ""))
+            Path(os.environ["OUT"]).write_text(text, encoding="utf-8")
+            sys.stdout.write(text)
+
+            counts = {k: sum(1 for r in rows if r.verdict == k)
+                      for k in (BETTER, WORSE, SAME, UNSTABLE, ABSENT)}
+            out("worse", str(counts[WORSE]))
+            out("better", str(counts[BETTER]))
+            out("unstable", str(counts[UNSTABLE] + counts[ABSENT]))
+
+            claimed = os.environ.get("CLAIMS", "").strip()
+            if cmd == "judge" and claimed and claimed != "none":
+                row = by_name(rows, claimed)
+                if row is None:
+                    out("moved", ABSENT)
+                    out("why", "no line for the claimed rail %s" % claimed)
+                    out("effect", "-"); out("interval", "-"); out("q", "-")
+                else:
+                    out("moved", row.verdict)
+                    out("why", row.line().strip())
+                    out("effect", "%.6f" % row.effect)
+                    out("interval", ("%.6f,%.6f" % row.interval) if row.interval else "-")
+                    out("q", ("%.6f" % row.q) if row.q is not None else "-")
+            else:
+                out("moved", "-"); out("why", "")
+                out("effect", "-"); out("interval", "-"); out("q", "-")
+        except RailError as exc:
+            print("::error::rails %s: %s" % (cmd, exc))
+            sys.exit(1)
+        PYEOF

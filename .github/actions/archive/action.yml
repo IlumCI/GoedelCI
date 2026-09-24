@@ -1,0 +1,353 @@
+name: goedel-archive
+description: >-
+  The lineage tree over the ledger, clade-level metaproductivity, and which
+  node the night should grow from.
+
+# This is the Huxley-Goedel Machine's contribution (arXiv:2510.21614) made
+# concrete for a repository. The observation it rests on is the
+# *metaproductivity-performance mismatch*: the tree state that scores best now
+# is not reliably the one whose descendants score best later, so a search that
+# always expands the current best is expanding the wrong thing. What predicts
+# future improvement is **clade-level metaproductivity** -- how well a node's
+# whole lineage of descendants has done -- and that is a quantity this ledger
+# already contains, because every certificate names the one it descends from.
+#
+# The archive's nodes are the ADOPTED trees, plus a root. A refusal is not a
+# node; it is an evaluation that happened at its parent, and it counts against
+# that parent's clade exactly as a failed benchmark run counts against an
+# agent. Rollbacks and supersessions count as neither: they are things that
+# happened TO the record, and scoring a lineage for surviving an operator's
+# override would reward the wrong thing.
+#
+# Selection is Thompson sampling over Beta(1+S, 1+F) per clade, seeded from a
+# string the caller supplies -- the night's point, normally. Seeded, because a
+# night nobody can reconstruct is the thing this whole ledger exists not to be:
+# two runs over the same record must choose the same node, and an operator
+# reading the log must be able to get the same answer by hand.
+#
+# **No sideways moves.** A `back` is only ever proposed toward an ANCESTOR of
+# the tip. Moving to a cousin clade that scores better is a real thing the
+# literature does and a thing this machine deliberately does not do: the
+# repository has one working tree and one history, and restoring a cousin would
+# make the ledger's parent chain stop describing the file tree.
+
+inputs:
+  command:
+    description: "report | select | reconsider | selftest"
+    required: true
+  root:
+    description: "the tree the ledger lives in"
+    required: false
+    default: "."
+  seed:
+    description: "what makes this night's draw reproducible"
+    required: false
+    default: ""
+  min-evidence:
+    description: "counted trials below which reconsider always stays"
+    required: false
+    default: "6"
+  half:
+    description: "extend (greedy) or explore (sampled) -- the OOPS half in force"
+    required: false
+    default: explore
+
+outputs:
+  node:
+    description: "the chosen node's certificate name, or `root`"
+    value: ${{ steps.run.outputs.node }}
+  tree:
+    description: "the git tree that node is"
+    value: ${{ steps.run.outputs.tree }}
+  decision:
+    description: "for reconsider: stay | back"
+    value: ${{ steps.run.outputs.decision }}
+  steps:
+    description: "for reconsider: how far up the chain"
+    value: ${{ steps.run.outputs.steps }}
+  cmp:
+    description: "the chosen clade's metaproductivity"
+    value: ${{ steps.run.outputs.cmp }}
+  evidence:
+    description: "how many counted trials that clade rests on"
+    value: ${{ steps.run.outputs.evidence }}
+  why:
+    description: "one line saying what the record said"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        SEED: ${{ inputs.seed }}
+        MIN_EVIDENCE: ${{ inputs.min-evidence }}
+        HALF: ${{ inputs.half }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import hashlib, os, random, sys
+        from pathlib import Path
+
+        ROOT = "root"
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        class Node:
+            __slots__ = ("name", "seq", "tree", "parent", "children",
+                         "successes", "trials", "depth")
+            def __init__(self, name, seq, tree, parent, depth):
+                self.name, self.seq, self.tree = name, seq, tree
+                self.parent, self.depth = parent, depth
+                self.children, self.successes, self.trials = [], 0, 0
+
+        class Archive:
+            def __init__(self, nodes, order):
+                self.nodes, self.order = nodes, order
+
+            def clade(self, name):
+                """`name` and every node descended from it."""
+                found, stack = [], [name]
+                while stack:
+                    n = stack.pop()
+                    found.append(n)
+                    stack.extend(reversed(self.nodes[n].children))
+                return found
+
+            def counts(self, name):
+                s = t = 0
+                for n in self.clade(name):
+                    s += self.nodes[n].successes
+                    t += self.nodes[n].trials
+                return s, t
+
+            def cmp(self, name):
+                """Clade metaproductivity: the posterior mean under a uniform prior.
+
+                The prior matters and is not decoration. A node with one
+                adopted trial out of one would otherwise read 1.000 and beat a
+                node with nine out of ten forever, which is the pathology that
+                makes a one-sample maximum a bad thing to sort by. Beta(1,1)
+                prices ignorance: one-of-one reads 0.667, nine-of-ten reads
+                0.833.
+                """
+                s, t = self.counts(name)
+                return (s + 1) / (t + 2)
+
+            def select(self, seed, explore=True):
+                rng = random.Random(hashlib.sha256(seed.encode("utf-8")).digest())
+                best, best_draw = ROOT, -1.0
+                for name in self.order:
+                    s, t = self.counts(name)
+                    draw = rng.betavariate(1 + s, 1 + (t - s)) if explore else (s + 1) / (t + 2)
+                    # Depth breaks ties toward the deeper node: two clades with
+                    # the same record are the same bet, and the deeper one
+                    # already carries more adopted work, so starting there
+                    # spends less.
+                    draw += self.nodes[name].depth * 1e-9
+                    if draw > best_draw:
+                        best, best_draw = name, draw
+                return best
+
+            def tip(self):
+                return self.order[-1] if len(self.order) > 1 else ROOT
+
+            def distance(self, frm, to):
+                n, d = frm, 0
+                while n != to:
+                    if n == ROOT:
+                        return -1
+                    n = self.nodes[n].parent
+                    d += 1
+                return d
+
+            def report(self):
+                rows = [("node", "seq", "depth", "s/t", "clade s/t", "cmp")]
+                for name in self.order:
+                    n = self.nodes[name]
+                    s, t = self.counts(name)
+                    rows.append((name[:12], str(n.seq) if n.seq else "-", str(n.depth),
+                                 "%d/%d" % (n.successes, n.trials), "%d/%d" % (s, t),
+                                 "%.3f" % self.cmp(name)))
+                w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+                return "\n".join("  ".join(c.ljust(x) for c, x in zip(r, w)).rstrip()
+                                 for r in rows)
+
+        def build(entries):
+            """`entries` is a list of plain field mappings, in seq order."""
+            nodes = {ROOT: Node(ROOT, 0, "-", "", 0)}
+            order = [ROOT]
+            for name, f in entries:
+                if f["verdict"] not in ("adopt", "refuse", "stale"):
+                    continue
+                parent = f["lineage"]
+                if parent not in nodes:
+                    # `ledger fsck` refuses this, so reaching it means fsck did
+                    # not run. Attach to the root rather than dropping the
+                    # trial: an unattributable trial is still one that happened.
+                    parent = ROOT
+                nodes[parent].trials += 1
+                if f["verdict"] == "adopt":
+                    nodes[parent].successes += 1
+                    nodes[name] = Node(name, int(f["seq"]), f["candidate-tree"], parent,
+                                       nodes[parent].depth + 1)
+                    nodes[parent].children.append(name)
+                    order.append(name)
+            return Archive(nodes, order)
+
+        def load(root):
+            d = Path(root) / "loop/ledger/entries"
+            if not d.is_dir():
+                return []
+            es = []
+            for p in sorted(d.iterdir()):
+                if p.suffix != ".cert" or p.name.startswith("."):
+                    continue
+                f = {}
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    k, _, v = line.partition(" ")
+                    f[k] = v
+                es.append((p.stem, f))
+            es.sort(key=lambda e: int(e[1]["seq"]))
+            return es
+
+        def reconsider(archive, seed, min_evidence=6, explore=True):
+            tip = archive.tip()
+            total = archive.counts(ROOT)[1]
+            if total < min_evidence:
+                # Below the floor this answers `stay` by construction, and that
+                # is not a stub: a clade comparison over four trials is a
+                # comparison of two priors, and backtracking on it would throw
+                # away adopted work for a coin.
+                return ("stay", "", 0, tip,
+                        "%d counted trial(s), under the %d floor" % (total, min_evidence))
+            pick = archive.select(seed, explore=explore)
+            if pick == tip:
+                return ("stay", "", 0, tip, "the tip is the best clade to grow from")
+            steps = archive.distance(tip, pick)
+            if steps <= 0:
+                return ("stay", "", 0, tip,
+                        "%s is not an ancestor of the tip; no sideways moves" % pick[:12])
+            return ("back", archive.nodes[pick].tree, steps, pick,
+                    "clade %s reads %.3f against the tip's %.3f over %d trial(s)"
+                    % (pick[:12], archive.cmp(pick), archive.cmp(tip), archive.counts(pick)[1]))
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s)
+                    if detail: print("         " + str(detail))
+
+            def e(name, seq, lineage, verdict):
+                return (name, {"verdict": verdict, "seq": str(seq), "lineage": lineage,
+                               "candidate-tree": (name * 3)[:40].ljust(40, "0")})
+
+            empty = build([])
+            claim("an empty ledger is a root and nothing else", empty.order == [ROOT])
+            claim("its tip is the root", empty.tip() == ROOT)
+            claim("with no evidence the root reads the prior", empty.cmp(ROOT) == 0.5)
+            claim("and it is where a night grows from", empty.select("x") == ROOT)
+
+            es = [e("a"*16, 1, ROOT, "adopt"), e("b"*16, 2, "a"*16, "refuse"),
+                  e("c"*16, 3, "a"*16, "adopt"), e("d"*16, 4, "c"*16, "refuse"),
+                  e("e"*16, 5, "c"*16, "refuse")]
+            a = build(es)
+            claim("only adoptions become nodes", a.order == [ROOT, "a"*16, "c"*16])
+            claim("refusals count as trials at the node they were tried from",
+                  a.nodes["c"*16].trials == 2)
+            claim("the tip is the newest adopted state", a.tip() == "c"*16)
+            claim("a clade holds its node and its descendants",
+                  a.clade("a"*16) == ["a"*16, "c"*16])
+            claim("the root's clade counts every trial", a.counts(ROOT) == (2, 5))
+            claim("cmp prices a clade under a uniform prior", abs(a.cmp(ROOT) - 3/7) < 1e-12)
+            claim("a one-of-one clade does not read as certainty",
+                  build([e("f"*16, 1, ROOT, "adopt")]).cmp(ROOT) < 0.7)
+            claim("an event entry is not a trial",
+                  build([e("a"*16, 1, ROOT, "rollback")]).counts(ROOT) == (0, 0))
+            claim("a stale entry is", build([e("a"*16, 1, ROOT, "stale")]).counts(ROOT) == (0, 1))
+
+            claim("selection is deterministic in its seed", a.select("n1") == a.select("n1"))
+            claim("and it does explore more than one clade",
+                  len({a.select("n%d" % i) for i in range(40)}) > 1)
+            greedy = max(a.order, key=lambda n: (a.cmp(n), a.nodes[n].depth))
+            claim("greedy selection takes the best posterior mean, every time",
+                  {a.select("n%d" % i, explore=False) for i in range(20)} == {greedy})
+
+            claim("distance up the chain is counted in steps",
+                  a.distance("c"*16, "a"*16) == 1)
+            claim("and a node that is not an ancestor answers -1",
+                  a.distance("a"*16, "c"*16) == -1)
+
+            thin = build(es[:2])
+            claim("under the evidence floor, reconsider stays",
+                  reconsider(thin, "s", 6)[0] == "stay")
+            claim("and says how far under it is", "under the 6 floor" in reconsider(thin, "s", 6)[4])
+
+            bad = [e("a"*16, 1, ROOT, "adopt"), e("1"*16, 2, "a"*16, "adopt"),
+                   e("2"*16, 3, "a"*16, "adopt"), e("3"*16, 4, "a"*16, "adopt"),
+                   e("4"*16, 5, "3"*16, "refuse"), e("5"*16, 6, "3"*16, "refuse"),
+                   e("6"*16, 7, "3"*16, "refuse"), e("7"*16, 8, "3"*16, "refuse")]
+            ab = build(bad)
+            outs = [reconsider(ab, "s%d" % i, 6) for i in range(40)]
+            claim("a tip with a dead clade under a live ancestor does get backtracked to",
+                  any(o[0] == "back" for o in outs),
+                  "forty seeds all answered stay")
+            back = next(o for o in outs if o[0] == "back")
+            claim("a backtrack names a real ancestor", back[3] in ab.clade(ROOT))
+            claim("and how far up it is", back[2] >= 1)
+            claim("and never proposes a sideways move",
+                  all(o[0] == "stay" or ab.distance(ab.tip(), o[3]) > 0 for o in outs))
+            claim("a lineage whose every child failed is not where the night goes",
+                  all(o[3] != "3"*16 for o in outs if o[0] == "back"))
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+
+        root = os.environ.get("ROOT", ".") or "."
+        seed = os.environ.get("SEED", "")
+        explore = os.environ.get("HALF", "explore") != "extend"
+        archive = build(load(root))
+
+        if cmd == "report":
+            print(archive.report())
+            node = archive.tip()
+            decision, tree, steps, why = "stay", archive.nodes[node].tree, 0, "reported only"
+        elif cmd == "select":
+            node = archive.select(seed, explore=explore)
+            tree = archive.nodes[node].tree
+            decision, steps = "stay", 0
+            why = ("clade %s, cmp %.3f over %d trial(s), %s"
+                   % (node[:12], archive.cmp(node), archive.counts(node)[1],
+                      "sampled" if explore else "greedy"))
+            print("  " + why)
+        elif cmd == "reconsider":
+            decision, tree, steps, node, why = reconsider(
+                archive, seed, int(os.environ.get("MIN_EVIDENCE", "6") or "6"), explore)
+            print("  the clade says: %s -- %s" % (decision, why))
+        else:
+            print("::error::archive: no such command: %r" % cmd)
+            sys.exit(1)
+
+        out("node", node)
+        out("tree", tree)
+        out("decision", decision)
+        out("steps", str(steps))
+        out("cmp", "%.4f" % archive.cmp(node))
+        out("evidence", str(archive.counts(node)[1]))
+        out("why", why)
+        PYEOF

@@ -1,0 +1,400 @@
+name: goedel-config
+description: >-
+  Read and validate `goedel.toml` -- the whole of what this machine knows about
+  the project it improves -- and compute the digest of the evaluator judging it.
+
+# Every other action is written against this file rather than against a
+# language, a build system or a test runner. Adopting the template into a
+# repository is editing this one file; if something has to be special-cased in
+# a workflow, that is a gap in this schema and not a licence to hard-code a
+# path.
+#
+# Three rules this enforces rather than documents:
+#
+# * **The evaluator masks and the allow masks may not overlap.** A machine that
+#   may edit the thing that judges it has no gate at all, and the overlap is
+#   the shape that mistake takes -- `src/**` allowed and `src/judge/**`
+#   forbidden reads as safe and is not, because the first glob admits the
+#   second's files. Checked against the MASKS, not against the tree, so a file
+#   that does not exist yet cannot slip through by not existing yet.
+#
+# * **A kind must have a J1.** A kind with no primary criterion can only be
+#   adopted on "nothing broke", which is adoption on the absence of evidence.
+#   Rows naming no witness, no rail and no rising count are refused at load,
+#   not at judgement time.
+#
+# * **The utility has a digest.** `utility` is sha256 over every file the
+#   evaluator masks cover, and it goes into every certificate. It is what makes
+#   "these two verdicts came from the same machine" a checkable claim rather
+#   than an assumption -- the Red Queen property the ledger's epoch rules rest
+#   on (arXiv:2606.26294).
+
+inputs:
+  root:
+    description: "the tree holding goedel.toml"
+    required: false
+    default: "."
+  command:
+    description: "load | show | selftest"
+    required: false
+    default: load
+  export:
+    description: "write GOEDEL_* into $GITHUB_ENV for the rest of the job"
+    required: false
+    default: "true"
+
+outputs:
+  name:
+    description: "the project's name"
+    value: ${{ steps.run.outputs.name }}
+  utility:
+    description: "sha256 over every evaluator file: which judge this is"
+    value: ${{ steps.run.outputs.utility }}
+  epoch-len:
+    description: "how many entries an epoch holds"
+    value: ${{ steps.run.outputs.epoch_len }}
+  kinds:
+    description: "the enabled kinds, space separated"
+    value: ${{ steps.run.outputs.kinds }}
+  shards:
+    description: "how many author shards a night fans out over"
+    value: ${{ steps.run.outputs.shards }}
+  shard-matrix:
+    description: "the same, as a JSON array for `strategy.matrix`"
+    value: ${{ steps.run.outputs.shard_matrix }}
+  json:
+    description: "the path the whole validated config was written to"
+    value: ${{ steps.run.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        ROOT: ${{ inputs.root }}
+        COMMAND: ${{ inputs.command }}
+        EXPORT: ${{ inputs.export }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import fnmatch, hashlib, json, os, sys
+        from pathlib import Path
+
+        try:
+            import tomllib
+        except ModuleNotFoundError:          # pragma: no cover -- 3.10 and below
+            print("::error::this runner's python3 has no tomllib; goedel.toml needs 3.11+")
+            sys.exit(1)
+
+        J1 = ("witness", "claims", "rail", "cost")
+
+        class ConfigError(Exception): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def export(k, v):
+            path = os.environ.get("GITHUB_ENV")
+            if not path or os.environ.get("EXPORT", "true") != "true":
+                return
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        # -- the masks --------------------------------------------------
+
+        def matches(path, masks):
+            # `lstrip("./")` was here and it strips CHARACTERS, not a prefix:
+            # `.github/x` came back as `github/x`, so every evaluator mask
+            # beginning with a dot matched nothing and the machine's own
+            # workflows read as proposable. A dotfile is exactly what the
+            # evaluator masks are made of.
+            if path.startswith("./"):
+                path = path[2:]
+            for m in masks:
+                if fnmatch.fnmatch(path, m):
+                    return True
+                # `src/**` covers `src/a/b` under fnmatch, which lets `*` cross
+                # separators -- but it should also cover `src` itself, which it
+                # does not.
+                if m.endswith("/**") and (path == m[:-3] or path.startswith(m[:-2])):
+                    return True
+            return False
+
+        def overlap(allow, evaluator):
+            bad = []
+            for a in allow:
+                probe = a.replace("**", "x").replace("*", "x")
+                if matches(probe, evaluator):
+                    bad.append(a); continue
+                for e in evaluator:
+                    if matches(e.replace("**", "x").replace("*", "x"), (a,)):
+                        bad.append(a); break
+            return bad
+
+        # -- the schema -------------------------------------------------
+
+        def kind_from(name, row):
+            verb = str(row.get("verb", "edit"))
+            if verb not in ("create", "edit"):
+                raise ConfigError("kind %s: verb is create or edit, not %r" % (name, verb))
+            j1 = str(row.get("j1", ""))
+            if j1 not in J1:
+                raise ConfigError(
+                    "kind %s: j1 must be one of %s, not %r -- a kind with no primary "
+                    "criterion can only be adopted on the absence of evidence"
+                    % (name, "/".join(J1), j1))
+            rail = str(row.get("rail", ""))
+            if j1 == "rail" and not rail:
+                raise ConfigError("kind %s: j1 = rail names no rail to move" % name)
+            if j1 == "witness" and verb == "create":
+                raise ConfigError(
+                    "kind %s: a witness must build against the PARENT tree, and a file "
+                    "being created is by construction absent from it -- so a create kind "
+                    "cannot be judged by fail-then-pass" % name)
+            return {
+                "name": name, "verb": verb, "j1": j1, "rail": rail,
+                "allow_rails": list(row.get("allow_rails", [])),
+                "adrift_rails": list(row.get("adrift_rails", [])),
+                "diff_lines": int(row.get("diff_lines", 400)),
+                "diff_files": int(row.get("diff_files", 10)),
+                "enabled": bool(row.get("enabled", True)),
+                "prompt": str(row.get("prompt", "")),
+            }
+
+        def load(raw, root):
+            project = raw.get("project", {})
+            allow = tuple(project.get("allow", ()))
+            evaluator = tuple(project.get("evaluator", ()))
+            if not allow:
+                raise ConfigError("[project] allow is empty: nothing could ever be proposed")
+            if not evaluator:
+                raise ConfigError(
+                    "[project] evaluator is empty: the machine could propose a change to "
+                    "its own judge, which is a gate that is not one")
+            bad = overlap(allow, evaluator)
+            if bad:
+                raise ConfigError(
+                    "these allow masks also admit evaluator paths, so the machine could "
+                    "edit its own judge: " + ", ".join(bad))
+
+            h = raw.get("harness", {})
+            harness = {
+                "setup": list(h.get("setup", [])),
+                "build": str(h.get("build", "")),
+                "check": str(h.get("check", "")),
+                "test": str(h.get("test", "")),
+                "bench": str(h.get("bench", "")),
+                "artifact": str(h.get("artifact", "")),
+                "suites_re": str(h.get("suites_re", r"(\d+) (?:tests?|suites?|examples?) (?:passed|ok)")),
+                "claims_re": str(h.get("claims_re", r"^\s*(?:ok|PASS|PASSED)\b")),
+                "warnings_re": str(h.get("warnings_re", r"^(?:warning|WARN)")),
+                "timeout": int(h.get("timeout", 1800)),
+            }
+            if not harness["test"]:
+                raise ConfigError(
+                    "[harness] test is empty: with no test command nothing can count claims, "
+                    "and every kind's J2 is a count that may not fall")
+
+            a = raw.get("author", {})
+            author = {
+                "base_url_env": str(a.get("base_url_env", "GOEDEL_INFERENCE_URL")),
+                "api_key_env": str(a.get("api_key_env", "GOEDEL_INFERENCE_KEY")),
+                "model": str(a.get("model", "")),
+                "attempts": int(a.get("attempts", 6)),
+                "temperature": float(a.get("temperature", 0.0)),
+                "max_tokens": int(a.get("max_tokens", 2600)),
+                "shards": int(a.get("shards", 6)),
+                "context": list(a.get("context", [])),
+            }
+            if author["shards"] < 1:
+                raise ConfigError("[author] shards must be at least 1")
+
+            j = raw.get("judge", {})
+            judge = {
+                "epoch_len": int(j.get("epoch_len", 16)),
+                "confidence": float(j.get("confidence", 0.95)),
+                "fdr": float(j.get("fdr", 0.10)),
+                "repeats": int(j.get("repeats", 3)),
+                "min_evidence": int(j.get("min_evidence", 6)),
+                "base_minutes": int(j.get("base_minutes", 45)),
+                "max_level": int(j.get("max_level", 3)),
+                "balks": int(j.get("balks", 3)),
+            }
+            if judge["epoch_len"] < 1:
+                raise ConfigError("[judge] epoch_len must be at least 1")
+            if not 0.0 < judge["confidence"] < 1.0:
+                raise ConfigError("[judge] confidence must lie strictly between 0 and 1")
+            if not 0.0 < judge["fdr"] < 1.0:
+                raise ConfigError("[judge] fdr must lie strictly between 0 and 1")
+            if judge["repeats"] < 1:
+                raise ConfigError("[judge] repeats must be at least 1")
+
+            kinds_raw = raw.get("kinds", {})
+            if not kinds_raw:
+                raise ConfigError("[kinds] is empty: the machine has no move it may make")
+            kinds = {k: kind_from(k, v) for k, v in kinds_raw.items()}
+            if not any(k["enabled"] for k in kinds.values()):
+                raise ConfigError("[kinds] has no enabled row")
+
+            floors = {str(k): float(v) for k, v in raw.get("floors", {}).items()}
+            for rail, f in floors.items():
+                if f < 0:
+                    raise ConfigError("[floors] %s is negative; a floor is a magnitude" % rail)
+
+            return {
+                "name": str(project.get("name", Path(root).name)),
+                "goal": str(project.get("goal", "loop/goal.txt")),
+                "allow": list(allow), "evaluator": list(evaluator),
+                "harness": harness, "author": author, "judge": judge,
+                "kinds": kinds, "floors": floors,
+            }
+
+        def utility_digest(root, evaluator):
+            """sha256 over every evaluator file, by path then content.
+
+            The path is hashed too. Renaming a judge without changing a byte of
+            it is still a different judge: the workflow that called the old
+            name now calls nothing.
+            """
+            h = hashlib.sha256()
+            root = Path(root)
+            files = []
+            for p in sorted(root.rglob("*")):
+                if not p.is_file() or p.is_symlink():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if rel.startswith(".git/"):
+                    continue
+                if matches(rel, evaluator):
+                    files.append((rel, p))
+            for rel, p in files:
+                h.update(rel.encode("utf-8")); h.update(b"\0")
+                h.update(hashlib.sha256(p.read_bytes()).digest())
+            return h.hexdigest(), len(files)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s)
+                    if detail: print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except ConfigError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            base = {"project": {"allow": ["src/**"], "evaluator": [".github/**", "goedel.toml"]},
+                    "harness": {"test": "t"}, "kinds": {"feature": {"verb": "create", "j1": "claims"}}}
+            cfg = load(base, ".")
+            claim("a src path is proposable", matches("src/a/b.py", cfg["allow"])
+                  and not matches("src/a/b.py", cfg["evaluator"]))
+            claim("the machine itself is not", matches(".github/actions/rails/action.yml", cfg["evaluator"]))
+            claim("the config naming the masks is not", matches("goedel.toml", cfg["evaluator"]))
+            claim("a path outside every allow mask is not", not matches("README.md", cfg["allow"]))
+
+            def bad(over):
+                d = json.loads(json.dumps(base));
+                for k, v in over.items(): d[k] = v
+                return lambda: load(d, ".")
+            raises("an allow mask that admits an evaluator path is refused at load",
+                   bad({"project": {"allow": [".github/**"], "evaluator": [".github/**"]}}))
+            raises("an allow mask whose parent is the evaluator is refused too",
+                   bad({"project": {"allow": [".github/actions/rails/action.yml"],
+                                    "evaluator": [".github/**"]}}))
+            raises("an empty evaluator mask is refused: a judge nothing protects is not one",
+                   bad({"project": {"allow": ["src/**"], "evaluator": []}}))
+            raises("an empty allow mask is refused: nothing could be proposed",
+                   bad({"project": {"allow": [], "evaluator": [".github/**"]}}))
+            raises("a kind with no J1 is refused, not judged on the absence of evidence",
+                   bad({"kinds": {"x": {"j1": "vibes"}}}))
+            raises("a rail kind that names no rail is refused",
+                   bad({"kinds": {"x": {"j1": "rail"}}}))
+            raises("a create kind judged by a witness is refused: the witness cannot build",
+                   bad({"kinds": {"x": {"verb": "create", "j1": "witness"}}}))
+            raises("a project with no test command is refused: nothing could count a claim",
+                   bad({"harness": {}}))
+            raises("a config with no kinds is refused", bad({"kinds": {}}))
+            raises("a config whose every kind is disabled is refused",
+                   bad({"kinds": {"x": {"j1": "claims", "enabled": False}}}))
+            raises("an epoch shorter than one entry is refused",
+                   bad({"judge": {"epoch_len": 0}}))
+            raises("a confidence of one is refused: an interval that excludes nothing",
+                   bad({"judge": {"confidence": 1.0}}))
+            raises("a negative floor is refused: a floor is a magnitude",
+                   bad({"floors": {"host.": -0.1}}))
+
+            import tempfile
+            with tempfile.TemporaryDirectory() as td:
+                r = Path(td); (r / ".github").mkdir()
+                (r / ".github/a.yml").write_text("one")
+                d1, n1 = utility_digest(r, [".github/**"])
+                claim("the utility digest covers the evaluator files", n1 == 1)
+                (r / ".github/a.yml").write_text("two")
+                d2, _ = utility_digest(r, [".github/**"])
+                claim("editing the judge changes the digest", d1 != d2)
+                (r / ".github/a.yml").rename(r / ".github/b.yml")
+                d3, _ = utility_digest(r, [".github/**"])
+                claim("and so does renaming it without editing it", d2 != d3)
+                (r / "src").mkdir(); (r / "src/x.py").write_text("anything")
+                d4, _ = utility_digest(r, [".github/**"])
+                claim("a change outside the masks does not", d3 == d4)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ.get("COMMAND", "load").strip()
+        root = os.environ.get("ROOT", ".") or "."
+        try:
+            if cmd == "selftest":
+                sys.exit(selftest())
+            p = Path(root) / "goedel.toml"
+            if not p.is_file():
+                raise ConfigError(
+                    "no goedel.toml at %s -- that file is the whole of the adapter between "
+                    "this machine and a project, and there is no default for it" % root)
+            try:
+                raw = tomllib.loads(p.read_text(encoding="utf-8"))
+            except tomllib.TOMLDecodeError as exc:
+                raise ConfigError("goedel.toml is not valid TOML: %s" % exc) from None
+            cfg = load(raw, root)
+            digest, n = utility_digest(root, cfg["evaluator"])
+            cfg["utility"] = digest
+            cfg["utility_files"] = n
+
+            dest = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "goedel-config.json"
+            dest.write_text(json.dumps(cfg, indent=2, sort_keys=True), encoding="utf-8")
+
+            enabled = [k for k, v in sorted(cfg["kinds"].items()) if v["enabled"]]
+            out("name", cfg["name"])
+            out("utility", digest)
+            out("epoch_len", str(cfg["judge"]["epoch_len"]))
+            out("kinds", " ".join(enabled))
+            out("shards", str(cfg["author"]["shards"]))
+            out("shard_matrix", json.dumps(list(range(cfg["author"]["shards"]))))
+            out("json", str(dest))
+            export("GOEDEL_CONFIG", str(dest))
+            export("GOEDEL_NAME", cfg["name"])
+            export("GOEDEL_UTILITY", digest)
+            export("GOEDEL_EPOCH_LEN", str(cfg["judge"]["epoch_len"]))
+            export("GOEDEL_REPEATS", str(cfg["judge"]["repeats"]))
+            export("GOEDEL_MIN_EVIDENCE", str(cfg["judge"]["min_evidence"]))
+
+            print("  %s: %d kind(s) enabled (%s)" % (cfg["name"], len(enabled), ", ".join(enabled)))
+            print("  the evaluator is %d file(s), digest %s" % (n, digest[:16]))
+            print("  epoch %d entries, repeats %d, confidence %.2f, fdr %.2f"
+                  % (cfg["judge"]["epoch_len"], cfg["judge"]["repeats"],
+                     cfg["judge"]["confidence"], cfg["judge"]["fdr"]))
+            if cmd == "show":
+                print(json.dumps(cfg, indent=2, sort_keys=True))
+        except ConfigError as exc:
+            print("::error::config: %s" % exc)
+            sys.exit(1)
+        PYEOF
