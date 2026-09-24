@@ -91,6 +91,12 @@ gap; it is a file this machine declines to call a certificate, because the
 missing one is always the one that mattered. `-` means *nobody counted this* and
 is a different fact from `0`, which means somebody counted and got none.
 
+`author` is which model drew the candidate. A night can fan out over several
+models rather than several temperatures of one — each shard is its own runner,
+so that is free in wall clock — and `archive report` prices each author under
+the same Beta(1,1) the clades use. A portfolio you cannot attribute is one you
+cannot learn from.
+
 `cert` also refuses combinations no single field can catch: an adoption whose
 candidate tree equals its parent changed nothing; an adoption on a `worse` or
 `unstable` reading adopted noise; an adoption whose interval straddles zero

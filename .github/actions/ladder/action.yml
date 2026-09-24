@@ -293,11 +293,28 @@ runs:
 
         # provider is sent no grammar, and the two must not disagree.
 
-        GRAMMAR = (
-            'root ::= "<<<RUNG>>>\\nkind: " line "\\ntarget: " line '
-            '"\\ntitle: " line "\\nwitness: " line "\\n<<<END>>>"\n'
-            'line ::= [^\\n]+\n'
-        )
+        def grammar(kinds):
+            """The block, with `kind` enumerated rather than left open.
+
+            A free `kind` line lets the model name one that does not exist,
+            which `admit` then refuses for a reason the model could not have
+            known -- and a refusal it could not have avoided is a balk, and
+            three balks retire a milestone. Enumerated, the only kinds it can
+            emit are the ones this project enabled.
+
+            ENABLED, not every kind the config defines. A config carries
+            kinds that are switched off, and offering one in the grammar
+            would let the model pick exactly the thing `admit` refuses two
+            lines later -- the same unavoidable refusal in a new place.
+            """
+            on = sorted(k for k, v in kinds.items() if v.get("enabled", True))
+            alts = " | ".join('"%s"' % k for k in on) or '[^\\n]+'
+            return (
+                'root ::= "<<<RUNG>>>\\nkind: " kind "\\ntarget: " line '
+                '"\\ntitle: " line "\\nwitness: " line "\\n<<<END>>>"\n'
+                'kind ::= %s\n'
+                'line ::= [^\\n]+\n' % alts
+            )
 
         SYSTEM = __import__("textwrap").dedent("""\
             You decompose a project's goal into the single next milestone that would
@@ -685,14 +702,25 @@ runs:
             claim("and a populated one as a table",
                   "retired" in progress([r1], [cert("refuse", r1["point"])] * 3, G, 3))
             # -- the grammar, which is the shape as a constraint ----------
+            G = grammar({"feature": {"enabled": True}, "repair": {"enabled": True},
+                         "off": {"enabled": False}})
             claim("the grammar names the same four fields the parser requires",
-                  all(("\\n%s: " % k) in GRAMMAR or ('"<<<RUNG>>>\\n%s: "' % k) in GRAMMAR
-                      for k in DECLARED),
-                  GRAMMAR)
+                  all(("\\n%s: " % k) in G or ('"<<<RUNG>>>\\n%s: "' % k) in G
+                      for k in DECLARED), G)
             claim("and it opens and closes on the sentinels admit looks for",
-                  "<<<RUNG>>>" in GRAMMAR and "<<<END>>>" in GRAMMAR)
+                  "<<<RUNG>>>" in G and "<<<END>>>" in G)
             claim("a field is one line, so a milestone cannot run into the next",
-                  "line ::= [^" in GRAMMAR and GRAMMAR.rstrip().endswith("]+"))
+                  "line ::= [^" in G and G.rstrip().endswith("]+"))
+            claim("kind is enumerated, so the model cannot name one that is "
+                  "not enabled and be refused for a rule it could not check",
+                  'kind ::= "feature" | "repair"' in G, G)
+            claim("a kind the project switched off is not offered, or the "
+                  "model would pick the one thing admit refuses next",
+                  '"off"' not in G, G)
+            claim("a project with one kind gets a grammar naming only it",
+                  'kind ::= "repair"\n' in grammar({"repair": {"enabled": True}}))
+            claim("and the enumeration follows the project, not this file",
+                  '"tidy"' in grammar({"tidy": {"enabled": True}}))
             claim("the block the grammar forces is one admit reads",
                   read_proposal("<<<RUNG>>>\nkind: feature\ntarget: src/a.py\n"
                                 "title: t\nwitness: w\n<<<END>>>")["witness"] == "w",
@@ -788,7 +816,8 @@ runs:
                     encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
                 if os.environ.get("GRAMMAR_OUT", "").strip():
-                    Path(os.environ["GRAMMAR_OUT"]).write_text(GRAMMAR, encoding="utf-8")
+                    Path(os.environ["GRAMMAR_OUT"]).write_text(
+                        grammar(cfg["kinds"]), encoding="utf-8")
                 print("  asked for the next milestone")
                 out("have", "no"); out("why", "a question was written")
             elif cmd == "admit":
