@@ -1,0 +1,378 @@
+name: goedel-template-check
+description: >-
+  The machine checked against itself: every workflow is one GitHub can actually
+  load, every action can prove itself, every local `uses:` resolves, and the
+  one block that exists twice is the same block twice.
+
+# **First among the checks in spirit, because a workflow GitHub cannot load is
+# a gate that is not running at all.** In the repository this template grew
+# from, one workflow carried two `env:` keys on a single step. GitHub refused
+# the file, so every push produced a zero-job run named after the path, the
+# branch filter never applied because the filter was inside the file that would
+# not load, and nothing published from that channel for weeks. The only symptom
+# was a fast red X on unrelated branches, which reads as noise.
+#
+# It survived a YAML sweep that printed `ok`, because a permissive loader keeps
+# the LAST of a duplicate pair -- agreeing with a file the real parser rejects,
+# and keeping the wrong half of it. So this does not use a YAML library. It
+# reads the files the way the failure mode requires: structurally, and refusing
+# what a library would quietly resolve.
+#
+# The four checks:
+#
+#   loadable    no duplicate key in one mapping, no tab indentation, and no
+#               block scalar that ends early. The last is this template's own
+#               hazard: every action here carries a python program inside
+#               `run: |`, and YAML ends a block scalar at the first line
+#               indented less than its first line. A prompt written flush-left
+#               inside one truncates the program GitHub loads -- with no error,
+#               at the exact point where the rest of the file stops existing.
+#
+#   provable    every action under .github/actions/ accepts `command:
+#               selftest`. An action that cannot prove itself is one nothing
+#               downstream should trust, and it is how a check gets deleted:
+#               not by argument, by nobody noticing it went.
+#
+#   resolvable  every `uses: ./.github/actions/X` names a directory that is
+#               there. A local `uses:` that does not resolve fails at run time,
+#               in the middle of a night, on a step nobody was watching.
+#
+#   agreed      the request client is duplicated between `draft` and `ladder`,
+#               because a composite action cannot be called in a loop and
+#               `draft` needs six attempts. A copy that is checked is the
+#               honest version of a copy; an unchecked one is two definitions
+#               that have to agree and eventually will not.
+
+inputs:
+  command:
+    description: "check | selftest"
+    required: true
+  root:
+    description: "the tree to check"
+    required: false
+    default: "."
+
+outputs:
+  actions:
+    description: "how many actions were checked"
+    value: ${{ steps.run.outputs.actions }}
+  workflows:
+    description: "how many workflows were checked"
+    value: ${{ steps.run.outputs.workflows }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import os, re, sys
+        from pathlib import Path
+
+        KEY = re.compile(r"^(\s*)(-\s+)?([A-Za-z_][\w.\-]*)\s*:(\s|$)")
+        ITEM = re.compile(r"^(\s*)-(\s|$)")
+        BLOCK = re.compile(r":\s*[|>][+-]?\d*\s*$")
+        USES = re.compile(r"^\s*(?:-\s+)?uses:\s*['\"]?(\./[^\s'\"]+)")
+        # `(?<![<])` so that `# <<< ask` -- a marker comment, not a redirection
+        # -- does not read as `<< ask`.
+        HEREDOC = re.compile(r"(?<![<])<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s*$")
+
+        class TemplateError(Exception): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def loadable(path, text):
+            """Everything a structural read can say about one file.
+
+            Returns (problems, uses). The `uses:` values are collected HERE,
+            by the same walk that already knows where the block scalars and
+            the comments are, rather than by a regex over the whole file --
+            which found this action's own documentation and the string
+            literals inside its selftest, and reported them as unresolved
+            local actions.
+            """
+            bad, uses = [], []
+            lines = text.split("\n")
+            # (indent, {keys seen}) for each open mapping, outermost first.
+            stack = [(-1, set())]
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                if line.strip().startswith("#") or not line.strip():
+                    i += 1; continue
+                u = USES.match(line)
+                if u:
+                    uses.append(u.group(1))
+                if "\t" in line[: len(line) - len(line.lstrip())]:
+                    bad.append("line %d: a tab in the indentation; YAML forbids it" % (i + 1))
+                    i += 1; continue
+
+                if BLOCK.search(line):
+                    # Skip the scalar. YAML ends it at the first non-empty line
+                    # indented less than its first line, and that is legal --
+                    # it is how `run:` gives way to the next key. What is NOT
+                    # legal is a HEREDOC inside the scalar whose terminator is
+                    # on the far side of that boundary: the shell then gets a
+                    # program cut off wherever YAML happened to stop, GitHub
+                    # reports nothing wrong, and the step runs a fragment.
+                    #
+                    # Every action in this template is a python program inside
+                    # `run: |`, so this is the template's own characteristic
+                    # way of breaking, and a generic "ends early" heuristic
+                    # both misses it -- the offending line is usually at column
+                    # zero, outside any plausible guess at the block's owner --
+                    # and fires on ordinary well-formed steps.
+                    j, first, body = i + 1, None, []
+                    while j < len(lines):
+                        cur = lines[j]
+                        if not cur.strip():
+                            body.append(""); j += 1; continue
+                        ind = len(cur) - len(cur.lstrip())
+                        if first is None:
+                            first = ind
+                        elif ind < first:
+                            break
+                        body.append(cur[first:] if len(cur) >= first else cur.strip())
+                        j += 1
+                    for n, b in enumerate(body):
+                        if b.lstrip().startswith("#"):
+                            # `# <<< ask` reads as a heredoc opener `<< ask` to
+                            # a regex that does not check what precedes the
+                            # `<<`. The marker comments this template uses to
+                            # bracket its one duplicated block are exactly that
+                            # shape, so the check reported every action that
+                            # carries one.
+                            continue
+                        m = HEREDOC.search(b)
+                        if not m:
+                            continue
+                        term = m.group(1)
+                        if not any(x.strip() == term for x in body[n + 1:]):
+                            bad.append(
+                                "line %d opens a heredoc <<%s that never closes inside this "
+                                "run: block. YAML ended the block at line %d, so the shell "
+                                "is handed a TRUNCATED program and GitHub reports nothing "
+                                "wrong." % (i + 1 + n + 1, term, j + 1))
+                    i = j; continue
+
+                m = KEY.match(line)
+                if not m:
+                    if ITEM.match(line):
+                        # A bare `- value` at this indent. Nothing to track.
+                        pass
+                    i += 1; continue
+                indent, dash, key, _ = m.groups()
+                depth = len(indent) + (len(dash) if dash else 0)
+                if dash:
+                    # `- key:` opens a fresh mapping for this sequence item, so
+                    # the same key in two items is not a duplicate.
+                    while stack and stack[-1][0] >= depth:
+                        stack.pop()
+                    stack.append((depth, set()))
+                else:
+                    while stack and stack[-1][0] > depth:
+                        stack.pop()
+                    if not stack or stack[-1][0] < depth:
+                        stack.append((depth, set()))
+                seen = stack[-1][1]
+                if key in seen:
+                    bad.append(
+                        "line %d: %r again in the same mapping. A permissive loader keeps "
+                        "the last of the pair and agrees with a file GitHub refuses "
+                        "outright." % (i + 1, key))
+                seen.add(key)
+                i += 1
+            return bad, uses
+
+        def has_selftest(text):
+            return "selftest" in text and re.search(r"command.*selftest|selftest.*command",
+                                                    text, re.S) is not None
+
+        def block(text, name):
+            m = re.search(r"# >>> %s\b.*?\n(.*?)\n\s*# <<< %s\b" % (name, name), text, re.S)
+            return m.group(1) if m else None
+
+        def check(root):
+            root = Path(root)
+            problems, n_actions, n_workflows = [], 0, 0
+
+            wf = root / ".github/workflows"
+            files = []
+            if wf.is_dir():
+                files += sorted(p for p in wf.iterdir() if p.suffix in (".yml", ".yaml"))
+            n_workflows = len(files)
+            actions = []
+            ad = root / ".github/actions"
+            if ad.is_dir():
+                for sub in sorted(x for x in ad.iterdir() if x.is_dir()):
+                    p = sub / "action.yml"
+                    if not p.is_file():
+                        p = sub / "action.yaml"
+                    if not p.is_file():
+                        problems.append("%s has no action.yml" % sub.name)
+                        continue
+                    actions.append((sub.name, p))
+            n_actions = len(actions)
+            files += [p for _, p in actions]
+
+            for p in files:
+                bad, uses = loadable(p, p.read_text(encoding="utf-8"))
+                for b in bad:
+                    problems.append("%s: %s" % (p.relative_to(root), b))
+                for u in uses:
+                    # `u[2:]` and not `lstrip("./")`. lstrip strips CHARACTERS,
+                    # so `./.github/actions/cert` came back as
+                    # `github/actions/cert` and every local action read as
+                    # missing. Every path in this template begins with a dot.
+                    rel = u[2:] if u.startswith("./") else u
+                    # A directory for a composite action, a FILE for a
+                    # reusable workflow. Requiring a directory refused every
+                    # `uses: ./.github/workflows/x.yml`, which is how one
+                    # workflow calls another and is the whole shape of the
+                    # night's judge step.
+                    target = root / rel
+                    if not (target.is_dir() or target.is_file()):
+                        problems.append("%s uses %s, which is not there"
+                                        % (p.relative_to(root), u))
+                    elif target.is_dir() and not (target / "action.yml").is_file() \
+                            and not (target / "action.yaml").is_file():
+                        problems.append("%s uses %s, which has no action.yml"
+                                        % (p.relative_to(root), u))
+
+            for name, p in actions:
+                if not has_selftest(p.read_text(encoding="utf-8")):
+                    problems.append(
+                        "%s has no selftest command. An action that cannot prove itself is "
+                        "one nothing downstream should trust." % name)
+
+            a = root / ".github/actions/draft/action.yml"
+            b = root / ".github/actions/ladder/action.yml"
+            if a.is_file() and b.is_file():
+                x = block(a.read_text(encoding="utf-8"), "ask")
+                y = block(b.read_text(encoding="utf-8"), "ask")
+                if x is None or y is None:
+                    problems.append("the duplicated `ask` block has lost its markers in "
+                                    "draft or ladder, so nothing is checking the copies")
+                elif x != y:
+                    problems.append(
+                        "draft and ladder carry DIFFERENT copies of the request client. "
+                        "They are two definitions of how this machine talks to a model, and "
+                        "they have drifted.")
+            return problems, n_actions, n_workflows
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+
+            lo = lambda f, s: loadable(f, s)[0]
+            us = lambda s: loadable("f", s)[1]
+
+            good = "on:\n  push:\n    branches: [main]\njobs:\n  a:\n    runs-on: x\n"
+            claim("a well-formed workflow has nothing wrong with it", lo("f", good) == [])
+
+            dup = "jobs:\n  a:\n    runs-on: x\n    runs-on: y\n"
+            claim("two of one key in one mapping is caught", len(lo("f", dup)) == 1)
+            claim("and the message says why a loader would not catch it",
+                  "keeps the last" in lo("f", dup)[0])
+
+            twice = ("jobs:\n  a:\n    steps:\n      - run: x\n        env:\n          A: 1\n"
+                     "        env:\n          B: 2\n")
+            claim("the two-env-keys-on-one-step bug is caught", len(lo("f", twice)) == 1)
+
+            items = ("steps:\n  - name: one\n    run: x\n  - name: two\n    run: y\n")
+            claim("the same key in two list items is not a duplicate",
+                  lo("f", items) == [])
+            claim("but twice in ONE list item is",
+                  len(lo("f", "steps:\n  - name: one\n    name: two\n")) == 1)
+
+            siblings = "a:\n  x: 1\nb:\n  x: 2\n"
+            claim("the same key under two different parents is not a duplicate",
+                  lo("f", siblings) == [])
+
+            tab = "jobs:\n\ta: x\n"
+            claim("a tab in the indentation is caught", len(lo("f", tab)) == 1)
+
+            blk = "run: |\n  line one\n  line two\n"
+            claim("a block scalar is skipped rather than parsed as keys",
+                  lo("f", blk) == [])
+            claim("a key-looking line inside a block scalar is not a key",
+                  lo("f", "run: |\n  a: 1\n  a: 2\n") == [])
+            early = "steps:\n  - run: |\n      first: line\n    name: x\n"
+            claim("a block that ends at a real sibling key is fine",
+                  lo("f", early) == [])
+            closed = ("steps:\n  - run: |\n      python3 - <<'PY'\n      print(1)\n"
+                      "      PY\n    name: x\n")
+            claim("a heredoc that closes inside its block is fine",
+                  lo("f", closed) == [])
+            trap = ("steps:\n  - run: |\n      python3 - <<'PY'\n      print(1)\n"
+                    "    name: x\n")
+            claim("a heredoc whose terminator fell outside the block is caught",
+                  len(lo("f", trap)) == 1)
+            claim("and the message says the shell gets a truncated program",
+                  "TRUNCATED" in lo("f", trap)[0])
+            flush = ("steps:\n  - run: |\n      python3 - <<'PY'\n      x = \"\"\"\n"
+                     "prompt at column zero\n\"\"\"\n      PY\n")
+            claim("a line at column zero inside a block ends it, and the heredoc "
+                  "terminator is stranded",
+                  len(lo("f", flush)) == 1)
+
+            claim("a local uses is found", us("      - uses: ./.github/actions/cert\n")
+                  == ["./.github/actions/cert"])
+            claim("a marketplace one is not", us("      - uses: actions/checkout@v4\n") == [])
+            claim("a reusable workflow is used by file, not by directory",
+                  us("    uses: ./.github/workflows/loop-judge.yml\n")
+                  == ["./.github/workflows/loop-judge.yml"])
+            claim("a uses inside a comment is not a uses",
+                  us("      # - uses: ./.github/actions/X\n") == [])
+            claim("nor is one inside a block scalar, where it is a string literal",
+                  us("      - run: |\n          uses: ./.github/actions/cert\n") == [])
+            claim("a dotted local path survives being resolved",
+                  ("./.github/actions/cert")[2:] == ".github/actions/cert",
+                  "lstrip('./') would have eaten the leading dot of .github")
+            claim("a marker comment is not a heredoc",
+                  lo("f", "steps:\n  - run: |\n      # <<< ask\n      x\n") == [])
+
+            claim("a marked block is extracted",
+                  block("# >>> ask -- a note\nBODY\n# <<< ask\n", "ask") == "BODY")
+            claim("and an unmarked file answers None", block("nothing", "ask") is None)
+            claim("the marker's own comment line is not part of the block",
+                  block("# >>> ask -- draft says this\nBODY\n# <<< ask", "ask")
+                  == block("# >>> ask -- ladder says that\nBODY\n# <<< ask", "ask"))
+
+            claim("an action without a selftest is noticed",
+                  not has_selftest("inputs:\n  command:\n    description: run\n"))
+            claim("and one with it is not",
+                  has_selftest("inputs:\n  command:\n    description: run | selftest\n"))
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd != "check":
+            print("::error::template-check: no such command: %r" % cmd); sys.exit(1)
+
+        problems, n_actions, n_workflows = check(os.environ.get("ROOT", ".") or ".")
+        out("actions", str(n_actions)); out("workflows", str(n_workflows))
+        if problems:
+            for p in problems:
+                print("::error::%s" % p)
+            sys.exit(1)
+        print("  %d action(s) and %d workflow(s): every one loadable, every action provable, "
+              "every local uses resolved" % (n_actions, n_workflows))
+        PYEOF

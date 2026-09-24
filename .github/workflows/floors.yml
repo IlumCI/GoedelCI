@@ -1,0 +1,136 @@
+name: floors
+
+# The noise floors in `goedel.toml` decide whether a measurement moved. This
+# measures them on the runner class the judge actually runs on: ONE tree, N
+# harness runs, per-rail between-run spread, committed to `loop/main` as a
+# small TSV.
+#
+# **It is data and never a verdict.** It does not edit the floors it measures;
+# changing a declared floor is a `boundary` proposal, and this is the evidence
+# such a proposal must cite. The factory does not get to edit the judge -- the
+# original of this machine had floors measured once, on one machine, wrong by
+# up to seven times, and nothing that could notice.
+#
+# CONSUMER: boundary proposals declaring `floors`, and an operator reading the
+# flag step. CANARY: the flag step must fire whenever a declared floor is
+# outside the band, and a flag logic that cannot reproduce a known gap is
+# broken -- so the summary names any rail it measured that has no declared
+# floor at all, which is the commonest way a project's floors go stale.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "how many times to run the harness over one tree"
+        default: "8"
+  schedule:
+    # Weekly, and in the same concurrency group as the night, so it serialises
+    # against it rather than racing it for the branch.
+    - cron: "7 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: loop-main
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: loop/main
+          fetch-depth: 0
+
+      - id: cfg
+        uses: ./.github/actions/config
+        with: { command: load }
+
+      # One tree, many readings. `repeats` here is the WHOLE measurement:
+      # every sample is of the same artifact, so whatever they disagree by is
+      # the machine and the day, and nothing else.
+      - id: harness
+        uses: ./.github/actions/harness
+        with:
+          command: run
+          config: ${{ steps.cfg.outputs.json }}
+          arm: floors
+          repeats: ${{ inputs.runs || '8' }}
+
+      - id: spread
+        uses: ./.github/actions/rails
+        with:
+          command: spread
+          before: rails-floors.txt
+          config: ${{ steps.cfg.outputs.json }}
+          out: spread.tsv
+
+      - name: Say which declared floors no longer describe the machine
+        shell: bash
+        env:
+          CFG: ${{ steps.cfg.outputs.json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import json, os
+          from pathlib import Path
+          cfg = json.loads(Path(os.environ["CFG"]).read_text(encoding="utf-8"))
+          floors = cfg["floors"]
+          rows = {}
+          for line in Path("spread.tsv").read_text(encoding="utf-8").splitlines()[1:]:
+              if line.strip():
+                  name, n, med, p95 = line.split("\t")
+                  rows[name] = float(p95)
+
+          def declared(rail):
+              best, best_len = None, -1
+              for prefix, value in floors.items():
+                  if (rail == prefix or rail.startswith(prefix)) and len(prefix) > best_len:
+                      best, best_len = float(value), len(prefix)
+              return best
+
+          flagged = 0
+          for name in sorted(rows):
+              p95, f = rows[name], declared(name)
+              if f is None:
+                  print("::warning::%s was measured at %.2f%% spread and has no declared "
+                        "floor, so any movement in it counts as real" % (name, p95 * 100))
+                  flagged += 1
+              elif p95 > 0 and not (p95 <= f <= 2 * p95):
+                  print("::warning::%s: the declared floor %.2f%% is outside [%.2f%%, %.2f%%] "
+                        "of what this runner class actually does" % (name, f * 100,
+                                                                     p95 * 100, 2 * p95 * 100))
+                  flagged += 1
+          print("  %d rail(s) measured, %d flagged" % (len(rows), flagged))
+          if flagged:
+              print("  a floors change is a boundary proposal; this file is its evidence")
+          PYEOF
+
+      - name: File it
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p loop/evidence/floors
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          cp spread.tsv "loop/evidence/floors/$stamp.tsv"
+          git add loop/evidence/floors
+          git commit -q -m "floors: the between-run spread on this runner class ($stamp)"
+          git push origin HEAD:refs/heads/loop/main
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: floors-${{ github.run_id }}
+          path: |
+            spread.tsv
+            rails-floors.txt
+            harness-floors.log
+          if-no-files-found: ignore
+          retention-days: 90

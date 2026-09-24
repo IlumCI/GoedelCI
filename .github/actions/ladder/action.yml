@@ -593,7 +593,13 @@ runs:
                 print(body)
                 out("have", "yes" if openr else "no"); out("why", "")
             elif cmd == "progress":
-                print(progress(rungs, entries, goal, limit))
+                text = progress(rungs, entries, goal, limit)
+                print(text)
+                # Also to a file. A composite action's stdout is not something
+                # a caller can capture, and the audit pull request needs these
+                # lines in its body -- a multi-line job output is a quoting
+                # accident and GITHUB_OUTPUT has no good way to carry a table.
+                Path("ladder-progress.txt").write_text(text + "\n", encoding="utf-8")
                 out("have", "yes" if openr else "no"); out("why", "")
             elif cmd == "next":
                 if not openr:

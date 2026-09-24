@@ -1,42 +1,31 @@
 name: boundary
 
-# The only lane that may change the evaluator -- rails.py's floors, the
-# judge workflows, godel.py itself -- and it ships LAST by operator
-# decision: the epoch gate below needs a ledger to count, and a gate with
-# no track record to gate against is a ceremony.
+# **The only lane that may change the evaluator**: the actions under
+# `.github/actions/`, the workflows, the floors and bars in `goedel.toml`.
+# Everywhere else the machine changes the project and a fixed judge decides.
+# Here the machine changes the JUDGE, and nothing about that is safe by
+# default -- an evaluator free to rewrite its own bar will discover that the
+# cheapest way to pass is a lower one.
 #
-# Structure, in godel.rs's judge_verdict idiom:
-#   epoch  -- evaluator changes are questionable only at frozen-bar epoch
-#             boundaries (EPOCH_LEN entries), never mid-epoch, never at
-#             genesis. Off-boundary dispatches refuse with the distance.
-#   Sane   -- the patched evaluator's own selftests pass; a floors change
-#             sits inside [p95, 2*p95] of the newest measured spread.
-#   Moves  -- old and new judge configurations must disagree on at least
-#             one archived anchor pair, or the change is a certificate with
-#             no content.
-#   Honest -- loosening admitted only where newly-admitted pairs' ground
-#             truth was good; tightening only where newly-refused ones were
-#             not gains. Pairs without ground truth abstain.
+# It ships last by design and it is the one lane an operator starts by hand.
+# The epoch gate needs a ledger to count and a gate with no track record to
+# gate against is a ceremony.
 #
-# The write half runs under environment `evaluator`, whose required
-# reviewer means every run BLOCKS on a human before EVALUATOR_TOKEN exists
-# in it -- and the output is a PR to main, never a push, even to loop/main:
-# evaluator changes reach the machine only through main, which the machine
-# then follows.
+# Two human decisions, not one. The write half runs under the `evaluator`
+# environment, whose required reviewer means every run BLOCKS before
+# `EVALUATOR_TOKEN` resolves; and its output is a pull request to the default
+# branch, never a push -- not even to `loop/main`. Evaluator changes reach the
+# machine only through the branch a human merges, which the machine then
+# follows.
 #
-# The machine may DRAFT proposals into loop/evidence/boundary/ through its
-# ordinary lane (they are data); only an operator dispatch judges one.
-#
-# CONSUMER: the operator, twice (environment approval, then the PR merge).
-# CANARY: the Sane drill (a floors change outside 2*p95 must refuse) and
-# the Moves gap -- with no anchors archived yet, Moves/Honest REFUSE with
-# the gap named rather than passing on nothing; absent is not ok.
+# The machine may DRAFT proposals into `loop/boundary/` through its ordinary
+# lane, because they are data. Only an operator dispatch judges one.
 
 on:
   workflow_dispatch:
     inputs:
       proposal:
-        description: "path under loop/evidence/boundary/ (a diff + declaration)"
+        description: "path under loop/boundary/ (a declaration line, then a diff)"
         required: true
 
 permissions:
@@ -49,144 +38,212 @@ concurrency:
 jobs:
   judge:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     env:
       PROPOSAL: ${{ inputs.proposal }}
     outputs:
       ok: ${{ steps.verdict.outputs.ok }}
+      declares: ${{ steps.proposal.outputs.declares }}
+      moves: ${{ steps.verdict.outputs.moves }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: loop/main
           fetch-depth: 0
 
-      - name: The epoch gate
-        run: |
-          set -euo pipefail
-          python3 - <<'PYEOF'
-          import os, sys
-          sys.path.insert(0, "tools")
-          import godel
-          n = len(godel.load_entries("."))
-          if not godel.is_boundary(n):
-              to_go = godel.EPOCH_LEN - (n % godel.EPOCH_LEN) if n else godel.EPOCH_LEN
-              print(f"::error::the ledger holds {n} entr{'y' if n==1 else 'ies'}; "
-                    f"the criterion is questionable only at epoch boundaries, "
-                    f"{to_go} away")
-              sys.exit(1)
-          print(f"at an epoch boundary ({n} entries); the criterion may be questioned")
-          PYEOF
+      - id: cfg
+        uses: ./.github/actions/config
+        with: { command: load }
 
-      - name: The proposal itself
+      - id: ledger
+        uses: ./.github/actions/ledger
+        with:
+          command: fsck
+          epoch-len: ${{ steps.cfg.outputs.epoch-len }}
+
+      - id: proposal
+        name: The proposal itself
+        shell: bash
         run: |
           set -euo pipefail
           case "$PROPOSAL" in
-            loop/evidence/boundary/*) ;;
-            *) echo "::error::proposals live under loop/evidence/boundary/"; exit 1;;
+            loop/boundary/*) ;;
+            *) echo "::error::proposals live under loop/boundary/"; exit 1;;
           esac
           test -f "$PROPOSAL" || { echo "::error::no such proposal"; exit 1; }
-          # Line 1: `declares <floors|judge-logic|workflow|gate-check>`.
-          # The rest: a unified diff touching EVALUATOR paths only.
           decl=$(head -1 "$PROPOSAL")
           case "$decl" in
-            "declares floors"|"declares judge-logic"|"declares workflow"|"declares gate-check") ;;
-            *) echo "::error::the proposal declares nothing this lane knows"; exit 1;;
+            "declares floors"|"declares judge"|"declares workflow"|"declares bar") ;;
+            *) echo "::error::the proposal declares nothing this lane knows: $decl"; exit 1;;
           esac
-          echo "DECL=${decl#declares }" >> "$GITHUB_ENV"
+          echo "declares=${decl#declares }" >> "$GITHUB_OUTPUT"
           tail -n +2 "$PROPOSAL" > /tmp/boundary.diff
           git apply --check --stat /tmp/boundary.diff
 
-      - name: Sane
+      # **The inverse of every other mask in this repository.** A boundary
+      # proposal may touch ONLY the evaluator. A diff that reaches into the
+      # project as well would be an ordinary change smuggled through the one
+      # lane that does not judge ordinary changes -- adopted on Moves and
+      # Honest, which say nothing about whether the project still works.
+      - name: It may touch the evaluator, and nothing else
+        shell: bash
+        env:
+          CFG: ${{ steps.cfg.outputs.json }}
         run: |
           set -euo pipefail
-          git apply /tmp/boundary.diff
-          python3 tools/rails.py --selftest
-          python3 tools/knob.py --selftest
-          python3 tools/godel.py --selftest
-          if [ "$DECL" = "floors" ]; then
-            newest=$(ls loop/evidence/floors/*.tsv 2>/dev/null | sort | tail -1 || true)
-            if [ -z "$newest" ]; then
-              echo "::error::a floors change with no measured spread to cite; run evidence-floors first"
-              exit 1
-            fi
-            python3 - "$newest" <<'PYEOF'
-          import io, sys
-          sys.path.insert(0, "tools")
-          import importlib, rails
-          importlib.reload(rails)          # the PATCHED table
-          rows = {r.split("\t")[0]: float(r.split("\t")[3])
-                  for r in io.open(sys.argv[1]) if not r.startswith("rail")}
-          bad = 0
-          for prefix, f in rails.NOISE.items():
-              p95s = [v for name, v in rows.items()
-                      if name == prefix or name.startswith(prefix)]
-              if not p95s:
+          python3 - <<'PYEOF'
+          import fnmatch, json, os, re, sys
+          from pathlib import Path
+          cfg = json.loads(Path(os.environ["CFG"]).read_text(encoding="utf-8"))
+          def m(p, masks):
+              if p.startswith("./"):
+                  p = p[2:]
+              for x in masks:
+                  if fnmatch.fnmatch(p, x):
+                      return True
+                  if x.endswith("/**") and (p == x[:-3] or p.startswith(x[:-2])):
+                      return True
+              return False
+          paths = []
+          for line in Path("/tmp/boundary.diff").read_text(encoding="utf-8").splitlines():
+              g = re.match(r"^diff --git a/(.+?) b/(.+)$", line)
+              if g:
+                  for x in g.groups():
+                      if x != "/dev/null" and x not in paths:
+                          paths.append(x)
+          if not paths:
+              print("::error::the proposal's diff names no file")
+              sys.exit(1)
+          bad = [p for p in paths if not m(p, cfg["evaluator"])]
+          if bad:
+              print("::error::a boundary proposal may touch only the evaluator; these are "
+                    "not evaluator paths: " + ", ".join(bad))
+              sys.exit(1)
+          print("  %d evaluator file(s): %s" % (len(paths), ", ".join(paths)))
+          PYEOF
+
+      # --- the anchors, as the CURRENT evaluator reads them ---------------
+      - id: old
+        uses: ./.github/actions/rails
+        with:
+          command: anchors
+          anchors: loop/anchors
+          config: ${{ steps.cfg.outputs.json }}
+          out: anchors-old.tsv
+
+      - name: Apply it
+        shell: bash
+        run: git apply /tmp/boundary.diff
+
+      # --- Sane: the patched evaluator still proves itself ----------------
+      #
+      # Every claim suite, with the change applied. A proposal that breaks a
+      # check does not get to argue that the check was wrong -- that argument
+      # is a separate proposal, made against the check.
+      - uses: ./.github/actions/template-check
+        with: { command: check }
+      - uses: ./.github/actions/cert
+        with: { command: selftest }
+      - uses: ./.github/actions/ledger
+        with: { command: selftest }
+      - uses: ./.github/actions/config
+        with: { command: selftest }
+      - uses: ./.github/actions/envelope
+        with: { command: selftest }
+      - uses: ./.github/actions/rails
+        with: { command: selftest }
+      - uses: ./.github/actions/archive
+        with: { command: selftest }
+      - uses: ./.github/actions/ladder
+        with: { command: selftest }
+      - uses: ./.github/actions/draft
+        with: { command: selftest }
+      - uses: ./.github/actions/harness
+        with: { command: selftest }
+      - uses: ./.github/actions/budget
+        with: { command: selftest }
+      - uses: ./.github/actions/adopt-decide
+        with: { command: selftest }
+      - uses: ./.github/actions/boundary-judge
+        with: { command: selftest }
+
+      # A floors change must cite a measurement, and the measurement must be
+      # one this runner class produced. A number somebody typed is what the
+      # original of this machine had, and it was wrong by up to seven times.
+      - name: A floors change must sit inside the measured spread
+        if: steps.proposal.outputs.declares == 'floors'
+        shell: bash
+        run: |
+          set -euo pipefail
+          newest=$(ls -1 loop/evidence/floors/*.tsv 2>/dev/null | sort | tail -1 || true)
+          if [ -z "$newest" ]; then
+            echo "::error::a floors change with no measured spread to cite."
+            echo "::error::run the `floors` workflow first; a floor nobody measured is a"
+            echo "::error::number somebody typed."
+            exit 1
+          fi
+          python3 - "$newest" <<'PYEOF'
+          import json, sys, tomllib
+          from pathlib import Path
+          rows = {}
+          for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()[1:]:
+              if not line.strip():
                   continue
-              p95 = max(p95s)
-              if p95 > 0 and not (p95 <= f <= 2 * p95):
+              name, n, med, p95 = line.split("\t")
+              rows[name] = float(p95)
+          floors = tomllib.loads(Path("goedel.toml").read_text(encoding="utf-8")).get("floors", {})
+          bad = 0
+          for prefix, f in floors.items():
+              seen = [v for name, v in rows.items() if name == prefix or name.startswith(prefix)]
+              if not seen:
+                  continue
+              p95 = max(seen)
+              # A floor below the measured spread admits the day as an effect;
+              # one far above it refuses real improvements. Twice the spread is
+              # the band, and it is a judgement rather than a theorem -- which
+              # is why it is stated here where a proposal can argue with it.
+              if p95 > 0 and not (p95 <= float(f) <= 2 * p95):
                   bad += 1
-                  print(f"::error::{prefix}: {f} is outside [{p95:.3f}, {2*p95:.3f}] "
-                        f"of the newest measured spread")
+                  print("::error::%s: %s is outside [%.4f, %.4f] of the newest measured spread"
+                        % (prefix, f, p95, 2 * p95))
           sys.exit(1 if bad else 0)
           PYEOF
-          fi
-          if [ "$DECL" = "workflow" ]; then
-            curl -sSL https://github.com/rhysd/actionlint/releases/latest/download/actionlint_linux_amd64.tar.gz \
-              | tar xz actionlint
-            ./actionlint
-          fi
-          git apply -R /tmp/boundary.diff
 
-      # With no archived anchors these two REFUSE rather than pass, and say
-      # why: a Moves that cannot be asked is not a Moves that passed.
-      - name: Moves, then Honest
-        id: verdict
-        run: |
-          set -euo pipefail
-          # Same trap as the ledger count; see loop-judge.yml.
-          pairs=0
-          if [ -d loop/evidence/anchors ]; then
-            pairs=$(ls -1 loop/evidence/anchors | wc -l)
-          fi
-          if [ "$pairs" = "0" ]; then
-            echo "::error::no anchor pairs are archived, so whether this change"
-            echo "::error::MOVES anything cannot be asked -- harvest anchors from"
-            echo "::error::evidence-boot first; absent is not ok"
-            exit 1
-          fi
-          # Each anchor pair: before.txt/after.txt + a ground line. Old and
-          # new rails.py must disagree somewhere (Moves), and every
-          # disagreement must side with the ground truth (Honest).
-          moves=0; dishonest=0
-          for d in loop/evidence/anchors/*/; do
-            old=$(python3 tools/rails.py judge "$d/before.txt" "$d/after.txt" \
-                    --claims "$(cat "$d/claims")" >/dev/null 2>&1; echo $?)
-            git apply /tmp/boundary.diff
-            new=$(python3 tools/rails.py judge "$d/before.txt" "$d/after.txt" \
-                    --claims "$(cat "$d/claims")" >/dev/null 2>&1; echo $?)
-            git apply -R /tmp/boundary.diff
-            if [ "$old" != "$new" ]; then
-              moves=$((moves + 1))
-              truth=$(cat "$d/ground" 2>/dev/null || echo "unknown")
-              want=$([ "$truth" = "real" ] && echo 0 || echo 1)
-              if [ "$truth" != "unknown" ] && [ "$new" != "$want" ]; then
-                dishonest=$((dishonest + 1))
-                echo "::error::$d: the new judge answers $new where ground truth says $truth"
-              fi
-            fi
-          done
-          if [ "$moves" = "0" ]; then
-            echo "::error::old and new judges agree on every anchor -- a change with no content"
-            exit 1
-          fi
-          if [ "$dishonest" != "0" ]; then
-            exit 1
-          fi
-          echo "moves on $moves pair(s), honestly"
-          echo "ok=yes" >> "$GITHUB_OUTPUT"
+      # --- the anchors again, as the PROPOSED evaluator reads them --------
+      - id: new
+        uses: ./.github/actions/rails
+        with:
+          command: anchors
+          anchors: loop/anchors
+          config: ${{ steps.cfg.outputs.json }}
+          out: anchors-new.tsv
 
-  # The write half: blocked on a human by the environment, and its output
-  # is a PR, never a push.
+      - name: Put it back before judging it
+        shell: bash
+        run: git apply -R /tmp/boundary.diff
+
+      - id: verdict
+        uses: ./.github/actions/boundary-judge
+        with:
+          command: judge
+          old: anchors-old.tsv
+          new: anchors-new.tsv
+          boundary: ${{ steps.ledger.outputs.boundary }}
+          entries: ${{ steps.ledger.outputs.count }}
+          epoch-len: ${{ steps.cfg.outputs.epoch-len }}
+
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boundary-${{ github.run_id }}
+          path: |
+            anchors-old.tsv
+            anchors-new.tsv
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # The write half: blocked on a human by the environment, and its output is a
+  # pull request, never a push.
   open-pr:
     needs: judge
     if: needs.judge.outputs.ok == 'yes'
@@ -204,19 +261,29 @@ jobs:
           ref: loop/main
           fetch-depth: 0
           token: ${{ secrets.EVALUATOR_TOKEN }}
-      - name: A branch and a PR, for the second human decision
+
+      - name: A branch and a pull request, for the second human decision
+        shell: bash
+        env:
+          DEFAULT: ${{ github.event.repository.default_branch }}
+          DECLARES: ${{ needs.judge.outputs.declares }}
+          MOVES: ${{ needs.judge.outputs.moves }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           name=$(sha256sum "$PROPOSAL" | cut -c1-16)
-          git fetch origin main
-          git checkout -b "boundary/$name" origin/main
+          git fetch origin "$DEFAULT"
+          git checkout -q -b "boundary/$name" "origin/$DEFAULT"
           tail -n +2 "$PROPOSAL" | git apply
           git add -A
-          git commit -m "boundary: $(head -1 "$PROPOSAL") ($name)"
+          git commit -q -m "boundary: $DECLARES ($name)"
           git push origin "boundary/$name"
           GH_TOKEN="$EVALUATOR_TOKEN" gh pr create \
-            --head "boundary/$name" --base main --label evaluator \
-            --title "boundary: $(head -1 "$PROPOSAL")" \
-            --body "An evaluator change, cross-judged at an epoch boundary. The run's log carries Sane/Moves/Honest; merging is the second human decision."
+            --head "boundary/$name" --base "$DEFAULT" --label evaluator \
+            --title "boundary: $DECLARES ($name)" \
+            --body "A change to the evaluator itself, cross-judged at an epoch boundary.
+
+The run's log carries Sane, Moves, Honest and Remembers; it moves on $MOVES archived anchor(s) and disagrees with none of their ground truth. Merging is the second human decision.
+
+Nothing in this branch has been through the ordinary judge, because the ordinary judge is what it changes."

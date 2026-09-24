@@ -51,8 +51,12 @@ description: >-
 
 inputs:
   command:
-    description: "compare | judge | spread | selftest"
+    description: "compare | judge | spread | anchors | selftest"
     required: true
+  anchors:
+    description: "for anchors: a directory of archived comparisons to re-judge"
+    required: false
+    default: loop/anchors
   before:
     description: "the baseline arm's rail file"
     required: false
@@ -73,12 +77,20 @@ inputs:
     description: "for judge: the one rail this candidate claimed to move"
     required: false
     default: ""
+  kind:
+    description: >-
+      the kind being judged. Its allow_rails and adrift_rails are read out of
+      the config, so a workflow never has to restate a list that already exists
+      in goedel.toml -- two copies of which rails a kind may pay for is two
+      answers that have to agree.
+    required: false
+    default: ""
   allow:
-    description: "rails this kind may pay for: priced, not vetoed on"
+    description: "extra rails to price rather than veto on, beyond the kind's own"
     required: false
     default: ""
   adrift:
-    description: "rails nothing here controls for: reported, not attributed"
+    description: "extra rails nothing here controls for: reported, not attributed"
     required: false
     default: ""
   config:
@@ -132,6 +144,8 @@ runs:
         AGAIN_BEFORE: ${{ inputs.again-before }}
         AGAIN_AFTER: ${{ inputs.again-after }}
         CLAIMS: ${{ inputs.claims }}
+        ANCHORS: ${{ inputs.anchors }}
+        KIND: ${{ inputs.kind }}
         ALLOW: ${{ inputs.allow }}
         ADRIFT: ${{ inputs.adrift }}
         CONFIG: ${{ inputs.config }}
@@ -520,6 +534,51 @@ runs:
                         best, best_len = float(value), len(prefix)
                 return best
 
+            if cmd == "anchors":
+                # Re-judge every archived comparison with THIS evaluator, and
+                # print one row each. `boundary` runs it twice -- once on the
+                # tree as it stands and once with a proposed change applied --
+                # and the difference between the two files is the only evidence
+                # that a change to the judge does anything at all.
+                #
+                # It is here rather than in `boundary-judge` because the
+                # comparison logic must be the SAME code the nightly judge
+                # uses. A second implementation of it, however careful, would
+                # let a boundary proposal pass against a judge that is not the
+                # one it is changing.
+                d = Path(os.environ.get("ANCHORS", "loop/anchors"))
+                if not d.is_dir():
+                    print("::error::no anchors under %s -- whether a change to the judge "
+                          "MOVES anything cannot be asked, and absent is not ok" % d)
+                    sys.exit(1)
+                rows_out = ["anchor\tclaims\tverdict\tground"]
+                n = 0
+                for sub in sorted(x for x in d.iterdir() if x.is_dir()):
+                    need = [sub / "before.txt", sub / "after.txt", sub / "claims"]
+                    if not all(x.is_file() for x in need):
+                        raise RailError("anchor %s is missing before.txt, after.txt or claims"
+                                        % sub.name)
+                    claimed = (sub / "claims").read_text(encoding="utf-8").strip()
+                    ground = "unknown"
+                    if (sub / "ground").is_file():
+                        ground = (sub / "ground").read_text(encoding="utf-8").strip()
+                    if ground not in ("real", "noise", "unknown"):
+                        raise RailError("anchor %s: ground truth is real, noise or absent, "
+                                        "not %r" % (sub.name, ground))
+                    rr = compare(read(str(sub / "before.txt")), read(str(sub / "after.txt")),
+                                 floor_for, confidence=float(judge.get("confidence", 0.95)),
+                                 fdr=float(judge.get("fdr", 0.10)), seed=sub.name)
+                    row = by_name(rr, claimed)
+                    rows_out.append("%s\t%s\t%s\t%s"
+                                    % (sub.name, claimed,
+                                       row.verdict if row else ABSENT, ground))
+                    n += 1
+                text = "\n".join(rows_out) + "\n"
+                Path(os.environ["OUT"]).write_text(text, encoding="utf-8")
+                sys.stdout.write(text)
+                out("better", str(n))
+                sys.exit(0)
+
             if cmd == "spread":
                 # The between-run spread of one artifact, for evidence-floors.
                 rails = read(os.environ["BEFORE"])
@@ -532,12 +591,15 @@ runs:
                     print("%s\t%d\t%s\t%.6f" % (name, len(r.samples), num(med), p95))
                 sys.exit(0)
 
+            kind = cfg.get("kinds", {}).get(os.environ.get("KIND", "").strip(), {})
+            allow_rails = list(kind.get("allow_rails", [])) + os.environ.get("ALLOW", "").split()
+            adrift_rails = list(kind.get("adrift_rails", [])) + os.environ.get("ADRIFT", "").split()
+
             rows = compare(
                 read(os.environ["BEFORE"]), read(os.environ["AFTER"]), floor_for,
                 again_before=read(os.environ.get("AGAIN_BEFORE", "")) or None,
                 again_after=read(os.environ.get("AGAIN_AFTER", "")) or None,
-                allow=tuple(os.environ.get("ALLOW", "").split()),
-                adrift=tuple(os.environ.get("ADRIFT", "").split()),
+                allow=tuple(allow_rails), adrift=tuple(adrift_rails),
                 confidence=float(judge.get("confidence", 0.95)),
                 fdr=float(judge.get("fdr", 0.10)),
                 seed=os.environ.get("SEED", ""))

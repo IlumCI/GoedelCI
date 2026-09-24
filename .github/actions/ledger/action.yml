@@ -353,7 +353,10 @@ runs:
                 es = load(root)
                 n = len(es)
             if cmd == "tail":
-                print(tail(es, int(os.environ.get("TAIL_N", "10") or "10")))
+                text = tail(es, int(os.environ.get("TAIL_N", "10") or "10"))
+                print(text)
+                # And to a file, for the same reason ladder's progress is.
+                Path("ledger-tail.txt").write_text(text + "\n", encoding="utf-8")
             elif cmd == "report":
                 adopted = sum(1 for e in es if e.adopted)
                 counted = sum(1 for e in es if e.counted)

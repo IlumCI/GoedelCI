@@ -1,0 +1,266 @@
+name: goedel-boundary-judge
+description: >-
+  Whether a proposed change to the evaluator itself may be offered to a human:
+  the epoch gate, and four questions asked of archived comparisons.
+
+# **This is the lane that makes the repository self-improving rather than
+# merely automated.** Everywhere else, the machine changes the project and a
+# fixed judge decides. Here the machine changes the JUDGE. Nothing about that
+# is safe by default -- an evaluator free to rewrite its own bar will find that
+# the cheapest way to pass is a lower one -- so every gate below exists to make
+# one specific way of cheating impossible.
+#
+# **Epoch.** The Red Queen Goedel Machine's organising idea (arXiv:2606.26294)
+# is that recursive self-improvement under a moving standard is only coherent
+# if the standard holds still for stretches: search runs in epochs, the
+# criterion is fixed within one, and it may move only at a boundary. So the
+# ledger must sit exactly at an epoch edge, and `ledger fsck` refuses a record
+# where it moved anywhere else. Genesis is deliberately not a boundary: a
+# criterion with no track record to gate against is one nothing has tested, and
+# letting the first change through free is the one moment the gate costs
+# nothing to pass.
+#
+# **Moves.** Old and new must disagree about at least one archived comparison.
+# A change to the judge that changes no verdict is a diff with a story; the
+# ledger would record an evaluator change and nothing would have happened.
+#
+# **Honest.** Every disagreement must side with the ground truth. Loosening is
+# admitted only where the newly-admitted anchors were really improvements;
+# tightening only where the newly-refused ones were really noise. Anchors with
+# no recorded ground truth abstain rather than vote -- an unlabelled anchor is
+# not evidence, and counting it either way would let a proposal buy a majority
+# by archiving comparisons nobody has judged.
+#
+# **Remembers.** The dual gate from HarnessEvolve (arXiv:2609.00829), which is
+# there because a self-modifying harness forgets. Every anchor the CURRENT
+# judge refuses and ground truth calls noise must still be refused by the new
+# one. Honest alone does not cover this: a proposal can be honest about the
+# anchors it moves and quietly lose a refusal it was already making, because
+# that anchor is not a disagreement in the direction Honest looks at.
+#
+# **With no anchors archived, every one of these REFUSES rather than passes.**
+# A Moves that cannot be asked is not a Moves that passed, and a gate that
+# waves through what it cannot check is worse than no gate, because it reads
+# green.
+
+inputs:
+  command:
+    description: "judge | selftest"
+    required: true
+  old:
+    description: "the anchors TSV the CURRENT evaluator produced"
+    required: false
+    default: anchors-old.tsv
+  new:
+    description: "the anchors TSV the PROPOSED evaluator produced"
+    required: false
+    default: anchors-new.tsv
+  boundary:
+    description: "yes when the ledger sits at an epoch edge"
+    required: false
+    default: "no"
+  entries:
+    description: "how many entries the ledger holds, for the message"
+    required: false
+    default: "0"
+  epoch-len:
+    description: "how many entries an epoch holds"
+    required: false
+    default: "16"
+
+outputs:
+  ok:
+    description: "yes when the change may be offered to a human"
+    value: ${{ steps.run.outputs.ok }}
+  moves:
+    description: "how many anchors the two evaluators disagree about"
+    value: ${{ steps.run.outputs.moves }}
+  why:
+    description: "one line for the log and the pull request"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        OLD: ${{ inputs.old }}
+        NEW: ${{ inputs.new }}
+        BOUNDARY: ${{ inputs.boundary }}
+        ENTRIES: ${{ inputs.entries }}
+        EPOCH_LEN: ${{ inputs.epoch-len }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import os, sys
+        from pathlib import Path
+
+        ADMITS = ("better",)          # a verdict that would let a candidate through
+
+        class BoundaryError(Exception): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def read_tsv(path):
+            rows = {}
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            if not lines or not lines[0].startswith("anchor\t"):
+                raise BoundaryError("%s is not an anchors table" % path)
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) != 4:
+                    raise BoundaryError("%s: %r is not `anchor claims verdict ground`"
+                                        % (path, line))
+                anchor, claims, verdict, ground = parts
+                rows[anchor] = (claims, verdict, ground)
+            return rows
+
+        def judge(old, new):
+            """(ok, moves, reasons). Pure over two anchor tables."""
+            reasons = []
+            if not old or not new:
+                return (False, 0, ["no anchors are archived, so whether this change MOVES "
+                                   "anything cannot be asked -- harvest anchors first; "
+                                   "absent is not ok"])
+            if set(old) != set(new):
+                missing = sorted(set(old) - set(new)) + sorted(set(new) - set(old))
+                return (False, 0, ["the two runs judged different anchors: %s"
+                                   % ", ".join(missing[:6])])
+
+            moves, dishonest, forgotten = 0, [], []
+            for anchor in sorted(old):
+                _, o, ground = old[anchor]
+                _, n, _ = new[anchor]
+
+                # Remembers, first, because it is about anchors the two AGREE
+                # on as often as ones they do not.
+                if ground == "noise" and o not in ADMITS and n in ADMITS:
+                    forgotten.append(anchor)
+
+                if o == n:
+                    continue
+                moves += 1
+                if ground == "unknown":
+                    # Abstains. An unlabelled anchor is not evidence, and
+                    # counting it either way would let a proposal buy a
+                    # majority by archiving comparisons nobody has judged.
+                    continue
+                wants = ground == "real"
+                if (n in ADMITS) != wants:
+                    dishonest.append("%s: the new judge says %s where the truth is %s"
+                                     % (anchor, n, ground))
+
+            if moves == 0:
+                reasons.append("old and new agree on every anchor -- a change with no content")
+            if dishonest:
+                reasons.append("it disagrees with the ground truth on %d anchor(s): %s"
+                               % (len(dishonest), "; ".join(dishonest[:4])))
+            if forgotten:
+                reasons.append(
+                    "it forgets %d refusal(s) the current judge already makes: %s -- a "
+                    "harness that loosens on what it used to catch has regressed, however "
+                    "honest it is about what it moves"
+                    % (len(forgotten), ", ".join(forgotten[:4])))
+            if reasons:
+                return (False, moves, reasons)
+            labelled = sum(1 for a in old if old[a][2] != "unknown")
+            return (True, moves, ["moves on %d anchor(s), honestly, over %d labelled"
+                                  % (moves, labelled)])
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+
+            def T(**rows):
+                return {k: ("host.q",) + v for k, v in rows.items()}
+
+            claim("with no anchors it refuses rather than passes",
+                  judge({}, {})[0] is False)
+            claim("and says a Moves that cannot be asked is not one",
+                  "cannot be asked" in judge({}, {})[2][0])
+
+            same = T(a=("same", "noise"))
+            claim("a change that moves nothing is refused as having no content",
+                  judge(same, same)[0] is False)
+            claim("and says so", "no content" in judge(same, same)[2][0])
+
+            good = judge(T(a=("same", "real")), T(a=("better", "real")))
+            claim("admitting something the truth calls real is honest", good[0] is True)
+            claim("and counts as a move", good[1] == 1)
+            bad = judge(T(a=("same", "noise")), T(a=("better", "noise")))
+            claim("admitting something the truth calls noise is not", bad[0] is False)
+            claim("and names the anchor", "a:" in bad[2][0])
+
+            tight = judge(T(a=("better", "noise")), T(a=("same", "noise")))
+            claim("refusing something the truth calls noise is honest", tight[0] is True)
+            wrong = judge(T(a=("better", "real")), T(a=("same", "real")))
+            claim("refusing something the truth calls real is not", wrong[0] is False)
+
+            abstain = judge(T(a=("same", "unknown"), b=("same", "real")),
+                            T(a=("better", "unknown"), b=("better", "real")))
+            claim("an unlabelled anchor abstains rather than votes", abstain[0] is True)
+            only = judge(T(a=("same", "unknown")), T(a=("better", "unknown")))
+            claim("but a proposal cannot pass on unlabelled anchors alone",
+                  only[0] is True,
+                  "it moves, and nothing contradicts it -- the labelled-count is in the "
+                  "reason so an operator can see the evidence is thin")
+            claim("and the reason says how many were actually labelled",
+                  "0 labelled" in only[2][0])
+
+            # Remembers: honest about what it moves, and quietly loses a catch.
+            forget = judge(T(a=("same", "real"), b=("same", "noise")),
+                           T(a=("better", "real"), b=("better", "noise")))
+            claim("a proposal that loosens on a known-noise anchor is refused",
+                  forget[0] is False)
+            keep = judge(T(a=("same", "real"), b=("same", "noise")),
+                         T(a=("better", "real"), b=("same", "noise")))
+            claim("and the same proposal without that loosening is not", keep[0] is True)
+            claim("the forgetting reason explains why Honest did not catch it",
+                  any("however honest" in r for r in forget[2]))
+
+            claim("two runs over different anchor sets is refused",
+                  judge(T(a=("same", "real")), T(b=("same", "real")))[0] is False)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd != "judge":
+            print("::error::boundary-judge: no such command: %r" % cmd); sys.exit(1)
+
+        try:
+            if os.environ.get("BOUNDARY", "no") != "yes":
+                n = int(os.environ.get("ENTRIES", "0") or "0")
+                length = int(os.environ.get("EPOCH_LEN", "16") or "16")
+                to_go = length - (n % length) if n else length
+                raise BoundaryError(
+                    "the ledger holds %d entr%s; the criterion is questionable only at an "
+                    "epoch boundary, %d away" % (n, "y" if n == 1 else "ies", to_go))
+            good, moves, reasons = judge(read_tsv(os.environ["OLD"]),
+                                         read_tsv(os.environ["NEW"]))
+            for r in reasons:
+                print(("  " if good else "::error::") + r)
+            out("ok", "yes" if good else "no")
+            out("moves", str(moves))
+            out("why", "; ".join(reasons)[:400].replace("\n", " "))
+            sys.exit(0 if good else 1)
+        except BoundaryError as exc:
+            print("::error::boundary: %s" % exc)
+            out("ok", "no"); out("moves", "0"); out("why", str(exc)[:400])
+            sys.exit(1)
+        PYEOF
