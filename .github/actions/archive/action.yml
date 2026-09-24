@@ -64,6 +64,12 @@ inputs:
     description: "for authors: how many shards the night fans out over"
     required: false
     default: "1"
+  decay:
+    description: >-
+      for authors: how much a trial counts per epoch of age. 1 is all-time,
+      0 counts only the current epoch.
+    required: false
+    default: "1"
   min-evidence:
     description: "counted trials below which reconsider always stays"
     required: false
@@ -110,6 +116,7 @@ runs:
         SEED: ${{ inputs.seed }}
         POOL: ${{ inputs.pool }}
         SHARDS: ${{ inputs.shards }}
+        DECAY: ${{ inputs.decay }}
         MIN_EVIDENCE: ${{ inputs.min-evidence }}
         HALF: ${{ inputs.half }}
       run: |
@@ -233,7 +240,7 @@ runs:
                 return "\n".join("  ".join(c.ljust(x) for c, x in zip(r, w)).rstrip()
                                  for r in rows)
 
-        def authors(entries):
+        def authors(entries, decay=1.0, now=None):
             """Adoptions and trials per author, and the same posterior mean.
 
             **The portfolio's own scoreboard.** A night can fan out over
@@ -246,14 +253,45 @@ runs:
             reason: a one-of-one author is not evidence that it is perfect,
             and the uniform prior is what stops a single lucky draw sorting
             above a model with a long record. Events are not trials.
+
+            **A trial from `n` epochs ago counts `decay ** n`.** The epoch is
+            the span within which `utility` holds still, so a trial judged in
+            an earlier one was judged by a different standard and is weaker
+            evidence about this one -- weaker, not worthless, which is why
+            this discounts rather than truncates. `decay = 0` IS truncation
+            (only the current epoch survives, since anything older weighs
+            zero) and `decay = 1` is the all-time count, so both readings
+            come out of one number.
+
+            The counts go fractional, which Beta takes without complaint: a
+            model with four full-weight adoptions and four half-weight ones
+            is Beta(7, 1), and that is the right amount of confidence.
             """
+            def epoch_of(f):
+                try:
+                    return int(f.get("epoch", 0))
+                except (TypeError, ValueError):
+                    return 0
+
+            if now is None:
+                seen = [epoch_of(f) for _, f in entries]
+                now = max(seen) if seen else 0
             tally = {}
             for _, f in entries:
                 a = (f.get("author") or "-").strip()
                 if not a or a == "-" or f.get("lane") == "event":
                     continue
-                s, t = tally.get(a, (0, 0))
-                tally[a] = (s + (1 if f.get("verdict") == "adopt" else 0), t + 1)
+                # **Age measured in epochs, not in nights.** The epoch is the
+                # span within which the criterion holds still, so it is the
+                # only unit in which two trials are comparable at all. `max(0,
+                # ...)` because an entry cannot be newer than the newest one
+                # and a negative age would weigh it MORE than the present.
+                age = max(0, now - epoch_of(f))
+                w = decay ** age
+                if w <= 0.0:
+                    continue
+                s, t = tally.get(a, (0.0, 0.0))
+                tally[a] = (s + (w if f.get("verdict") == "adopt" else 0.0), t + w)
             return {a: (s, t, (s + 1.0) / (t + 2.0)) for a, (s, t) in tally.items()}
 
         def authors_report(tally):
@@ -262,7 +300,11 @@ runs:
             rows = [("author", "adopted", "trials", "cmp")]
             for a in sorted(tally, key=lambda k: (-tally[k][2], k)):
                 s, t, c = tally[a]
-                rows.append((a, str(s), str(t), "%.3f" % c))
+                # Fractional, because they are discounted by age. Printed to
+                # one place rather than rounded to integers: "3.5 of 6.0" is
+                # the actual evidence, and an operator reading "4 of 6" would
+                # be reading a number nothing computed.
+                rows.append((a, "%.1f" % s, "%.1f" % t, "%.3f" % c))
             w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
             return "\n".join("  " + "  ".join(c.ljust(x) for c, x in zip(r, w)).rstrip()
                               for r in rows)
@@ -489,8 +531,8 @@ runs:
             claim("and a move to one says it went up and back down",
                   not over or "back down" in over[0][4] or "down into" in over[0][4])
             # -- the portfolio's scoreboard --------------------------------
-            def E(author, verdict, lane="model"):
-                return ("x", {"author": author, "verdict": verdict, "lane": lane})
+            def E(author, verdict, lane="model", epoch=0):
+                return ("x", {"author": author, "verdict": verdict, "lane": lane, "epoch": epoch})
             
             t = authors([E("a", "adopt"), E("a", "refuse"), E("b", "adopt")])
             claim("an author's adoptions and trials are counted",
@@ -508,6 +550,46 @@ runs:
                   authors_report(t).splitlines()[1].split()[0] == "b")
             claim("and says so plainly when nothing has been attributed yet",
                   "no author" in authors_report({}))
+
+            # -- and a record that stops counting ---------------------------
+            old = [E("a", "adopt", epoch=0)] * 4 + [E("b", "adopt", epoch=3)] * 4
+            flat = authors(old, decay=1.0)
+            claim("at decay 1 an ancient trial counts as much as tonight's",
+                  flat["a"][1] == flat["b"][1] == 4.0, flat)
+            half = authors(old, decay=0.5)
+            claim("at decay 0.5 a trial three epochs old counts an eighth",
+                  abs(half["a"][1] - 0.5) < 1e-9 and half["b"][1] == 4.0, half)
+            claim("so the recent author outranks the ancient one on the same record",
+                  half["b"][2] > half["a"][2])
+            hard = authors(old, decay=0.0)
+            claim("decay 0 IS truncation: only the current epoch survives",
+                  list(hard) == ["b"] and hard["b"][1] == 4.0, hard)
+            claim("the current epoch is read off the entries, so nothing has to "
+                  "tell the archive what night it is",
+                  authors([E("a", "adopt", epoch=9)], decay=0.0)["a"][1] == 1.0)
+            claim("an entry that somehow post-dates the newest is not weighed "
+                  "MORE than the present",
+                  authors([E("a", "adopt", epoch=0)], decay=0.5, now=-5)["a"][1] == 1.0)
+            claim("counts go fractional, which is what Beta wants",
+                  authors([E("a", "adopt", epoch=0), E("a", "refuse", epoch=1)],
+                          decay=0.5)["a"][:2] == (0.5, 1.5))
+            claim("and a discounted tally still sorts and prints",
+                  "0.5" in authors_report(authors(old, decay=0.5)))
+            claim("a discounted record still drives the assignment",
+                  assign(["a", "b"], half, 1, "s")[0] == "b"),
+            # **Truncation must make an author UNCERTAIN, not invisible.** At
+            # decay 0 an author with nothing in the current epoch drops out of
+            # the tally entirely -- and `assign` reads a missing author as
+            # Beta(1,1), the uniform prior, so it is still drawn. If it fell to
+            # zero instead, one quiet epoch would retire a model for good and
+            # the record could never recover it. Measured on a filed ledger:
+            # an author last tried two epochs ago still took 37 of 160 shards.
+            gone = authors([E("now", "adopt", epoch=2)] * 12, decay=0.0)
+            claim("an author with nothing in the window is absent from the tally",
+                  "stale" not in gone)
+            claim("but still drawn, because a missing author reads as the prior "
+                  "and not as a zero",
+                  "stale" in assign(["now", "stale"], gone, 60, "s"))
 
             # -- Thompson sampling over the portfolio ----------------------
 
@@ -592,8 +674,14 @@ runs:
                 n = int(os.environ.get("SHARDS", "1") or "1")
             except ValueError:
                 n = 1
-            tally = authors(entries)
+            try:
+                decay = float(os.environ.get("DECAY", "1") or "1")
+            except ValueError:
+                decay = 1.0
+            decay = min(1.0, max(0.0, decay))
+            tally = authors(entries, decay=decay)
             picks = assign(names, tally, n, seed)
+            print("  a trial counts %.2f per epoch of age" % decay)
             print(authors_report(tally))
             print("\n  tonight: " + ", ".join(
                 "shard %d %s" % (i, a) for i, a in enumerate(picks)))

@@ -120,6 +120,20 @@ max_level = 3
 # milestone the drafter cannot write is offered again every night, forever.
 balks = 3
 
+# How fast an author's record stops counting. A trial from n epochs ago counts
+# author_decay ** n. The epoch is the span within which `utility` holds still,
+# so a trial judged in an earlier one was judged by a different standard --
+# weaker evidence about tonight, not worthless.
+#
+# 1.0 counts every trial ever. 0.0 counts only the current epoch, which is
+# truncation and leaves about sixteen entries split across the pool. 0.5 keeps
+# roughly two epochs of memory and is the default for that reason.
+#
+# An author with nothing left in the window is UNCERTAIN, not excluded: it
+# drops out of the tally and is then drawn from the uniform prior, so one quiet
+# epoch cannot retire a model for good.
+author_decay = 0.5
+
 [author]
 # **`local` runs the model ON THE RUNNER, and needs no credential at all.**
 #
@@ -239,6 +253,7 @@ warmup_seconds = 300
 # weights = "https://huggingface.co/empero-ai/Qwen3.8-4B-Distill-GGUF/resolve/main/Qwen3.8-4B-Q8_0.gguf"
 # weights_sha256 = "770b780d6754a4954d1caf395c9239eaeb394f15c7a7ea34039883377c93c9c3"
 # weights_bytes = 4610579744
+
 
 [floors]
 # A movement inside its floor is not a movement. Prefixes, longest match wins.

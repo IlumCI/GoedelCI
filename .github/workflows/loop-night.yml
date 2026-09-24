@@ -516,6 +516,7 @@ jobs:
           command: authors
           pool: ${{ steps.cfg.outputs.authors }}
           shards: ${{ steps.cfg.outputs.shards }}
+          decay: ${{ steps.cfg.outputs.author-decay }}
           seed: ${{ github.run_id }}
 
       - id: node

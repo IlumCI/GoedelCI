@@ -301,13 +301,41 @@ correct, and is why there is no minimum-evidence floor here as there is on
 `reconsider`. Sampling two identical priors costs nothing; *backtracking* on them
 would move the night somewhere for no reason.
 
-**A record does not expire, and that is a real limitation.** An author is scored
-over every trial it has ever had, so a model that did badly against an old goal
-carries that forever, and a model added tonight starts from the uniform prior
-rather than from anything it has shown. Epoch-scoping the tally would be the
-principled fix — `utility` already changes only at epoch boundaries, and entries
-judged by different criteria are not strictly comparable — but sixteen entries an
-epoch is thin evidence to sample from. It is named here rather than half-solved.
+**A record expires, at a rate you set.** A trial from *n* epochs ago counts
+`author_decay ** n`. The epoch is the span within which `utility` holds still, so
+a trial judged in an earlier one was judged by a different standard — weaker
+evidence about tonight, not worthless, which is why this discounts rather than
+truncates:
+
+```toml
+[judge]
+author_decay = 0.5   # 1.0 = all time · 0.0 = this epoch only
+```
+
+Truncation is the `0.0` case, so both readings come out of one number. `0.5`
+keeps roughly two epochs of memory — about thirty-two entries — and is the
+default because a single epoch is sixteen entries split across the pool, and
+Beta at four trials is nearly uniform.
+
+Measured on a filed ledger of 48 certificates across three epochs, where `stale`
+was good long ago and has not been tried since:
+
+| | `stale` | `now` | shards to `stale`, 40 nights |
+|---|---|---|---|
+| `1.0` | 10.0/16.0 → 0.611 | 20.0/32.0 → 0.618 | 55 of 160 |
+| `0.5` | 2.5/4.0 → 0.583 | 16.0/24.0 → 0.654 | 51 of 160 |
+| `0.0` | *(absent)* | 12.0/16.0 → 0.722 | 37 of 160 |
+
+The counts go fractional because they are discounted by age, and Beta takes
+that without complaint: four full-weight adoptions and four half-weight ones is
+Beta(7, 1), which is the right amount of confidence.
+
+**Truncation makes an author uncertain, not invisible.** At `0.0` an author with
+nothing in the current epoch drops out of the tally entirely — and a missing
+author reads as Beta(1, 1), the uniform prior, so it is still drawn. It falls
+from 55 shards to 37, not to zero. If it fell to zero, one quiet epoch would
+retire a model for good and no amount of later evidence could recover it. There
+is a claim on exactly that.
 
 **The cache is the ceiling.** GitHub gives a repository 10 GB of Actions cache,
 evicted least-recently-used, so three 2.78 GB authors fit and four do not. Over
