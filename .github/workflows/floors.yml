@@ -41,11 +41,7 @@ jobs:
     timeout-minutes: 300
     permissions:
       contents: write
-      # To ask `ci` to run on the branch this pushed. A push made with
-      # GITHUB_TOKEN does not trigger a workflow -- GitHub's recursion guard --
-      # so `ci`'s `loop/**` filter never fires by itself, and the branch the
-      # loop works on would be the only one nothing independent ever checked.
-      # `workflow_dispatch` is the documented exception to that guard.
+      # To ask `ci` to run on loop/main; see the last step of this job.
       actions: write
     steps:
       # Not `ref: loop/main`. A repository that has never run a night does
@@ -137,8 +133,6 @@ jobs:
 
       - name: File it
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -149,9 +143,26 @@ jobs:
           git add loop/evidence/floors
           git commit -q -m "floors: the between-run spread on this runner class ($stamp)"
           git push origin HEAD:refs/heads/loop/main
-          # See the note on `actions: write` above.
-          GH_TOKEN="${GITHUB_TOKEN:-}" gh workflow run ci.yml --ref loop/main \
+
+      # See the `verify` job in loop-night.yml: a push made with GITHUB_TOKEN
+      # does not trigger a workflow, so `ci`'s `loop/**` filter never fires
+      # for anything this pushed. `workflow_dispatch` is the exception, and
+      # the check runs land on the pull request's head.
+      - name: Ask ci to verify the branch this left behind
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --heads \
+               "https://github.com/$REPO" loop/main >/dev/null 2>&1; then
+            echo "  no loop/main to verify"; exit 0
+          fi
+          gh workflow run ci.yml --repo "$REPO" --ref loop/main \
             || echo "::warning::could not ask ci to run on loop/main"
+          echo "  ci asked to run on loop/main"
 
       - if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
