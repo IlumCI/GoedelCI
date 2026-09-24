@@ -56,7 +56,9 @@ inputs:
     required: false
     default: ""
   why:
-    description: "for balk: what came back instead of a draft"
+    description: >-
+      for balk: what came back instead of a draft. For card: the refusal the
+      last answer earned, shown to the model so it can correct it.
     required: false
     default: ""
   reply:
@@ -84,6 +86,12 @@ inputs:
     description: "for card: where to write the question"
     required: false
     default: ladder-card.txt
+  only-verb:
+    description: >-
+      for card: hold the retry to kinds with this verb. `admit` names it when
+      the refusal was one a narrowed grammar can fix.
+    required: false
+    default: ""
   grammar-out:
     description: "for card: where to write the GBNF the reply must take"
     required: false
@@ -119,6 +127,12 @@ outputs:
   why:
     description: "one line for the log"
     value: ${{ steps.run.outputs.why }}
+  retry-verb:
+    description: >-
+      for admit: the verb a retry should be held to, when the refusal was one
+      a narrowed grammar can fix. Empty otherwise. NOT `verb`, which is the
+      accepted rung's -- one key with two meanings is a key nothing can read.
+    value: ${{ steps.run.outputs.retry_verb }}
 
 runs:
   using: composite
@@ -137,6 +151,7 @@ runs:
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
         GRAMMAR_OUT: ${{ inputs.grammar-out }}
+        ONLY_VERB: ${{ inputs.only-verb }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -148,7 +163,17 @@ runs:
         KEYS = ("seq", "goal", "kind", "target", "title", "witness", "point", "balks")
         DECLARED = ("kind", "target", "title", "witness")
 
-        class LadderError(Exception): pass
+        class LadderError(Exception):
+            """A refusal, optionally carrying the verb that would have worked.
+
+            `verb` is empty for refusals nothing mechanical can fix -- a
+            witness that is a feeling, a milestone already on the ladder --
+            and set for the one that a narrowed grammar can: the model chose
+            a kind whose verb does not match whether the target exists.
+            """
+            def __init__(self, message, verb=""):
+                super().__init__(message)
+                self.verb = verb
 
         def out(k, v):
             """A step output, and never more than one.
@@ -293,7 +318,7 @@ runs:
 
         # provider is sent no grammar, and the two must not disagree.
 
-        def grammar(kinds):
+        def grammar(kinds, only_verb=""):
             """The block, with `kind` enumerated rather than left open.
 
             A free `kind` line lets the model name one that does not exist,
@@ -306,8 +331,19 @@ runs:
             kinds that are switched off, and offering one in the grammar
             would let the model pick exactly the thing `admit` refuses two
             lines later -- the same unavoidable refusal in a new place.
+
+            **`only_verb` is the retry.** Shown a refusal in prose, the
+            author answered with the same wrong kind again -- measured, not
+            supposed. So a retry does not ask more politely: it removes the
+            wrong kinds from the grammar, and then the answer cannot contain
+            one. Falls back to every enabled kind if the narrowing would
+            leave none, because a grammar with no alternatives is not a
+            grammar and an empty pool is worse than a wide one.
             """
-            on = sorted(k for k, v in kinds.items() if v.get("enabled", True))
+            on = sorted(k for k, v in kinds.items() if v.get("enabled", True)
+                        and (not only_verb or v.get("verb") == only_verb))
+            if not on:
+                on = sorted(k for k, v in kinds.items() if v.get("enabled", True))
             alts = " | ".join('"%s"' % k for k in on) or '[^\\n]+'
             return (
                 'root ::= "<<<RUNG>>>\\nkind: " kind "\\ntarget: " line '
@@ -402,12 +438,17 @@ runs:
                 raise LadderError("%s escapes the tree" % target)
             exists = (Path(root) / target).exists()
             verb = kinds[kind]["verb"]
+            # **The refusal names the verb that WOULD have worked.** Prose
+            # does not move a 4B off a wrong kind -- measured: shown this
+            # refusal in as many words, it answered `feature` on the same
+            # existing file again. So the retry does not ask more politely,
+            # it narrows the grammar, and this is what tells it how.
             if verb == "create" and exists:
                 raise LadderError("kind %s creates a file and %s is already there"
-                                  % (kind, target))
+                                  % (kind, target), "edit")
             if verb == "edit" and not exists:
                 raise LadderError("kind %s edits a file and %s does not exist"
-                                  % (kind, target))
+                                  % (kind, target), "create")
             if not fields["witness"] or fields["witness"] == "-":
                 raise LadderError(
                     "a milestone with no witness cannot be judged, so it is not a "
@@ -439,7 +480,7 @@ runs:
             return rung
 
         def card(cfg, root, rungs, entries, goal_body, balk_limit, goal, criteria=(),
-                 survey=""):
+                 survey="", refused=""):
             kinds = ["  %s (%s, judged by %s)" % (k, v["verb"], v["j1"])
                      for k, v in sorted(cfg["kinds"].items()) if v["enabled"]]
             done, gone = [], []
@@ -495,6 +536,21 @@ runs:
             if gone:
                 parts.append("TRIED AND ABANDONED -- do not propose these again\n"
                              + "\n".join(gone))
+            # **The last refusal, last.** A model follows the most recent
+            # instruction it was given, so the correction goes at the END of
+            # the card rather than buried in the preamble. This is the same
+            # feedback loop `draft` runs inside one draw, where each attempt
+            # is shown what the compiler said about the one before it -- and
+            # without it a refusal the model could have fixed in one line
+            # became a balk, three of which retire a milestone.
+            if refused:
+                parts.append(
+                    "YOUR LAST ANSWER WAS REFUSED\n  " + refused.strip()
+                    + "\n\nThat is a mechanical check, not an opinion. Read it "
+                      "literally and answer again, changing what it names and "
+                      "nothing else. If it says a `create` kind's target already "
+                      "exists, either aim at a path that does not, or choose the "
+                      "kind whose verb is `edit`.")
             return "\n\n".join(parts)
 
         def progress(rungs, entries, goal, balk_limit):
@@ -704,6 +760,25 @@ runs:
             # -- the grammar, which is the shape as a constraint ----------
             G = grammar({"feature": {"enabled": True}, "repair": {"enabled": True},
                          "off": {"enabled": False}})
+            # -- the correction, which is what stops a balk -----------------
+            C = dict(cfg=CFG, root=".", rungs=[], entries=[], goal_body="g",
+                     balk_limit=3, goal="g" * 16)
+            plain = card(**C)
+            claim("an ordinary card carries no refusal",
+                  "YOUR LAST ANSWER WAS REFUSED" not in plain)
+            again = card(refused="kind feature creates a file and src/a.py is "
+                                 "already there", **C)
+            claim("a card built after a refusal carries it",
+                  "YOUR LAST ANSWER WAS REFUSED" in again)
+            claim("and carries it LAST, because a model follows the most recent "
+                  "instruction it was given",
+                  again.rindex("REFUSED") > again.rindex("THE KINDS OF MILESTONE"))
+            claim("it says what to do about the create-on-an-existing-file case, "
+                  "which is the refusal a 4B actually earns",
+                  "kind whose verb is `edit`" in again)
+            claim("the refusal itself is quoted rather than paraphrased",
+                  "src/a.py is already there" in again)
+
             claim("the grammar names the same four fields the parser requires",
                   all(("\\n%s: " % k) in G or ('"<<<RUNG>>>\\n%s: "' % k) in G
                       for k in DECLARED), G)
@@ -721,6 +796,21 @@ runs:
                   'kind ::= "repair"\n' in grammar({"repair": {"enabled": True}}))
             claim("and the enumeration follows the project, not this file",
                   '"tidy"' in grammar({"tidy": {"enabled": True}}))
+            # The retry narrows the grammar rather than asking more politely.
+            KV = {"feature": {"enabled": True, "verb": "create"}, "repair": {"enabled": True, "verb": "edit"}}
+            kindline = lambda g: [l for l in g.split("\n") if l.startswith("kind ::=")][0]
+            claim("an ordinary card offers every enabled kind",
+                  kindline(grammar(KV)) == 'kind ::= "feature" | "repair"',
+                  kindline(grammar(KV)))
+            claim("a retry held to edit offers only the edit kinds, so the answer "
+                  "cannot contain the one that was just refused",
+                  'kind ::= "repair"\n' in grammar(KV, "edit"), grammar(KV, "edit"))
+            claim("and held to create, only the create kinds",
+                  'kind ::= "feature"\n' in grammar(KV, "create"))
+            claim("a narrowing that would leave nothing falls back to all of them, "
+                  "because a grammar with no alternatives is not a grammar",
+                  kindline(grammar(KV, "nonesuch")) == kindline(grammar(KV)))
+
             claim("the block the grammar forces is one admit reads",
                   read_proposal("<<<RUNG>>>\nkind: feature\ntarget: src/a.py\n"
                                 "title: t\nwitness: w\n<<<END>>>")["witness"] == "w",
@@ -812,12 +902,14 @@ runs:
                     out("have", "yes"); out("point", openr["point"]); out("why", "already open")
                     sys.exit(0)
                 Path(os.environ["CARD_OUT"]).write_text(
-                    card(cfg, root, rungs, entries, body, limit, goal, criteria, survey),
+                    card(cfg, root, rungs, entries, body, limit, goal, criteria, survey,
+                         os.environ.get("WHY", "")),
                     encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
                 if os.environ.get("GRAMMAR_OUT", "").strip():
                     Path(os.environ["GRAMMAR_OUT"]).write_text(
-                        grammar(cfg["kinds"]), encoding="utf-8")
+                        grammar(cfg["kinds"], os.environ.get("ONLY_VERB", "").strip()),
+                        encoding="utf-8")
                 print("  asked for the next milestone")
                 out("have", "no"); out("why", "a question was written")
             elif cmd == "admit":
@@ -846,5 +938,6 @@ runs:
             # context is how a fence contract stops being one.
             print("::notice::ladder %s: %s" % (cmd, exc))
             out("have", "no"); out("why", str(exc)[:200].replace("\n", " "))
+            out("retry_verb", getattr(exc, "verb", ""))
             sys.exit(0 if cmd in ("card", "admit") else 1)
         PYEOF

@@ -483,6 +483,106 @@ jobs:
           criteria: blueprint-criteria.txt
           reply: ladder-reply.txt
 
+
+      # --- attempt 2: shown exactly why attempt  was refused ---------
+      #
+      # **Unrolled, because a composite action cannot be called in a loop from
+      # YAML.** Same shape as the `ci` suite list one file over, and the same
+      # reason. Three attempts because `admit`'s refusals are mechanical --
+      # the kind is not enabled, the target exists, the witness is a feeling
+      # -- and a model that cannot fix one of those in two corrections is not
+      # going to on the fifth.
+      - id: card2
+        # Every guard is "nothing has opened a rung YET", not "the last step
+        # failed". A skipped step's output is the empty string, so a round
+        # that never ran reads as not-yes and the chain carries on -- but a
+        # round that SUCCEEDED has to stop all of them, and `card.have` is
+        # the separate case where a rung was already open and nothing was
+        # ever asked.
+        if: steps.card.outputs.have != 'yes' && steps.propose.outputs.have != 'yes'
+        uses: ./.github/actions/ladder
+        with:
+          command: card
+          config: ${{ steps.cfg.outputs.json }}
+          criteria: blueprint-criteria.txt
+          survey: survey.txt
+          why: ${{ steps.propose.outputs.why }}
+          # **The retry narrows the grammar rather than asking more politely.**
+          # Measured: shown its refusal in prose, the author answered with the
+          # same wrong kind again. Held to the verb `admit` named, the answer
+          # cannot contain one.
+          only-verb: ${{ steps.propose.outputs.retry-verb }}
+          card-out: ladder-card.txt
+          system-out: ladder-system.txt
+          grammar-out: ladder.gbnf
+
+      - id: reply2
+        if: steps.card2.outcome == 'success' && steps.card2.outputs.have != 'yes'
+        continue-on-error: true
+        uses: ./.github/actions/draft
+        with:
+          command: ask
+          config: ${{ steps.cfg.outputs.json }}
+          system: ladder-system.txt
+          user: ladder-card.txt
+          grammar: ladder.gbnf
+          out: ladder-reply.txt
+
+      - id: propose2
+        if: steps.reply2.outcome == 'success'
+        uses: ./.github/actions/ladder
+        with:
+          command: admit
+          config: ${{ steps.cfg.outputs.json }}
+          criteria: blueprint-criteria.txt
+          reply: ladder-reply.txt
+
+      # --- attempt 3: shown exactly why attempt 2 was refused ---------
+      #
+      # **Unrolled, because a composite action cannot be called in a loop from
+      # YAML.** Same shape as the `ci` suite list one file over, and the same
+      # reason. Three attempts because `admit`'s refusals are mechanical --
+      # the kind is not enabled, the target exists, the witness is a feeling
+      # -- and a model that cannot fix one of those in two corrections is not
+      # going to on the fifth.
+      - id: card3
+        if: >-
+          steps.card.outputs.have != 'yes' &&
+          steps.propose.outputs.have != 'yes' &&
+          steps.propose2.outputs.have != 'yes'
+        uses: ./.github/actions/ladder
+        with:
+          command: card
+          config: ${{ steps.cfg.outputs.json }}
+          criteria: blueprint-criteria.txt
+          survey: survey.txt
+          why: ${{ steps.propose2.outputs.why || steps.propose.outputs.why }}
+          only-verb: ${{ steps.propose2.outputs.retry-verb || steps.propose.outputs.retry-verb }}
+          card-out: ladder-card.txt
+          system-out: ladder-system.txt
+          grammar-out: ladder.gbnf
+
+      - id: reply3
+        if: steps.card3.outcome == 'success' && steps.card3.outputs.have != 'yes'
+        continue-on-error: true
+        uses: ./.github/actions/draft
+        with:
+          command: ask
+          config: ${{ steps.cfg.outputs.json }}
+          system: ladder-system.txt
+          user: ladder-card.txt
+          grammar: ladder.gbnf
+          out: ladder-reply.txt
+
+      - id: propose3
+        if: steps.reply3.outcome == 'success'
+        uses: ./.github/actions/ladder
+        with:
+          command: admit
+          config: ${{ steps.cfg.outputs.json }}
+          criteria: blueprint-criteria.txt
+          reply: ladder-reply.txt
+
       - name: File the new rung, if there is one
         shell: bash
         run: |
