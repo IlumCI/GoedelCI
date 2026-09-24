@@ -37,11 +37,13 @@ description: >-
 #               there. A local `uses:` that does not resolve fails at run time,
 #               in the middle of a night, on a step nobody was watching.
 #
-#   agreed      the request client is duplicated between `draft` and `ladder`,
-#               because a composite action cannot be called in a loop and
-#               `draft` needs six attempts. A copy that is checked is the
-#               honest version of a copy; an unchecked one is two definitions
-#               that have to agree and eventually will not.
+#   singular    exactly one action may talk to the network. This was two for a
+#               while -- `draft` and `ladder` both needed a model, so both
+#               carried sixty lines of HTTP that had to agree -- and the fix
+#               was to split them so that one owns the network and the other
+#               owns what a milestone means. This check is what stops the
+#               second copy coming back the next time something needs to ask a
+#               question, which is the form that drift takes here.
 
 inputs:
   command:
@@ -81,6 +83,11 @@ runs:
         # `(?<![<])` so that `# <<< ask` -- a marker comment, not a redirection
         # -- does not read as `<< ask`.
         HEREDOC = re.compile(r"(?<![<])<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?\s*$")
+        # `urllib` need not be the first name on the line: the action that has
+        # it imports it alongside six others, and a regex anchored to the word
+        # right after `import` found nothing and reported that this machine
+        # cannot ask a model anything.
+        NETWORK = re.compile(r"^\s*(?:import|from)\s+[\w., ]*\burllib\b", re.M)
 
         class TemplateError(Exception): pass
 
@@ -262,19 +269,17 @@ runs:
                         "%s has no selftest command. An action that cannot prove itself is "
                         "one nothing downstream should trust." % name)
 
-            a = root / ".github/actions/draft/action.yml"
-            b = root / ".github/actions/ladder/action.yml"
-            if a.is_file() and b.is_file():
-                x = block(a.read_text(encoding="utf-8"), "ask")
-                y = block(b.read_text(encoding="utf-8"), "ask")
-                if x is None or y is None:
-                    problems.append("the duplicated `ask` block has lost its markers in "
-                                    "draft or ladder, so nothing is checking the copies")
-                elif x != y:
-                    problems.append(
-                        "draft and ladder carry DIFFERENT copies of the request client. "
-                        "They are two definitions of how this machine talks to a model, and "
-                        "they have drifted.")
+            talkers = [name for name, p in actions
+                       if NETWORK.search(p.read_text(encoding="utf-8"))]
+            if len(talkers) > 1:
+                problems.append(
+                    "more than one action talks to the network (%s). Exactly one may: two "
+                    "copies of a request client are two definitions of how this machine "
+                    "asks a question, and they drift. Ask through the one that owns it."
+                    % ", ".join(sorted(talkers)))
+            elif not talkers:
+                problems.append(
+                    "no action talks to the network, so nothing can ask a model anything")
             return problems, n_actions, n_workflows
 
         # ------------------------------------------------------------------
@@ -354,6 +359,15 @@ runs:
                   "lstrip('./') would have eaten the leading dot of .github")
             claim("a marker comment is not a heredoc",
                   lo("f", "steps:\n  - run: |\n      # <<< ask\n      x\n") == [])
+
+            claim("an action that imports urllib is one that talks to the network",
+                  bool(NETWORK.search("        import urllib.request\n")))
+            claim("even when it is not the first name on the import line",
+                  bool(NETWORK.search("        import json, os, sys, urllib.request\n")))
+            claim("and from-imports count too",
+                  bool(NETWORK.search("        from urllib.request import urlopen\n")))
+            claim("and a mention of it in a comment is not",
+                  not NETWORK.search("        # urllib would do it\n"))
 
             claim("a marked block is extracted",
                   block("# >>> ask -- a note\nBODY\n# <<< ask\n", "ask") == "BODY")

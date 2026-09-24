@@ -329,12 +329,39 @@ jobs:
       # refused proposal is the ordinary outcome and not a failure: the fence
       # contract is strict on purpose, and a night with no new rung still has
       # whatever is already open.
-      - id: propose
-        name: Keep the ladder stocked
+      # **Three steps rather than one, and that is the whole point.** `ladder`
+      # owns what a milestone means and `draft` owns the network; neither
+      # carries a copy of the other. A night with no key, or an endpoint having
+      # a bad afternoon, stops at the middle step and the rest of the night
+      # carries on with whatever is already open.
+      - id: card
+        name: Ask for the next milestone
         uses: ./.github/actions/ladder
         with:
-          command: propose
+          command: card
           config: ${{ steps.cfg.outputs.json }}
+          card-out: ladder-card.txt
+          system-out: ladder-system.txt
+
+      - id: reply
+        if: steps.card.outputs.have != 'yes'
+        continue-on-error: true
+        uses: ./.github/actions/draft
+        with:
+          command: ask
+          config: ${{ steps.cfg.outputs.json }}
+          system: ladder-system.txt
+          user: ladder-card.txt
+          out: ladder-reply.txt
+
+      - id: propose
+        if: steps.reply.outcome == 'success'
+        name: Admit it, or refuse it and say why
+        uses: ./.github/actions/ladder
+        with:
+          command: admit
+          config: ${{ steps.cfg.outputs.json }}
+          reply: ladder-reply.txt
 
       - name: File the new rung, if there is one
         shell: bash

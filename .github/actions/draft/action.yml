@@ -51,7 +51,7 @@ description: >-
 
 inputs:
   command:
-    description: "draft | selftest"
+    description: "draft | ask | selftest"
     required: true
   root:
     description: "the tree to draft against"
@@ -74,9 +74,17 @@ inputs:
     required: false
     default: root
   out:
-    description: "where to write the envelope"
+    description: "where to write the envelope, or the reply for `ask`"
     required: false
     default: envelope.env
+  system:
+    description: "for ask: a file holding the rules the answer is held to"
+    required: false
+    default: ""
+  user:
+    description: "for ask: a file holding the question"
+    required: false
+    default: ""
 
 outputs:
   drew:
@@ -108,6 +116,8 @@ runs:
         SEED: ${{ inputs.seed }}
         LINEAGE: ${{ inputs.lineage }}
         OUT: ${{ inputs.out }}
+        SYSTEM_FILE: ${{ inputs.system }}
+        USER_FILE: ${{ inputs.user }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -141,11 +151,13 @@ runs:
 
         # -- asking ------------------------------------------------------
 
-        # >>> ask -- this block is duplicated in ladder/action.yml and
-        # template-check asserts the two copies are byte-identical. A composite
-        # action cannot be called in a loop and `draft` needs six attempts, so
-        # the request client cannot live in an action of its own. A copy that is
-        # checked is the honest version of a copy.
+        # **The only place in this repository that talks to a model.** It was
+        # duplicated here and in `ladder`, because both needed to ask one --
+        # sixty lines of HTTP that had to agree and only agreed because a check
+        # said so. `ladder` asks through this action now, as two steps: it
+        # writes the question and the rules, `ask` answers, and it admits or
+        # refuses the answer. So it keeps what a milestone MEANS and this keeps
+        # the network, and neither holds a copy of the other.
         def ask(cfg, system, user, seed=None):
             """One request, to whichever provider goedel.toml names.
 
@@ -208,7 +220,6 @@ runs:
                 # It is a fact about the night, not about the rung.
                 raise NoAnswer("the reply carried no text")
             return text
-        # <<< ask
 
         # -- reading the reply -------------------------------------------
 
@@ -670,6 +681,28 @@ runs:
         cmd = os.environ["COMMAND"].strip()
         if cmd == "selftest":
             sys.exit(selftest())
+
+        if cmd == "ask":
+            # One question, one answer, no interpretation. Whoever asked owns
+            # what the reply means; this owns only getting one.
+            cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+            seed = os.environ.get("SEED", "").strip()
+            try:
+                reply = ask(cfg,
+                            Path(os.environ["SYSTEM_FILE"]).read_text(encoding="utf-8"),
+                            Path(os.environ["USER_FILE"]).read_text(encoding="utf-8"),
+                            int(seed) if seed else None)
+            except NoAnswer as exc:
+                print("::warning::no answer: %s" % exc)
+                Path(os.environ["OUT"]).write_text("", encoding="utf-8")
+                out("drew", "no"); out("why", "no answer: %s" % exc)
+                out("operator", "-"); out("attempts", "0")
+                sys.exit(NO_ANSWER)
+            Path(os.environ["OUT"]).write_text(reply, encoding="utf-8")
+            print("  %d character(s) came back" % len(reply))
+            out("drew", "yes"); out("why", ""); out("operator", "-"); out("attempts", "1")
+            sys.exit(0)
+
         if cmd != "draft":
             print("::error::draft: no such command: %r" % cmd)
             sys.exit(1)

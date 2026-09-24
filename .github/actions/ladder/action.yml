@@ -45,7 +45,7 @@ description: >-
 
 inputs:
   command:
-    description: "next | propose | balk | progress | goal | selftest"
+    description: "next | card | admit | balk | progress | goal | selftest"
     required: true
   root:
     description: "the tree the ladder lives in"
@@ -59,6 +59,18 @@ inputs:
     description: "for balk: what came back instead of a draft"
     required: false
     default: ""
+  reply:
+    description: "for admit: the file `draft ask` wrote"
+    required: false
+    default: reply.txt
+  card-out:
+    description: "for card: where to write the question"
+    required: false
+    default: ladder-card.txt
+  system-out:
+    description: "for card: where to write the rules the answer is held to"
+    required: false
+    default: ladder-system.txt
   emit-env:
     description: "for next: where to write the RUNG_* file"
     required: false
@@ -98,10 +110,13 @@ runs:
         CONFIG: ${{ inputs.config }}
         WHY: ${{ inputs.why }}
         EMIT_ENV: ${{ inputs.emit-env }}
+        REPLY: ${{ inputs.reply }}
+        CARD_OUT: ${{ inputs.card-out }}
+        SYSTEM_OUT: ${{ inputs.system-out }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
-        import fnmatch, hashlib, json, os, re, sys, urllib.error, urllib.request
+        import fnmatch, hashlib, json, os, re, sys
         from pathlib import Path
 
         RUNGS = "loop/ladder/rungs.txt"
@@ -110,7 +125,6 @@ runs:
         DECLARED = ("kind", "target", "title", "witness")
 
         class LadderError(Exception): pass
-        class NoAnswer(LadderError): pass
 
         def out(k, v):
             """A step output, and never more than one.
@@ -126,74 +140,6 @@ runs:
             with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
                 fh.write("%s=%s\n" % (k, v))
 
-        # >>> ask -- this block is duplicated in draft/action.yml and
-        # template-check asserts the two copies are byte-identical. A composite
-        # action cannot be called in a loop and `draft` needs six attempts, so
-        # the request client cannot live in an action of its own. A copy that is
-        # checked is the honest version of a copy.
-        def ask(cfg, system, user, seed=None):
-            """One request, to whichever provider goedel.toml names.
-
-            urllib and nothing else: a loop that needs a package installed
-            before it can think has a dependency that can be yanked, and this
-            one has to run unattended at 02:17.
-            """
-            a = cfg["author"]
-            key = os.environ.get(a["api_key_env"], "").strip()
-            base = os.environ.get(a["base_url_env"], "").strip()
-            model = a["model"]
-            temperature = a["temperature"]
-            if seed is not None:
-                # A declared draw. Temperature alone would make every shard the
-                # same answer at 0, and the point of the fan-out is independent
-                # samples of a rung the greedy path may be wrong about the same
-                # way every night.
-                temperature = max(temperature, 0.7)
-
-            if a["provider"] == "anthropic":
-                if not key:
-                    raise NoAnswer("no API key in $%s" % a["api_key_env"])
-                url = (base or "https://api.anthropic.com") + "/v1/messages"
-                body = {"model": model, "max_tokens": a["max_tokens"],
-                        "temperature": temperature, "system": system,
-                        "messages": [{"role": "user", "content": user}]}
-                headers = {"content-type": "application/json", "x-api-key": key,
-                           "anthropic-version": "2023-06-01"}
-                pick = lambda d: "".join(
-                    b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
-            else:
-                if not base:
-                    raise NoAnswer("no endpoint in $%s" % a["base_url_env"])
-                url = base.rstrip("/") + "/chat/completions"
-                body = {"model": model, "max_tokens": a["max_tokens"],
-                        "temperature": temperature,
-                        "messages": [{"role": "system", "content": system},
-                                     {"role": "user", "content": user}]}
-                if seed is not None:
-                    body["seed"] = seed
-                headers = {"content-type": "application/json"}
-                if key:
-                    headers["authorization"] = "Bearer " + key
-                pick = lambda d: d["choices"][0]["message"]["content"] or ""
-
-            req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
-                                         headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=300) as r:
-                    data = json.loads(r.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", "replace")[:300]
-                raise NoAnswer("the endpoint answered %d: %s" % (exc.code, detail)) from None
-            except Exception as exc:
-                raise NoAnswer("the endpoint did not answer: %s" % exc) from None
-            text = pick(data)
-            if not text.strip():
-                # A server that came up and then said nothing is the no-server
-                # case arriving after the health check rather than before it.
-                # It is a fact about the night, not about the rung.
-                raise NoAnswer("the reply carried no text")
-            return text
-        # <<< ask
 
         # -- the file ----------------------------------------------------
 
@@ -660,13 +606,32 @@ runs:
                 out("have", "yes"); out("point", openr["point"])
                 out("retired", "yes" if gone else "no")
                 out("why", os.environ.get("WHY", "")[:200].replace("\n", " "))
-            elif cmd == "propose":
+            elif cmd == "card":
+                # **The question, written to a file; the asking belongs to
+                # `draft`.** Both actions needed a model, so both carried a
+                # copy of the request client -- sixty lines of HTTP that had to
+                # agree and only agreed because a check said so. `draft` owns
+                # the network now and this owns what a milestone MEANS, which
+                # is the split that leaves neither holding a copy of the other.
                 if openr:
-                    print("  a rung is already open; nothing to propose")
+                    print("  a rung is already open; nothing to ask")
                     out("have", "yes"); out("point", openr["point"]); out("why", "already open")
                     sys.exit(0)
-                reply = ask(cfg, SYSTEM, card(cfg, root, rungs, entries, body, limit, goal))
-                rung = admit(read_proposal(reply), cfg, root, rungs, goal)
+                Path(os.environ["CARD_OUT"]).write_text(
+                    card(cfg, root, rungs, entries, body, limit, goal), encoding="utf-8")
+                Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                print("  asked for the next milestone")
+                out("have", "no"); out("why", "a question was written")
+            elif cmd == "admit":
+                if openr:
+                    print("  a rung is already open; the reply is not needed")
+                    out("have", "yes"); out("point", openr["point"]); out("why", "already open")
+                    sys.exit(0)
+                f = Path(os.environ["REPLY"])
+                if not f.is_file() or not f.read_text(encoding="utf-8").strip():
+                    raise LadderError("no reply to admit")
+                rung = admit(read_proposal(f.read_text(encoding="utf-8")),
+                             cfg, root, rungs, goal)
                 rungs.append(rung)
                 save(root, rungs)
                 print("  a new rung: %s %s -- %s"
@@ -677,15 +642,11 @@ runs:
                 out("why", rung["title"])
             else:
                 raise LadderError("no such command: %r" % cmd)
-        except NoAnswer as exc:
-            print("::warning::the ladder could not be extended: %s" % exc)
-            out("have", "no"); out("why", str(exc)[:200])
-            sys.exit(0)
         except LadderError as exc:
             # A refused proposal is the ORDINARY outcome and not a failure.
             # The night goes on to whatever else it can do; retrying with more
             # context is how a fence contract stops being one.
             print("::notice::ladder %s: %s" % (cmd, exc))
             out("have", "no"); out("why", str(exc)[:200].replace("\n", " "))
-            sys.exit(0 if cmd == "propose" else 1)
+            sys.exit(0 if cmd in ("card", "admit") else 1)
         PYEOF
