@@ -1,0 +1,15 @@
+# What a harness run leaves in the workspace. The judge uploads these as
+# artifacts and the night never commits them; they are here because running
+# anything by hand in a checkout produces them too.
+rails-*.txt
+harness-*.log
+judged.txt
+spread.tsv
+certificate.cert
+envelope.env
+ladder-progress.txt
+ledger-tail.txt
+anchors-*.tsv
+
+__pycache__/
+*.py[cod]
