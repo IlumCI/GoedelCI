@@ -1,0 +1,664 @@
+name: goedel-draft
+description: >-
+  Draft a candidate: pick the comparative evidence, ask the model for whole
+  files, turn the answer into a patch, and hold it to the project's own fast
+  check before anything downstream spends a runner on it.
+
+# **Nobody writes code here but this action.** The operator writes one line in
+# `loop/goal.txt`; `ladder` turns that into rungs; this turns a rung into an
+# envelope. Everything between is the machine's.
+#
+# **Whole files, never diffs.** A model asked for a unified diff has to get
+# line numbers, hunk headers and context exactly right against a file it is
+# only shown a copy of, and it silently does not -- the patch applies to
+# nothing and the night is spent. Asked for the file it wants to exist, it only
+# has to get the code right, and `git diff` writes a patch that applies by
+# construction. This costs tokens on unchanged lines and buys back every night
+# that would have died on a hunk header.
+#
+# **The fence is not markdown.** Source carries backticks, and a model that
+# closes its own fence early hands back half a file that parses as a whole one.
+# `<<<FILE path>>> ... <<<END>>>` does not occur in source by accident, and a
+# reply missing either marker is refused rather than truncated into.
+#
+# **The compiler answers before the judge does.** Each attempt runs the
+# project's `check` command (`harness.check` in goedel.toml -- a typecheck, a
+# lint, a `cargo check`, whatever answers in seconds) against the drafted tree
+# and, when it refuses, the refusal goes back into the next attempt's card.
+# That is the only feedback loop inside a single draw, and it is why `attempts`
+# is six rather than one.
+#
+# **Which evidence goes into the card is the Mendel-Goedel choice**
+# (arXiv:2608.07645). A self-modification conditioned on one failure trajectory
+# uses one bit of an archive that holds hundreds. Three operators, and the
+# policy picks between them from what the ledger actually contains:
+#
+#   cross-lineage   another lineage has attempted this same rung. Its
+#                   trajectory is shown alongside this one's: what someone
+#                   else tried, and what it cost them. Preferred, because it
+#                   is the only one that transfers a behaviour rather than
+#                   repeating a search.
+#   reaction-norm   this lineage has failed on two or more DIFFERENT targets.
+#                   A failure that recurs across targets is a property of the
+#                   lineage rather than of the task, and the card says so.
+#   clonal          neither: the last refusal on this target, alone. The
+#                   ordinary case, and what every single-trajectory loop does
+#                   all of the time.
+#
+# The operator chosen is recorded in the envelope and travels to the
+# certificate, so the ledger can eventually say which of the three is worth
+# doing -- a question nothing that does not record it can ask.
+
+inputs:
+  command:
+    description: "draft | selftest"
+    required: true
+  root:
+    description: "the tree to draft against"
+    required: false
+    default: "."
+  rung:
+    description: "the rung file `ladder next` wrote"
+    required: false
+    default: ""
+  config:
+    description: "the validated goedel.toml JSON"
+    required: false
+    default: ""
+  seed:
+    description: "this shard's declared draw; empty is the greedy one"
+    required: false
+    default: ""
+  lineage:
+    description: "the certificate name this candidate descends from"
+    required: false
+    default: root
+  out:
+    description: "where to write the envelope"
+    required: false
+    default: envelope.env
+
+outputs:
+  drew:
+    description: "yes when an envelope was written"
+    value: ${{ steps.run.outputs.drew }}
+  point:
+    description: "the envelope's digest"
+    value: ${{ steps.run.outputs.point }}
+  operator:
+    description: "which comparative evidence authored it"
+    value: ${{ steps.run.outputs.operator }}
+  attempts:
+    description: "how many draws it took"
+    value: ${{ steps.run.outputs.attempts }}
+  why:
+    description: "when it drew nothing, what stopped it"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        RUNG: ${{ inputs.rung }}
+        CONFIG: ${{ inputs.config }}
+        SEED: ${{ inputs.seed }}
+        LINEAGE: ${{ inputs.lineage }}
+        OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import json, os, re, subprocess, sys, tempfile, urllib.error, urllib.request
+        from pathlib import Path
+
+        # A draw that produced nothing is not a failure of the rung. The night
+        # separates the two, because three balks retire a rung and an
+        # afternoon of 503s would otherwise retire the whole ladder.
+        NO_ANSWER = 3
+
+        FENCE_OPEN = re.compile(r"^<<<FILE (.+?)>>>\s*$")
+        FENCE_CLOSE = "<<<END>>>"
+
+        class DraftError(Exception): pass
+        class NoAnswer(DraftError): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        # -- asking ------------------------------------------------------
+
+        # >>> ask -- this block is duplicated in ladder/action.yml and
+        # template-check asserts the two copies are byte-identical. A composite
+        # action cannot be called in a loop and `draft` needs six attempts, so
+        # the request client cannot live in an action of its own. A copy that is
+        # checked is the honest version of a copy.
+        def ask(cfg, system, user, seed=None):
+            """One request, to whichever provider goedel.toml names.
+
+            urllib and nothing else: a loop that needs a package installed
+            before it can think has a dependency that can be yanked, and this
+            one has to run unattended at 02:17.
+            """
+            a = cfg["author"]
+            key = os.environ.get(a["api_key_env"], "").strip()
+            base = os.environ.get(a["base_url_env"], "").strip()
+            model = a["model"]
+            temperature = a["temperature"]
+            if seed is not None:
+                # A declared draw. Temperature alone would make every shard the
+                # same answer at 0, and the point of the fan-out is independent
+                # samples of a rung the greedy path may be wrong about the same
+                # way every night.
+                temperature = max(temperature, 0.7)
+
+            if a["provider"] == "anthropic":
+                if not key:
+                    raise NoAnswer("no API key in $%s" % a["api_key_env"])
+                url = (base or "https://api.anthropic.com") + "/v1/messages"
+                body = {"model": model, "max_tokens": a["max_tokens"],
+                        "temperature": temperature, "system": system,
+                        "messages": [{"role": "user", "content": user}]}
+                headers = {"content-type": "application/json", "x-api-key": key,
+                           "anthropic-version": "2023-06-01"}
+                pick = lambda d: "".join(
+                    b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+            else:
+                if not base:
+                    raise NoAnswer("no endpoint in $%s" % a["base_url_env"])
+                url = base.rstrip("/") + "/chat/completions"
+                body = {"model": model, "max_tokens": a["max_tokens"],
+                        "temperature": temperature,
+                        "messages": [{"role": "system", "content": system},
+                                     {"role": "user", "content": user}]}
+                if seed is not None:
+                    body["seed"] = seed
+                headers = {"content-type": "application/json"}
+                if key:
+                    headers["authorization"] = "Bearer " + key
+                pick = lambda d: d["choices"][0]["message"]["content"] or ""
+
+            req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                         headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+                raise NoAnswer("the endpoint answered %d: %s" % (exc.code, detail)) from None
+            except Exception as exc:
+                raise NoAnswer("the endpoint did not answer: %s" % exc) from None
+            text = pick(data)
+            if not text.strip():
+                # A server that came up and then said nothing is the no-server
+                # case arriving after the health check rather than before it.
+                # It is a fact about the night, not about the rung.
+                raise NoAnswer("the reply carried no text")
+            return text
+        # <<< ask
+
+        # -- reading the reply -------------------------------------------
+
+        def files_in(reply):
+            """Every `<<<FILE path>>> ... <<<END>>>` block, in order.
+
+            Prose outside the fences is ignored rather than refused: models
+            explain themselves and the explanation is not the answer. An
+            unclosed fence IS refused, because the content up to the end of the
+            reply reads as a whole file and is half of one.
+            """
+            found, path, body = [], None, []
+            for line in reply.split("\n"):
+                m = FENCE_OPEN.match(line)
+                if m:
+                    if path is not None:
+                        raise DraftError("a second %s before the first was closed" % line.strip())
+                    path, body = m.group(1).strip(), []
+                    continue
+                if line.strip() == FENCE_CLOSE:
+                    if path is None:
+                        raise DraftError("a closing fence with nothing open")
+                    found.append((path, "\n".join(body).rstrip("\n") + "\n"))
+                    path = None
+                    continue
+                if path is not None:
+                    body.append(line)
+            if path is not None:
+                raise DraftError("the fence for %s was never closed; the reply is truncated" % path)
+            if not found:
+                raise DraftError("the reply carries no fenced file")
+            return found
+
+        # -- the card ----------------------------------------------------
+
+        # `textwrap.dedent` and not a zero-indented triple quote. YAML ends a
+        # block scalar at the first line indented less than the block's first
+        # line, so a prompt written flush-left inside `run: |` truncates the
+        # program GitHub loads -- at the exact point where the rest of this
+        # file stops existing, with no error but a workflow that does nothing.
+        SYSTEM = __import__("textwrap").dedent("""\
+            You are the drafting half of a self-improving repository. You are given one
+            milestone and the files it concerns, and you answer with the complete new
+            contents of every file you want changed.
+
+            Answer ONLY with fenced files, in this exact form and nothing else around them:
+
+            <<<FILE path/to/file>>>
+            the entire new contents of that file
+            <<<END>>>
+
+            Rules that are checked mechanically and will refuse your answer:
+            - Give the WHOLE file, not a diff, not an excerpt, not an ellipsis.
+            - Only touch paths you were told you may touch.
+            - Do not touch tests unless the milestone asks you to.
+            - Keep the file's existing style, imports and conventions.
+            - If the milestone cannot be done in the files you were given, say why in one
+              line OUTSIDE any fence and emit no fence at all. A refusal is a useful
+              answer; a guess that does not compile is not.
+            """)
+
+        def card(rung, cfg, root, evidence, last_error=""):
+            kind = cfg["kinds"][rung["kind"]]
+            parts = []
+            goal = Path(root) / cfg.get("goal", "loop/goal.txt")
+            if goal.is_file():
+                parts.append("THE PROJECT IS AIMED AT\n" + goal.read_text(encoding="utf-8").strip())
+            parts.append(
+                "THE MILESTONE\n%s\n\nkind: %s (%s)\ntarget: %s\nwitness: %s"
+                % (rung.get("title", ""), rung["kind"], kind["j1"], rung["target"],
+                   rung.get("witness", "-")))
+            if kind["prompt"]:
+                parts.append("WHAT THIS KIND MEANS HERE\n" + kind["prompt"])
+            if kind["j1"] == "witness":
+                parts.append(
+                    "THIS KIND IS JUDGED BY FAIL-THEN-PASS. Answer with TWO files: the test "
+                    "that fails on the tree as it stands and passes once the bug is fixed, and "
+                    "the fixed source file. A fix with no failing test is refused before it is "
+                    "run.")
+            elif kind["j1"] == "claims":
+                parts.append(
+                    "THIS KIND IS JUDGED BY THE TEST COUNT RISING. Whatever you add must be "
+                    "exercised by a test that prints a pass; code nothing runs is refused.")
+
+            parts.append("YOU MAY TOUCH ONLY\n" + "\n".join(cfg["allow"]))
+            parts.append("YOU MAY NEVER TOUCH\n" + "\n".join(cfg["evaluator"]))
+
+            shown = []
+            for rel in [rung["target"]] + list(cfg["author"].get("context", [])):
+                p = Path(root) / rel
+                if p.is_file() and rel not in [s[0] for s in shown]:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                    shown.append((rel, text))
+            if shown:
+                parts.append("THE FILES AS THEY STAND\n" + "\n".join(
+                    "<<<FILE %s>>>\n%s<<<END>>>" % (rel, t) for rel, t in shown))
+            else:
+                parts.append("THE FILE %s DOES NOT EXIST YET; you are creating it."
+                             % rung["target"])
+
+            if evidence["text"]:
+                parts.append("WHAT THE RECORD SAYS (%s)\n%s"
+                             % (evidence["operator"], evidence["text"]))
+            if last_error:
+                parts.append(
+                    "YOUR LAST ANSWER DID NOT SURVIVE THE PROJECT'S OWN CHECK. Fix exactly "
+                    "this and answer again with the whole file:\n" + last_error[:4000])
+            return "\n\n".join(parts)
+
+        # -- the Mendel-Goedel evidence choice ---------------------------
+
+        def entries(root):
+            d = Path(root) / "loop/ledger/entries"
+            if not d.is_dir():
+                return []
+            es = []
+            for p in sorted(d.iterdir()):
+                if p.suffix != ".cert" or p.name.startswith("."):
+                    continue
+                f = {}
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    k, _, v = line.partition(" ")
+                    f[k] = v
+                f["_name"] = p.stem
+                es.append(f)
+            es.sort(key=lambda f: int(f["seq"]))
+            return es
+
+        def ancestry(es, name):
+            """`name` and every entry it descends from, `root` included.
+
+            `root` has to be in the set. It is not an entry, so a walk that
+            stops when the name is not in the ledger leaves it out -- and then
+            every trial made from the root (which is every trial, until
+            something is adopted) belongs to no lineage, `reaction-norm` can
+            never fire, and every refusal by this same lineage reads as another
+            lineage's. The whole operator choice collapses to clonal, silently,
+            and only on a fresh repository, which is every repository the first
+            time anybody runs this.
+            """
+            by = {f["_name"]: f for f in es}
+            chain, n = {name}, name
+            while n in by:
+                n = by[n]["lineage"]
+                chain.add(n)
+            return chain
+
+        def evidence_for(es, rung, lineage):
+            """Pick an operator and build the paragraph it justifies."""
+            refused = [f for f in es if f["verdict"] == "refuse"]
+            mine = ancestry(es, lineage)
+
+            same_rung = [f for f in refused
+                         if f.get("ladder", "-") == rung.get("point", "")
+                         and f.get("ladder", "-") != "-"]
+            other_lineage = [f for f in same_rung if f["lineage"] not in mine]
+            if other_lineage:
+                f = other_lineage[-1]
+                return {"operator": "cross-lineage", "text":
+                        "Another lineage attempted this same milestone and was refused:\n"
+                        "  %s\nDo not repeat it. If its approach was sound, take the part "
+                        "that was and fix the part that was not." % f["why"]}
+
+            here = [f for f in refused if f["lineage"] in mine]
+            targets = {}
+            for f in here:
+                targets.setdefault(f.get("axis", "?"), []).append(f)
+            if len(targets) >= 2:
+                lines = ["This lineage has been refused on more than one target, so the "
+                         "problem is likely in how it works rather than in this milestone:"]
+                for axis, fs in list(targets.items())[:4]:
+                    lines.append("  on %s: %s" % (axis, fs[-1]["why"]))
+                return {"operator": "reaction-norm", "text": "\n".join(lines)}
+
+            on_target = [f for f in here if f.get("axis", "") == rung["target"]]
+            if on_target:
+                return {"operator": "clonal", "text":
+                        "The last attempt at this target was refused:\n  %s"
+                        % on_target[-1]["why"]}
+            return {"operator": "clonal", "text": ""}
+
+        # -- the draft itself ---------------------------------------------
+
+        def git(root, *a, check=True):
+            r = subprocess.run(["git"] + list(a), cwd=root, capture_output=True, text=True)
+            if check and r.returncode:
+                raise DraftError("git %s: %s" % (" ".join(a), (r.stderr or r.stdout).strip()))
+            return r.stdout
+
+        def run_check(root, command, timeout):
+            if not command:
+                return True, ""
+            r = subprocess.run(command, cwd=root, shell=True, capture_output=True,
+                               text=True, timeout=timeout)
+            if r.returncode == 0:
+                return True, ""
+            return False, ((r.stdout or "") + (r.stderr or "")).strip()
+
+        def draft(root, rung, cfg, seed, lineage):
+            """Up to `attempts` draws, each held to the project's fast check."""
+            es = entries(root)
+            ev = evidence_for(es, rung, lineage)
+            kind = cfg["kinds"][rung["kind"]]
+            is_witness = kind["j1"] == "witness"
+            last_error, attempts = "", 0
+
+            for attempt in range(1, cfg["author"]["attempts"] + 1):
+                attempts = attempt
+                reply = ask(cfg, SYSTEM, card(rung, cfg, root, ev, last_error), seed)
+                try:
+                    files = files_in(reply)
+                except DraftError as exc:
+                    # No fence at all is the model declining, which the system
+                    # prompt asks for explicitly. It is a real answer about the
+                    # rung, so it counts toward a balk.
+                    last_error = "%s\nYour reply was:\n%s" % (exc, reply[:1200])
+                    continue
+
+                bad = [p for p, _ in files if not allowed(p, cfg)]
+                if bad:
+                    last_error = ("You wrote to %s, which you were told you may not touch. "
+                                  "Answer again touching only the allowed paths."
+                                  % ", ".join(bad))
+                    continue
+                if rung["target"] not in [p for p, _ in files]:
+                    last_error = ("You did not write %s, which is the milestone's target."
+                                  % rung["target"])
+                    continue
+                if is_witness and len(files) < 2:
+                    last_error = ("This kind needs a failing test AND the fix: two files, and "
+                                  "you answered with one.")
+                    continue
+
+                # Stage it in a scratch worktree so `check` sees a real tree and
+                # the repository the night is running in is never mutated.
+                with tempfile.TemporaryDirectory() as td:
+                    stage = Path(td) / "w"
+                    git(root, "worktree", "add", "--detach", "-q", str(stage), "HEAD")
+                    try:
+                        for rel, body in files:
+                            p = stage / rel
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            p.write_text(body, encoding="utf-8")
+                        ok, err = run_check(stage, cfg["harness"]["check"],
+                                            cfg["harness"]["timeout"])
+                        if not ok:
+                            last_error = err[-4000:]
+                            continue
+                        witness_paths = ([p for p, _ in files if p != rung["target"]]
+                                         if is_witness else [])
+                        patch = git(stage, "diff", "--", *[p for p, _ in files
+                                                           if p not in witness_paths])
+                        wpatch = git(stage, "diff", "--", *witness_paths) if witness_paths else ""
+                        # A file the tree did not have shows in `diff` only once
+                        # it is tracked. Adding intent is enough and stages
+                        # nothing.
+                        if not patch.strip():
+                            git(stage, "add", "-N", "--", *[p for p, _ in files])
+                            patch = git(stage, "diff", "--", *[p for p, _ in files
+                                                               if p not in witness_paths])
+                            if witness_paths:
+                                wpatch = git(stage, "diff", "--", *witness_paths)
+                    finally:
+                        git(root, "worktree", "remove", "--force", str(stage), check=False)
+
+                if not patch.strip():
+                    last_error = "Your answer is byte-identical to the file that is already there."
+                    continue
+                return ev, wpatch, patch, attempts
+
+            raise DraftError(last_error or "every attempt came back unusable")
+
+        def allowed(path, cfg):
+            import fnmatch
+            def m(p, masks):
+                if p.startswith("./"):
+                    p = p[2:]
+                for x in masks:
+                    if fnmatch.fnmatch(p, x):
+                        return True
+                    if x.endswith("/**") and (p == x[:-3] or p.startswith(x[:-2])):
+                        return True
+                return False
+            return m(path, cfg["allow"]) and not m(path, cfg["evaluator"])
+
+        def envelope(rung, cfg, ev, wpatch, patch, parent, seed, lineage):
+            head = [
+                "[envelope] v2",
+                "kind " + rung["kind"],
+                "verb " + cfg["kinds"][rung["kind"]]["verb"],
+                "target " + rung["target"],
+                "lane model",
+                "axis " + rung["target"],
+                "rung " + str(rung.get("rung", "1")),
+                "corpus " + rung.get("corpus", "00000000"),
+                "parent-tree " + parent,
+                "operator " + ev["operator"],
+                "lineage " + lineage,
+                "seed " + (str(seed) if seed is not None else "-"),
+                "witness " + rung.get("witness", "-"),
+                "title " + rung.get("title", "").replace("\n", " "),
+            ]
+            body = list(head)
+            if wpatch.strip():
+                body += ["[witness]", wpatch.rstrip("\n")]
+            body += ["[patch]", patch.rstrip("\n"), "[end]", ""]
+            return "\n".join(body)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s)
+                    if detail: print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except DraftError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            # -- the fence ------------------------------------------------
+            r = "prose\n<<<FILE src/a.py>>>\nx = 1\n<<<END>>>\ntrailing prose\n"
+            claim("a fenced file is read whole", files_in(r) == [("src/a.py", "x = 1\n")])
+            claim("prose around the fence is ignored, not refused", len(files_in(r)) == 1)
+            claim("two fences are two files",
+                  len(files_in("<<<FILE a>>>\n1\n<<<END>>>\n<<<FILE b>>>\n2\n<<<END>>>")) == 2)
+            claim("backticks inside a file survive",
+                  files_in("<<<FILE a>>>\n```\n<<<END>>>")[0][1] == "```\n")
+            raises("an unclosed fence is refused, not truncated into",
+                   lambda: files_in("<<<FILE a>>>\nhalf a file\n"))
+            raises("a fence opened twice is refused",
+                   lambda: files_in("<<<FILE a>>>\n<<<FILE b>>>\n<<<END>>>"))
+            raises("a closing fence with nothing open is refused",
+                   lambda: files_in("<<<END>>>"))
+            raises("a reply with no fence at all is a refusal, and says so",
+                   lambda: files_in("I cannot do this because the module does not exist."))
+
+            # -- the masks ------------------------------------------------
+            CFG = {"allow": ["src/**"], "evaluator": [".github/**", "goedel.toml"],
+                   "goal": "loop/goal.txt",
+                   "author": {"provider": "anthropic", "model": "m", "attempts": 6,
+                              "temperature": 0.0, "max_tokens": 100, "shards": 6,
+                              "context": [], "api_key_env": "K", "base_url_env": "U"},
+                   "harness": {"check": "", "timeout": 60},
+                   "kinds": {"feature": {"verb": "create", "j1": "claims", "prompt": "",
+                                         "enabled": True, "diff_files": 5, "diff_lines": 200},
+                             "repair": {"verb": "edit", "j1": "witness", "prompt": "",
+                                        "enabled": True, "diff_files": 5, "diff_lines": 200}}}
+            claim("a src path is writable", allowed("src/a.py", CFG))
+            claim("the machine's own actions are not", not allowed(".github/actions/x/action.yml", CFG))
+            claim("a path outside every allow mask is not", not allowed("README.md", CFG))
+
+            # -- the card -------------------------------------------------
+            rung = {"kind": "feature", "target": "src/new.py", "title": "add a cache",
+                    "witness": "-", "rung": "1", "point": "p"*64}
+            import tempfile as tf
+            with tf.TemporaryDirectory() as td:
+                c = card(rung, CFG, td, {"operator": "clonal", "text": ""})
+                claim("the card names the milestone", "add a cache" in c)
+                claim("and what may be touched", "src/**" in c)
+                claim("and what may never be", ".github/**" in c)
+                claim("and says the file does not exist yet", "DOES NOT EXIST YET" in c)
+                claim("a claims kind is told its code must be exercised",
+                      "exercised by a test" in c)
+                rr = dict(rung, kind="repair", target="src/a.py")
+                claim("a witness kind is told it needs a failing test first",
+                      "FAIL-THEN-PASS" in card(rr, CFG, td, {"operator": "clonal", "text": ""}))
+                claim("a retry carries the check's refusal",
+                      "boom" in card(rung, CFG, td, {"operator": "clonal", "text": ""}, "boom"))
+
+            # -- the operator choice --------------------------------------
+            def e(name, seq, lineage, verdict, axis="src/a.py", ladder="-", why="because"):
+                return {"_name": name, "seq": str(seq), "lineage": lineage, "verdict": verdict,
+                        "axis": axis, "ladder": ladder, "why": why}
+            rung2 = {"kind": "feature", "target": "src/a.py", "point": "p"*64, "rung": "1"}
+
+            claim("with an empty ledger the operator is clonal and the card is bare",
+                  evidence_for([], rung2, "root") == {"operator": "clonal", "text": ""})
+            one = [e("a"*16, 1, "root", "refuse", why="it did not build")]
+            got = evidence_for(one, rung2, "root")
+            claim("one refusal on this target is clonal evidence", got["operator"] == "clonal")
+            claim("and the card carries the reason", "it did not build" in got["text"])
+
+            two = [e("a"*16, 1, "root", "refuse", axis="src/a.py"),
+                   e("b"*16, 2, "root", "refuse", axis="src/b.py")]
+            claim("refusals on two targets in one lineage is a reaction norm",
+                  evidence_for(two, rung2, "root")["operator"] == "reaction-norm")
+            claim("and the card says the problem is the lineage, not the milestone",
+                  "how it works" in evidence_for(two, rung2, "root")["text"])
+
+            xl = [e("a"*16, 1, "root", "adopt"),
+                  e("b"*16, 2, "a"*16, "refuse", ladder="p"*64, why="someone else tried")]
+            got = evidence_for(xl, rung2, "root")
+            claim("a refusal on this rung from another lineage is cross-lineage",
+                  got["operator"] == "cross-lineage")
+            claim("and it is preferred over this lineage's own history",
+                  evidence_for(xl + two, rung2, "root")["operator"] == "cross-lineage")
+            claim("but a refusal from this same lineage is not cross-lineage",
+                  evidence_for([e("a"*16, 1, "root", "refuse", ladder="p"*64)],
+                               rung2, "a"*16)["operator"] != "cross-lineage")
+
+            # -- the envelope ---------------------------------------------
+            env = envelope(rung, CFG, {"operator": "clonal", "text": ""}, "",
+                           "diff --git a/src/new.py b/src/new.py\n", "c"*40, 3, "root")
+            claim("the envelope records which operator drew it", "operator clonal" in env)
+            claim("and the seed that drew it", "seed 3" in env)
+            claim("and closes", env.rstrip().endswith("[end]"))
+            wenv = envelope(dict(rung, kind="repair"), CFG, {"operator": "clonal", "text": ""},
+                            "W", "P", "c"*40, None, "root")
+            claim("a witness kind's envelope carries both patches",
+                  "[witness]" in wenv and "[patch]" in wenv)
+            claim("a greedy draw records no seed", "seed -" in wenv)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd != "draft":
+            print("::error::draft: no such command: %r" % cmd)
+            sys.exit(1)
+
+        root = os.environ.get("ROOT", ".") or "."
+        cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+        rung = {}
+        for line in Path(os.environ["RUNG"]).read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition("=")
+            if k.startswith("RUNG_"):
+                rung[k[5:].lower()] = v
+        seed = os.environ.get("SEED", "").strip()
+        seed = int(seed) if seed else None
+        lineage = os.environ.get("LINEAGE", "root").strip() or "root"
+
+        try:
+            parent = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=root,
+                                    capture_output=True, text=True, check=True).stdout.strip()
+            ev, wpatch, patch, attempts = draft(root, rung, cfg, seed, lineage)
+            text = envelope(rung, cfg, ev, wpatch, patch, parent, seed, lineage)
+            Path(os.environ["OUT"]).write_text(text, encoding="utf-8")
+            import hashlib
+            point = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            print("  drew %s on attempt %d, operator %s, point %s"
+                  % (rung["target"], attempts, ev["operator"], point[:16]))
+            out("drew", "yes"); out("point", point)
+            out("operator", ev["operator"]); out("attempts", str(attempts)); out("why", "")
+        except NoAnswer as exc:
+            # Not a balk: nothing here is evidence about the rung.
+            print("::warning::the model never answered: %s" % exc)
+            out("drew", "no"); out("why", "no answer: %s" % exc)
+            out("operator", "-"); out("attempts", "0")
+            sys.exit(NO_ANSWER)
+        except DraftError as exc:
+            print("::notice::drew nothing: %s" % str(exc)[:500])
+            out("drew", "no"); out("why", str(exc)[:300].replace("\n", " "))
+            out("operator", "-"); out("attempts", str(cfg["author"]["attempts"]))
+            sys.exit(1)
+        PYEOF

@@ -1,0 +1,356 @@
+name: goedel-harness
+description: >-
+  Run the project's own build, tests and benchmark, and turn what they printed
+  into counts and rails.
+
+# **This action knows no language.** Everything it runs is a string out of
+# `goedel.toml`, and everything it counts is a regular expression out of the
+# same file. A project is adopted into this template by describing itself here
+# once; nothing downstream ever asks what it is written in.
+#
+# What comes back, and why each of them:
+#
+#   built      whether the build command succeeded at all. A candidate that
+#              does not build is a REFUSAL with a reason, never a red job:
+#              a red job files no certificate, so the rung that produced it
+#              never moves, and under a schedule that is a silent stall where
+#              the same broken file is drafted every night forever.
+#
+#   suites     how many test files or groups ran.
+#   claims     how many individual assertions printed a pass.
+#   checks     how many of the harness commands that were attempted succeeded.
+#
+#   The three of them are the monotonic invariants. **None of them may fall.**
+#   It is the only thing standing between a machine that improves its test
+#   numbers and a machine that deletes its tests, and it is checked in the
+#   certificate itself so that no kind can forget it.
+#
+#   rails      every `name value unit direction` line the bench command
+#              printed, gathered over `repeats` runs into one sample set per
+#              rail, plus two this action measures itself: `cost.warnings`
+#              from the build output and `cost.artifact_bytes` from the
+#              configured artifact. Cost rails are exact -- one tree, one
+#              toolchain -- which is why they are the rails a project with no
+#              benchmark still has.
+#
+# **`repeats` is spent here and nowhere else.** The judge compares two arms; a
+# confidence interval needs several readings of each. Taking them in one job,
+# back to back, is what makes them comparable: two jobs is two machines, and
+# the difference between two machines is not an effect.
+
+inputs:
+  command:
+    description: "run | selftest"
+    required: true
+  root:
+    description: "the tree to build and test"
+    required: false
+    default: "."
+  config:
+    description: "the validated goedel.toml JSON"
+    required: false
+    default: ""
+  arm:
+    description: "a | b | w -- names the output files"
+    required: false
+    default: a
+  repeats:
+    description: "how many times to run the benchmark"
+    required: false
+    default: "1"
+  skip-bench:
+    description: "counts only; no rails"
+    required: false
+    default: "false"
+
+outputs:
+  built:
+    description: "yes | no"
+    value: ${{ steps.run.outputs.built }}
+  tested:
+    description: "yes | no"
+    value: ${{ steps.run.outputs.tested }}
+  suites:
+    description: "how many suites ran"
+    value: ${{ steps.run.outputs.suites }}
+  claims:
+    description: "how many assertions passed"
+    value: ${{ steps.run.outputs.claims }}
+  checks:
+    description: "how many harness commands succeeded"
+    value: ${{ steps.run.outputs.checks }}
+  rails:
+    description: "the rail file this arm produced"
+    value: ${{ steps.run.outputs.rails }}
+  why:
+    description: "when something did not survive, what"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        CONFIG: ${{ inputs.config }}
+        ARM: ${{ inputs.arm }}
+        REPEATS: ${{ inputs.repeats }}
+        SKIP_BENCH: ${{ inputs.skip-bench }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import json, os, re, subprocess, sys
+        from pathlib import Path
+
+        RAIL_LINE = re.compile(r"^([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+) +(-?[0-9.eE+]+) +(\S+) +(lower|higher)\s*$")
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def shell(cmd, root, timeout):
+            """Run one configured command. stdout and stderr are one stream:
+            a test runner that prints its failures to stderr and its tally to
+            stdout is the common case, and counting them separately means
+            counting half of what happened."""
+            if not cmd:
+                return None
+            r = subprocess.run(cmd, cwd=root, shell=True, capture_output=True,
+                               text=True, timeout=timeout)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+        def count_claims(text, pattern):
+            rx = re.compile(pattern, re.M)
+            return sum(1 for line in text.splitlines() if rx.search(line))
+
+        def count_suites(text, pattern):
+            """The LAST match wins. A runner prints a per-file tally as it goes
+            and a grand total at the end, and the grand total is the one that
+            describes the run."""
+            found = re.findall(pattern, text, re.M)
+            if not found:
+                return 0
+            last = found[-1]
+            if isinstance(last, tuple):
+                last = next((x for x in last if x), "0")
+            try:
+                return int(last)
+            except (TypeError, ValueError):
+                return 0
+
+        def rails_in(text):
+            """Every rail line the bench command printed. Anything else in its
+            output is ignored, so a benchmark may log freely."""
+            found = {}
+            for line in text.splitlines():
+                m = RAIL_LINE.match(line.strip())
+                if m:
+                    name, value, unit, direction = m.groups()
+                    found[name] = (float(value), unit, direction)
+            return found
+
+        def render(samples):
+            body = "\n".join(
+                "%s %s %s %s" % (n, ",".join(numstr(v) for v in vals), unit, direction)
+                for n, (vals, unit, direction) in sorted(samples.items()))
+            return "[rail] v2\n" + (body + "\n" if body else "") + "[rail] end\n"
+
+        def numstr(v):
+            return str(int(v)) if v == int(v) and abs(v) < 1e15 else repr(round(v, 6))
+
+        def measure(root, cfg, arm, repeats, skip_bench):
+            h = cfg["harness"]
+            timeout = h["timeout"]
+            log = []
+            attempted = succeeded = 0
+            why = ""
+
+            for cmd in h["setup"]:
+                attempted += 1
+                code, text = shell(cmd, root, timeout)
+                log.append("$ %s\n%s" % (cmd, text))
+                if code == 0:
+                    succeeded += 1
+                else:
+                    return dict(built=False, tested=False, suites=0, claims=0,
+                                checks=succeeded, rails={}, log="\n".join(log),
+                                why="setup failed: %s" % cmd)
+
+            built, warnings = True, 0
+            if h["build"]:
+                attempted += 1
+                code, text = shell(h["build"], root, timeout)
+                log.append("$ %s\n%s" % (h["build"], text))
+                warnings = count_claims(text, h["warnings_re"])
+                if code == 0:
+                    succeeded += 1
+                else:
+                    built = False
+                    errs = " ".join(l for l in text.splitlines()
+                                    if l.lower().startswith("error"))[:300]
+                    why = "the build failed: %s" % (errs or "no error line")
+
+            suites = claims = 0
+            tested = False
+            if built and h["test"]:
+                attempted += 1
+                code, text = shell(h["test"], root, timeout)
+                log.append("$ %s\n%s" % (h["test"], text))
+                suites = count_suites(text, h["suites_re"])
+                claims = count_claims(text, h["claims_re"])
+                if code == 0:
+                    succeeded += 1
+                    tested = True
+                else:
+                    why = why or ("the tests did not pass: %d claim(s) printed a pass" % claims)
+
+            samples = {}
+            if built and h["bench"] and not skip_bench:
+                for _ in range(max(1, repeats)):
+                    attempted += 1
+                    code, text = shell(h["bench"], root, timeout)
+                    log.append("$ %s\n%s" % (h["bench"], text))
+                    if code != 0:
+                        why = why or "the benchmark did not finish"
+                        break
+                    succeeded += 1
+                    for name, (value, unit, direction) in rails_in(text).items():
+                        if name not in samples:
+                            samples[name] = ([], unit, direction)
+                        samples[name][0].append(value)
+
+            # The two rails every project has, whatever it is written in.
+            if h["build"]:
+                samples["cost.warnings"] = ([float(warnings)], "n", "lower")
+            if built and h["artifact"]:
+                p = Path(root) / h["artifact"]
+                if p.is_file():
+                    samples["cost.artifact_bytes"] = ([float(p.stat().st_size)], "B", "lower")
+
+            return dict(built=built, tested=tested, suites=suites, claims=claims,
+                        checks=succeeded, rails=samples, log="\n".join(log), why=why)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            import tempfile
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+
+            D = {"suites_re": r"(\d+) tests? (?:passed|ok)",
+                 "claims_re": r"^\s*(?:ok|PASS)\b", "warnings_re": r"^(?:warning|WARN)"}
+
+            claim("claims are counted per line that printed a pass",
+                  count_claims("ok one\nok two\nnot ok three\n", D["claims_re"]) == 2)
+            claim("a line that merely mentions ok is not a pass",
+                  count_claims("this is okay\n", D["claims_re"]) == 0)
+            claim("suites take the last tally, which is the grand total",
+                  count_suites("3 tests passed\n7 tests passed\n", D["suites_re"]) == 7)
+            claim("and no tally at all is zero rather than an error",
+                  count_suites("nothing here\n", D["suites_re"]) == 0)
+
+            claim("a rail line is read off the benchmark's output",
+                  rails_in("noise\nhost.query 41.2 ms lower\nmore noise\n")
+                  == {"host.query": (41.2, "ms", "lower")})
+            claim("a line that is not a rail is ignored, so a benchmark may log",
+                  rails_in("Running benchmarks...\n") == {})
+            claim("an undotted name is not a rail",
+                  rails_in("query 41.2 ms lower\n") == {})
+            claim("a rail with no direction is not a rail",
+                  rails_in("host.query 41.2 ms\n") == {})
+
+            claim("rendering gathers repeated readings into one rail",
+                  render({"a.b": ([1.0, 2.0], "n", "lower")})
+                  == "[rail] v2\na.b 1,2 n lower\n[rail] end\n")
+            claim("an empty set still renders a well-formed file",
+                  render({}) == "[rail] v2\n[rail] end\n")
+
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "art.bin").write_bytes(b"x" * 100)
+                def cfg(**over):
+                    h = {"setup": [], "build": "", "check": "", "test": "true",
+                         "bench": "", "artifact": "", "timeout": 60}
+                    h.update(D); h.update(over)
+                    return {"harness": h}
+
+                r = measure(root, cfg(test="echo 'ok one'; echo 'ok two'; echo '2 tests passed'"),
+                            "a", 1, False)
+                claim("a passing test run is counted", (r["suites"], r["claims"]) == (2, 2))
+                claim("and reports itself tested", r["tested"])
+                claim("and every command it attempted succeeded", r["checks"] == 1)
+
+                r = measure(root, cfg(build="echo 'warning: x'; echo 'warning: y'"),
+                            "a", 1, False)
+                claim("warnings become a cost rail", r["rails"]["cost.warnings"][0] == [2.0])
+                claim("which every project has, whatever it is written in",
+                      "cost.warnings" in r["rails"])
+
+                r = measure(root, cfg(build="true", artifact="art.bin"), "a", 1, False)
+                claim("an artifact's size becomes a cost rail",
+                      r["rails"]["cost.artifact_bytes"][0] == [100.0])
+
+                r = measure(root, cfg(build="echo error: nope; exit 1"), "a", 1, False)
+                claim("a build that fails is reported, not raised", r["built"] is False)
+                claim("and names the error", "nope" in r["why"])
+                claim("and the tests are not run against a tree that did not build",
+                      r["claims"] == 0)
+                claim("and no artifact rail is measured off the previous build",
+                      "cost.artifact_bytes" not in r["rails"])
+
+                r = measure(root, cfg(test="echo 'ok one'; exit 1"), "a", 1, False)
+                claim("a failing test run still counts what passed", r["claims"] == 1)
+                claim("but does not report itself tested", not r["tested"])
+
+                r = measure(root, cfg(build="true", bench="echo 'host.q 5 ms lower'"),
+                            "a", 3, False)
+                claim("repeats gather several samples of one rail",
+                      r["rails"]["host.q"][0] == [5.0, 5.0, 5.0])
+                r = measure(root, cfg(build="true", bench="echo 'host.q 5 ms lower'"),
+                            "a", 3, True)
+                claim("and skipping the bench leaves the cost rails alone",
+                      "host.q" not in r["rails"] and "cost.warnings" in r["rails"])
+
+                r = measure(root, cfg(setup=["exit 1"], build="true"), "a", 1, False)
+                claim("a setup that fails stops before the build", r["built"] is False)
+                claim("and says it was the setup", "setup failed" in r["why"])
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd != "run":
+            print("::error::harness: no such command: %r" % cmd); sys.exit(1)
+
+        root = os.environ.get("ROOT", ".") or "."
+        cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+        arm = os.environ.get("ARM", "a")
+        r = measure(root, cfg, arm,
+                    int(os.environ.get("REPEATS", "1") or "1"),
+                    os.environ.get("SKIP_BENCH", "false") == "true")
+
+        rails_path = "rails-%s.txt" % arm
+        Path(rails_path).write_text(render(r["rails"]), encoding="utf-8")
+        Path("harness-%s.log" % arm).write_text(r["log"], encoding="utf-8")
+
+        print("  arm %s: built=%s tested=%s suites=%d claims=%d checks=%d rails=%d"
+              % (arm, "yes" if r["built"] else "no", "yes" if r["tested"] else "no",
+                 r["suites"], r["claims"], r["checks"], len(r["rails"])))
+        if r["why"]:
+            print("  %s" % r["why"])
+
+        out("built", "yes" if r["built"] else "no")
+        out("tested", "yes" if r["tested"] else "no")
+        out("suites", str(r["suites"])); out("claims", str(r["claims"]))
+        out("checks", str(r["checks"])); out("rails", rails_path)
+        out("why", r["why"].replace("\n", " ")[:300])
+        PYEOF

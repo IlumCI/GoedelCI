@@ -1,0 +1,655 @@
+name: goedel-ladder
+description: >-
+  The operator's one line, decomposed into witnessed milestones, and the
+  bookkeeping that says which one the night is on.
+
+# **This is the whole of what an operator does.** `loop/goal.txt` holds one
+# paragraph saying what the project is for. Everything below it -- what to
+# build next, in what order, and how anybody would know it worked -- is this
+# action's, and it is the difference between a loop that improves a repository
+# and a loop that walks a grid of constants forever.
+#
+# A rung is a milestone with a WITNESS: a sentence naming what would have to
+# be observed for the milestone to be met. A milestone without one cannot be
+# judged, so `propose` refuses to file it.
+#
+#     [rung] v2
+#     seq 3
+#     goal <sha256 of goal.txt when this rung was written>
+#     kind feature
+#     target src/cache.py
+#     title An LRU cache in front of the resolver
+#     witness a test that fills the cache past its bound and sees the oldest evicted
+#     point <sha256 of this block, without this line>
+#     balks 0
+#     [end]
+#
+# **State is derived, not stored.** Whether a rung is open, met or retired is
+# read off the LEDGER -- met when an adopted certificate carries its point,
+# retired after enough refusals do. A counter in this file would be a second
+# account of the same history and would eventually disagree with the first.
+# Balks are the exception and have to be stored, because a draw that came back
+# with nothing files no certificate to count.
+#
+# **The point is what makes any of that work.** It was the envelope's point
+# that travelled to the certificate in the original of this file -- and an
+# envelope's point differs every night, so `met` and `refused` both counted
+# zero forever and a rung could be neither completed nor retired. The loop
+# would have rebuilt one file every night for good, with the ladder never
+# leaving its first rung.
+#
+# **The goal hash is how a changed goal stops old rungs.** Rewrite
+# `loop/goal.txt` and every rung under the old text is stale by construction;
+# `next` skips them and `propose` writes fresh ones. Changing your mind costs
+# one edit.
+
+inputs:
+  command:
+    description: "next | propose | balk | progress | goal | selftest"
+    required: true
+  root:
+    description: "the tree the ladder lives in"
+    required: false
+    default: "."
+  config:
+    description: "the validated goedel.toml JSON"
+    required: false
+    default: ""
+  why:
+    description: "for balk: what came back instead of a draft"
+    required: false
+    default: ""
+  emit-env:
+    description: "for next: where to write the RUNG_* file"
+    required: false
+    default: rung.env
+
+outputs:
+  have:
+    description: "yes when a rung is open"
+    value: ${{ steps.run.outputs.have }}
+  point:
+    description: "the open rung's point"
+    value: ${{ steps.run.outputs.point }}
+  kind:
+    description: "the open rung's kind"
+    value: ${{ steps.run.outputs.kind }}
+  target:
+    description: "the file it is about"
+    value: ${{ steps.run.outputs.target }}
+  verb:
+    description: "create | edit"
+    value: ${{ steps.run.outputs.verb }}
+  retired:
+    description: "yes when this call retired the rung"
+    value: ${{ steps.run.outputs.retired }}
+  why:
+    description: "one line for the log"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        CONFIG: ${{ inputs.config }}
+        WHY: ${{ inputs.why }}
+        EMIT_ENV: ${{ inputs.emit-env }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import fnmatch, hashlib, json, os, re, sys, urllib.error, urllib.request
+        from pathlib import Path
+
+        RUNGS = "loop/ladder/rungs.txt"
+        OPEN, CLOSE = "[rung] v2", "[end]"
+        KEYS = ("seq", "goal", "kind", "target", "title", "witness", "point", "balks")
+        DECLARED = ("kind", "target", "title", "witness")
+
+        class LadderError(Exception): pass
+        class NoAnswer(LadderError): pass
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        # >>> ask -- this block is duplicated in draft/action.yml and
+        # template-check asserts the two copies are byte-identical. A composite
+        # action cannot be called in a loop and `draft` needs six attempts, so
+        # the request client cannot live in an action of its own. A copy that is
+        # checked is the honest version of a copy.
+        def ask(cfg, system, user, seed=None):
+            """One request, to whichever provider goedel.toml names.
+
+            urllib and nothing else: a loop that needs a package installed
+            before it can think has a dependency that can be yanked, and this
+            one has to run unattended at 02:17.
+            """
+            a = cfg["author"]
+            key = os.environ.get(a["api_key_env"], "").strip()
+            base = os.environ.get(a["base_url_env"], "").strip()
+            model = a["model"]
+            temperature = a["temperature"]
+            if seed is not None:
+                # A declared draw. Temperature alone would make every shard the
+                # same answer at 0, and the point of the fan-out is independent
+                # samples of a rung the greedy path may be wrong about the same
+                # way every night.
+                temperature = max(temperature, 0.7)
+
+            if a["provider"] == "anthropic":
+                if not key:
+                    raise NoAnswer("no API key in $%s" % a["api_key_env"])
+                url = (base or "https://api.anthropic.com") + "/v1/messages"
+                body = {"model": model, "max_tokens": a["max_tokens"],
+                        "temperature": temperature, "system": system,
+                        "messages": [{"role": "user", "content": user}]}
+                headers = {"content-type": "application/json", "x-api-key": key,
+                           "anthropic-version": "2023-06-01"}
+                pick = lambda d: "".join(
+                    b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
+            else:
+                if not base:
+                    raise NoAnswer("no endpoint in $%s" % a["base_url_env"])
+                url = base.rstrip("/") + "/chat/completions"
+                body = {"model": model, "max_tokens": a["max_tokens"],
+                        "temperature": temperature,
+                        "messages": [{"role": "system", "content": system},
+                                     {"role": "user", "content": user}]}
+                if seed is not None:
+                    body["seed"] = seed
+                headers = {"content-type": "application/json"}
+                if key:
+                    headers["authorization"] = "Bearer " + key
+                pick = lambda d: d["choices"][0]["message"]["content"] or ""
+
+            req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                         headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+                raise NoAnswer("the endpoint answered %d: %s" % (exc.code, detail)) from None
+            except Exception as exc:
+                raise NoAnswer("the endpoint did not answer: %s" % exc) from None
+            text = pick(data)
+            if not text.strip():
+                # A server that came up and then said nothing is the no-server
+                # case arriving after the health check rather than before it.
+                # It is a fact about the night, not about the rung.
+                raise NoAnswer("the reply carried no text")
+            return text
+        # <<< ask
+
+        # -- the file ----------------------------------------------------
+
+        def parse(text):
+            rungs, cur, inside = [], None, False
+            for n, line in enumerate(text.splitlines(), 1):
+                s = line.strip()
+                if s == OPEN:
+                    if inside:
+                        raise LadderError("line %d: a rung opened inside a rung" % n)
+                    cur, inside = {}, True
+                    continue
+                if s == CLOSE:
+                    if not inside:
+                        raise LadderError("line %d: a rung closed that was not open" % n)
+                    missing = [k for k in KEYS if k not in cur]
+                    if missing:
+                        raise LadderError("the rung ending at line %d declares no %s"
+                                          % (n, ", ".join(missing)))
+                    rungs.append(cur); cur, inside = None, False
+                    continue
+                if not s:
+                    continue
+                if not inside:
+                    raise LadderError("line %d: content outside any rung" % n)
+                k, _, v = line.strip().partition(" ")
+                if k not in KEYS:
+                    raise LadderError("line %d: %r is not a rung field" % (n, k))
+                if k in cur:
+                    raise LadderError("line %d: %s again" % (n, k))
+                cur[k] = v
+            if inside:
+                raise LadderError("the last rung was never closed")
+            return rungs
+
+        def render(rung):
+            return "\n".join([OPEN] + ["%s %s" % (k, rung[k]) for k in KEYS] + [CLOSE, ""])
+
+        def point_of(rung):
+            """The digest of the rung's declaration, without the point itself.
+
+            Only the DECLARED fields: seq and balks move, and a point that
+            moved with them would stop naming the milestone the certificates
+            carry.
+            """
+            body = "".join("%s %s\n" % (k, rung[k]) for k in DECLARED)
+            return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+        def load(root):
+            p = Path(root) / RUNGS
+            return parse(p.read_text(encoding="utf-8")) if p.is_file() else []
+
+        def save(root, rungs):
+            p = Path(root) / RUNGS
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("".join(render(r) for r in rungs), encoding="utf-8")
+
+        def goal_text(root, cfg):
+            p = Path(root) / cfg.get("goal", "loop/goal.txt")
+            return p.read_text(encoding="utf-8").strip() if p.is_file() else ""
+
+        def goal_hash(text):
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+        # -- state, derived ----------------------------------------------
+
+        def ledger(root):
+            d = Path(root) / "loop/ledger/entries"
+            if not d.is_dir():
+                return []
+            es = []
+            for p in sorted(d.iterdir()):
+                if p.suffix != ".cert" or p.name.startswith("."):
+                    continue
+                f = {}
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    k, _, v = line.partition(" ")
+                    f[k] = v
+                es.append(f)
+            return es
+
+        def state_of(rung, entries, goal, balk_limit):
+            """open | met | retired | stale, from the record rather than a counter."""
+            if rung["goal"] != goal:
+                return "stale"
+            mine = [f for f in entries if f.get("ladder") == rung["point"]]
+            if any(f["verdict"] == "adopt" for f in mine):
+                return "met"
+            refused = sum(1 for f in mine if f["verdict"] == "refuse")
+            if refused + int(rung["balks"]) >= balk_limit:
+                return "retired"
+            return "open"
+
+        def next_open(rungs, entries, goal, balk_limit):
+            for r in rungs:
+                if state_of(r, entries, goal, balk_limit) == "open":
+                    return r
+            return None
+
+        # -- proposing ---------------------------------------------------
+
+        SYSTEM = __import__("textwrap").dedent("""\
+            You decompose a project's goal into the single next milestone that would
+            move it forward. You answer with exactly one fenced block and nothing else:
+
+            <<<RUNG>>>
+            kind: <one of the kinds you were given>
+            target: <one path, relative to the repository root>
+            title: <one line, what this milestone is>
+            witness: <one line: what would have to be OBSERVED for it to be done>
+            <<<END>>>
+
+            Rules that are checked mechanically and will refuse your answer:
+            - The kind must be one of the kinds listed for you, and the target must be
+              inside the paths you were told are writable.
+            - A `create` kind's target must NOT already exist; an `edit` kind's must.
+            - The witness is a test that could be written and run, not a feeling. "the
+              cache evicts the oldest entry when it is full" is a witness; "performance
+              is better" is not.
+            - Propose the SMALLEST next step, not the whole goal. One file.
+            - Do not repeat a milestone that is already listed as done or abandoned.
+            """)
+
+        FENCE = re.compile(r"<<<RUNG>>>\s*(.*?)\s*<<<END>>>", re.S)
+
+        def read_proposal(reply):
+            found = FENCE.findall(reply)
+            if not found:
+                raise LadderError("the reply carries no fenced rung")
+            if len(found) > 1:
+                raise LadderError("the reply carries %d rungs; a milestone is one"
+                                  % len(found))
+            fields = {}
+            for line in found[0].splitlines():
+                if not line.strip():
+                    continue
+                k, sep, v = line.partition(":")
+                if not sep:
+                    raise LadderError("%r is not `key: value`" % line.strip())
+                k = k.strip()
+                if k not in DECLARED:
+                    raise LadderError("%r is not a rung field a proposal may set" % k)
+                if k in fields:
+                    raise LadderError("%s again" % k)
+                fields[k] = v.strip()
+            missing = [k for k in DECLARED if k not in fields]
+            if missing:
+                raise LadderError("the proposal declares no " + ", ".join(missing))
+            return fields
+
+        def matches(path, masks):
+            if path.startswith("./"):
+                path = path[2:]
+            for m in masks:
+                if fnmatch.fnmatch(path, m):
+                    return True
+                if m.endswith("/**") and (path == m[:-3] or path.startswith(m[:-2])):
+                    return True
+            return False
+
+        def admit(fields, cfg, root, rungs, goal):
+            kinds = cfg["kinds"]
+            kind = fields["kind"]
+            if kind not in kinds or not kinds[kind]["enabled"]:
+                raise LadderError("%r is not a kind this project has enabled" % kind)
+            target = fields["target"]
+            if matches(target, cfg["evaluator"]):
+                raise LadderError(
+                    "%s is the evaluator; a milestone aimed at the machine's own judge "
+                    "goes through the boundary lane, not the ladder" % target)
+            if not matches(target, cfg["allow"]):
+                raise LadderError("%s is outside every writable path" % target)
+            if ".." in Path(target).parts or Path(target).is_absolute():
+                raise LadderError("%s escapes the tree" % target)
+            exists = (Path(root) / target).exists()
+            verb = kinds[kind]["verb"]
+            if verb == "create" and exists:
+                raise LadderError("kind %s creates a file and %s is already there"
+                                  % (kind, target))
+            if verb == "edit" and not exists:
+                raise LadderError("kind %s edits a file and %s does not exist"
+                                  % (kind, target))
+            if not fields["witness"] or fields["witness"] == "-":
+                raise LadderError(
+                    "a milestone with no witness cannot be judged, so it is not a "
+                    "milestone")
+            if not fields["title"]:
+                raise LadderError("a milestone with no title says nothing")
+            for k, v in fields.items():
+                if "\n" in v:
+                    raise LadderError("%s carries a newline; the format is one line each" % k)
+
+            rung = dict(fields)
+            rung["seq"] = str(len(rungs) + 1)
+            rung["goal"] = goal
+            rung["balks"] = "0"
+            rung["point"] = point_of(rung)
+            if any(r["point"] == rung["point"] for r in rungs):
+                raise LadderError("this exact milestone is already on the ladder")
+            return rung
+
+        def card(cfg, root, rungs, entries, goal_body, balk_limit, goal):
+            kinds = ["  %s (%s, judged by %s)" % (k, v["verb"], v["j1"])
+                     for k, v in sorted(cfg["kinds"].items()) if v["enabled"]]
+            done, gone = [], []
+            for r in rungs:
+                s = state_of(r, entries, goal, balk_limit)
+                if s == "met":
+                    done.append("  %s: %s" % (r["target"], r["title"]))
+                elif s == "retired":
+                    gone.append("  %s: %s" % (r["target"], r["title"]))
+            tree = []
+            for p in sorted(Path(root).rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if matches(rel, cfg["allow"]) and not matches(rel, cfg["evaluator"]):
+                    tree.append("  " + rel)
+            parts = ["THE GOAL\n" + goal_body,
+                     "THE KINDS OF MILESTONE AVAILABLE\n" + "\n".join(kinds),
+                     "THE PATHS YOU MAY AIM AT\n" + "\n".join("  " + m for m in cfg["allow"])]
+            if tree:
+                parts.append("WHAT ALREADY EXISTS THERE\n" + "\n".join(tree[:200]))
+            else:
+                parts.append("NOTHING EXISTS THERE YET. The first milestone creates a file.")
+            if done:
+                parts.append("ALREADY DONE\n" + "\n".join(done))
+            if gone:
+                parts.append("TRIED AND ABANDONED -- do not propose these again\n"
+                             + "\n".join(gone))
+            return "\n\n".join(parts)
+
+        def progress(rungs, entries, goal, balk_limit):
+            if not rungs:
+                return "(the ladder is empty; the next night writes its first rung)"
+            rows = [("seq", "state", "kind", "target", "title")]
+            for r in rungs:
+                rows.append((r["seq"], state_of(r, entries, goal, balk_limit),
+                             r["kind"], r["target"][:34], r["title"][:52]))
+            w = [max(len(x[i]) for x in rows) for i in range(len(rows[0]))]
+            return "\n".join("  ".join(c.ljust(n) for c, n in zip(x, w)).rstrip() for x in rows)
+
+        # ------------------------------------------------------------------
+
+        def selftest():
+            import tempfile
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+            def raises(s, fn):
+                try: fn()
+                except LadderError: return claim(s, True)
+                except Exception as exc: return claim(s, False, "wrong error: %r" % exc)
+                return claim(s, False, "it returned instead of refusing")
+
+            CFG = {"allow": ["src/**"], "evaluator": [".github/**", "goedel.toml"],
+                   "goal": "loop/goal.txt",
+                   "kinds": {"feature": {"verb": "create", "j1": "claims", "enabled": True},
+                             "repair": {"verb": "edit", "j1": "witness", "enabled": True},
+                             "off": {"verb": "edit", "j1": "claims", "enabled": False}}}
+
+            def rung(**over):
+                r = {"seq": "1", "goal": "g"*16, "kind": "feature", "target": "src/a.py",
+                     "title": "a title", "witness": "a witness", "balks": "0"}
+                r.update(over); r["point"] = point_of(r); return r
+
+            r1 = rung()
+            claim("a rung round-trips", parse(render(r1)) == [r1])
+            claim("the point covers only the declaration",
+                  point_of(rung(seq="9", balks="3")) == point_of(r1))
+            claim("and changes when the milestone does",
+                  point_of(rung(title="another")) != point_of(r1))
+            raises("a rung that never closes is refused",
+                   lambda: parse(render(r1).replace("[end]\n", "")))
+            raises("a field nothing knows is refused",
+                   lambda: parse(render(r1).replace("balks 0", "vibes good")))
+            raises("content outside a rung is refused",
+                   lambda: parse("stray\n" + render(r1)))
+
+            # -- derived state -------------------------------------------
+            G = "g"*16
+            def cert(verdict, ladder):
+                return {"verdict": verdict, "ladder": ladder}
+            claim("a fresh rung is open", state_of(r1, [], G, 3) == "open")
+            claim("an adopted certificate carrying its point meets it",
+                  state_of(r1, [cert("adopt", r1["point"])], G, 3) == "met")
+            claim("a certificate carrying another point does not",
+                  state_of(r1, [cert("adopt", "z"*64)], G, 3) == "open")
+            claim("enough refusals retire it",
+                  state_of(r1, [cert("refuse", r1["point"])] * 3, G, 3) == "retired")
+            claim("and not one fewer",
+                  state_of(r1, [cert("refuse", r1["point"])] * 2, G, 3) == "open")
+            claim("balks count toward retirement, because a balk files no certificate",
+                  state_of(rung(balks="3"), [], G, 3) == "retired")
+            claim("balks and refusals count together",
+                  state_of(rung(balks="2"), [cert("refuse", point_of(rung(balks="2")))],
+                           G, 3) == "retired")
+            claim("a rung written under a different goal is stale",
+                  state_of(r1, [], "h"*16, 3) == "stale")
+            claim("so rewriting the goal stops every rung under the old one",
+                  next_open([r1], [], "h"*16, 3) is None)
+            claim("next takes the first open rung",
+                  next_open([rung(seq="1"), rung(seq="2", title="b")], [], G, 3)["title"]
+                  == "a title")
+            claim("and skips a met one",
+                  next_open([r1, rung(seq="2", title="b")],
+                            [cert("adopt", r1["point"])], G, 3)["title"] == "b")
+
+            # -- the fence contract --------------------------------------
+            good = ("<<<RUNG>>>\nkind: feature\ntarget: src/a.py\ntitle: t\n"
+                    "witness: w\n<<<END>>>")
+            claim("a well-formed proposal parses",
+                  read_proposal(good)["target"] == "src/a.py")
+            claim("prose around the fence is ignored",
+                  read_proposal("I think:\n" + good + "\nHope that helps.")["kind"] == "feature")
+            raises("a reply with no fence is refused", lambda: read_proposal("sure thing"))
+            raises("two fences is refused: a milestone is one",
+                   lambda: read_proposal(good + "\n" + good))
+            raises("a field a proposal may not set is refused",
+                   lambda: read_proposal(good.replace("title: t", "point: deadbeef")))
+            raises("a missing field is refused",
+                   lambda: read_proposal(good.replace("witness: w\n", "")))
+            raises("a line that is not key: value is refused",
+                   lambda: read_proposal(good.replace("title: t", "just some prose")))
+
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                (root / "src").mkdir()
+                (root / "src/there.py").write_text("x")
+                def adm(**over):
+                    f = {"kind": "feature", "target": "src/new.py", "title": "t",
+                         "witness": "w"}
+                    f.update(over)
+                    return lambda: admit(f, CFG, root, [], G)
+                claim("a well-formed milestone is admitted", adm()()["point"])
+                raises("a kind this project has not enabled is refused", adm(kind="off"))
+                raises("a kind it does not have at all is refused", adm(kind="mystery"))
+                raises("a target in the evaluator is refused", adm(target="goedel.toml"))
+                raises("a target outside every writable path is refused",
+                       adm(target="README.md"))
+                raises("a target that escapes the tree is refused",
+                       adm(target="src/../../etc/passwd"))
+                raises("a create kind aimed at a file that exists is refused",
+                       adm(target="src/there.py"))
+                raises("an edit kind aimed at a file that does not is refused",
+                       adm(kind="repair", target="src/absent.py"))
+                claim("and an edit kind aimed at one that does is admitted",
+                      admit({"kind": "repair", "target": "src/there.py", "title": "t",
+                             "witness": "w"}, CFG, root, [], G)["kind"] == "repair")
+                raises("a milestone with no witness is refused: it could not be judged",
+                       adm(witness=""))
+                raises("a witness of `-` is refused too", adm(witness="-"))
+                raises("a milestone with no title is refused", adm(title=""))
+                raises("a milestone already on the ladder is refused",
+                       lambda: admit({"kind": "feature", "target": "src/new.py",
+                                      "title": "t", "witness": "w"}, CFG, root,
+                                     [admit({"kind": "feature", "target": "src/new.py",
+                                             "title": "t", "witness": "w"},
+                                            CFG, root, [], G)], G))
+                added = admit({"kind": "feature", "target": "src/new.py", "title": "t",
+                               "witness": "w"}, CFG, root, [r1], G)
+                claim("a new rung takes the next sequence number", added["seq"] == "2")
+                claim("and is stamped with the goal it was written under",
+                      added["goal"] == G)
+
+                c = card(CFG, root, [r1], [cert("adopt", r1["point"])], "build a thing", 3, G)
+                claim("the card carries the goal", "build a thing" in c)
+                claim("and only the enabled kinds", "off (" not in c and "feature (" in c)
+                claim("and what is already done", "ALREADY DONE" in c)
+                claim("and what exists in the writable tree", "src/there.py" in c)
+                gone = card(CFG, root, [r1], [cert("refuse", r1["point"])] * 3,
+                            "build a thing", 3, G)
+                claim("and tells it not to re-propose what was abandoned",
+                      "ABANDONED" in gone)
+
+            claim("progress renders an empty ladder without failing",
+                  "empty" in progress([], [], G, 3))
+            claim("and a populated one as a table",
+                  "retired" in progress([r1], [cert("refuse", r1["point"])] * 3, G, 3))
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        # ------------------------------------------------------------------
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+
+        root = os.environ.get("ROOT", ".") or "."
+        cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+        limit = int(cfg["judge"].get("balks", 3))
+        try:
+            body = goal_text(root, cfg)
+            if not body:
+                raise LadderError(
+                    "loop/goal.txt is empty. That one paragraph is the only thing this "
+                    "machine cannot write for itself.")
+            goal = goal_hash(body)
+            rungs = load(root)
+            entries = ledger(root)
+            openr = next_open(rungs, entries, goal, limit)
+
+            if cmd == "goal":
+                print(body)
+                out("have", "yes" if openr else "no"); out("why", "")
+            elif cmd == "progress":
+                print(progress(rungs, entries, goal, limit))
+                out("have", "yes" if openr else "no"); out("why", "")
+            elif cmd == "next":
+                if not openr:
+                    print("  no rung is open")
+                    Path(os.environ["EMIT_ENV"]).write_text("", encoding="utf-8")
+                    out("have", "no"); out("why", "no open rung")
+                    sys.exit(0)
+                verb = cfg["kinds"][openr["kind"]]["verb"]
+                # A FILE and not job outputs: a title carries spaces and
+                # backticks and a witness carries a sentence, and every one of
+                # those is a quoting accident waiting in $GITHUB_OUTPUT.
+                Path(os.environ["EMIT_ENV"]).write_text(
+                    "".join("RUNG_%s=%s\n" % (k.upper(), openr[k]) for k in KEYS)
+                    + "RUNG_VERB=%s\n" % verb, encoding="utf-8")
+                print("  rung %s: %s %s -- %s"
+                      % (openr["seq"], openr["kind"], openr["target"], openr["title"]))
+                out("have", "yes"); out("point", openr["point"]); out("kind", openr["kind"])
+                out("target", openr["target"]); out("verb", verb)
+                out("why", openr["title"])
+            elif cmd == "balk":
+                if not openr:
+                    out("have", "no"); out("why", "nothing to balk at"); sys.exit(0)
+                openr["balks"] = str(int(openr["balks"]) + 1)
+                save(root, rungs)
+                gone = state_of(openr, entries, goal, limit) == "retired"
+                print("  balk %s on rung %s%s"
+                      % (openr["balks"], openr["seq"], " -- retired" if gone else ""))
+                out("have", "yes"); out("point", openr["point"])
+                out("retired", "yes" if gone else "no")
+                out("why", os.environ.get("WHY", "")[:200].replace("\n", " "))
+            elif cmd == "propose":
+                if openr:
+                    print("  a rung is already open; nothing to propose")
+                    out("have", "yes"); out("point", openr["point"]); out("why", "already open")
+                    sys.exit(0)
+                reply = ask(cfg, SYSTEM, card(cfg, root, rungs, entries, body, limit, goal))
+                rung = admit(read_proposal(reply), cfg, root, rungs, goal)
+                rungs.append(rung)
+                save(root, rungs)
+                print("  a new rung: %s %s -- %s"
+                      % (rung["kind"], rung["target"], rung["title"]))
+                out("have", "yes"); out("point", rung["point"]); out("kind", rung["kind"])
+                out("target", rung["target"])
+                out("verb", cfg["kinds"][rung["kind"]]["verb"])
+                out("why", rung["title"])
+            else:
+                raise LadderError("no such command: %r" % cmd)
+        except NoAnswer as exc:
+            print("::warning::the ladder could not be extended: %s" % exc)
+            out("have", "no"); out("why", str(exc)[:200])
+            sys.exit(0)
+        except LadderError as exc:
+            # A refused proposal is the ORDINARY outcome and not a failure.
+            # The night goes on to whatever else it can do; retrying with more
+            # context is how a fence contract stops being one.
+            print("::notice::ladder %s: %s" % (cmd, exc))
+            out("have", "no"); out("why", str(exc)[:200].replace("\n", " "))
+            sys.exit(0 if cmd == "propose" else 1)
+        PYEOF

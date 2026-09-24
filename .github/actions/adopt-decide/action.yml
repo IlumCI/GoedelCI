@@ -1,0 +1,141 @@
+name: goedel-adopt-decide
+description: >-
+  The one decision that turns a verdict into history: which tree the commit is
+  built on, and whether the verdict still means anything.
+
+# **This was four lines of shell, in a job that runs once a night, and it is
+# the whole of this loop's concurrency safety.** Proving four lines of shell
+# means arranging a race inside a real night, which is a drill nobody writes.
+# As a pure function every one of its states is asserted on every run with
+# nothing staged, which is the only reason to believe it.
+#
+# Three states, and the third is the one that matters:
+#
+#   adopt    the judge said yes and the tip has not moved. The commit's tree
+#            is the CANDIDATE's, so the code and the certificate recording it
+#            land together and are inseparable in history.
+#
+#   refuse   the judge said no. The commit's tree is the LIVE one -- the
+#            refusal is filed, the candidate's code is not. Building a refusal
+#            on the candidate's tree would adopt exactly what was refused,
+#            which is the single worst bug this file could have.
+#
+#   stale    the tip moved while the judge was running, so the judge answered
+#            a question about a tree that is no longer there. Whatever it said
+#            cannot land. The entry records `stale`, the code is dropped, and
+#            the point re-drafts from the new tip under a new name -- the
+#            parent tree is inside the envelope's digest, so it is a different
+#            proposal and gets a different point.
+#
+# The base tree comes back from the SAME call as the verdict, so the tree a
+# commit is built on cannot disagree with the verdict written beside it. Two
+# separate lookups is how those two facts drift apart.
+
+inputs:
+  command:
+    description: "decide | selftest"
+    required: true
+  cert:
+    description: "the certificate the judge rendered"
+    required: false
+    default: ""
+  live:
+    description: "the tree at the tip of the loop branch, right now"
+    required: false
+    default: ""
+
+outputs:
+  verdict:
+    description: "adopt | refuse | stale -- what actually gets filed"
+    value: ${{ steps.run.outputs.verdict }}
+  base:
+    description: "the tree the commit is built on"
+    value: ${{ steps.run.outputs.base }}
+  stale:
+    description: "yes when the tip moved mid-judge"
+    value: ${{ steps.run.outputs.stale }}
+  why:
+    description: "one line for the log"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        CERT: ${{ inputs.cert }}
+        LIVE: ${{ inputs.live }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import os, sys
+        from pathlib import Path
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def decide(verdict, parent, candidate, live):
+            """(verdict, base, why). Pure: every argument is a string."""
+            if parent != live:
+                return ("stale", live,
+                        "the tip moved from %s to %s while the judge ran, so its verdict is "
+                        "about a tree that is not there" % (parent[:12], live[:12]))
+            if verdict == "adopt":
+                return ("adopt", candidate,
+                        "adopted onto %s; the code and the certificate land together"
+                        % candidate[:12])
+            return (verdict, live,
+                    "filed as %s on the live tree; the candidate's code is dropped" % verdict)
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+
+            P, C, L = "p"*40, "c"*40, "l"*40
+
+            v, base, _ = decide("adopt", P, C, P)
+            claim("an adoption builds on the candidate's tree", (v, base) == ("adopt", C))
+            v, base, _ = decide("refuse", P, C, P)
+            claim("a refusal builds on the live tree, never the candidate's",
+                  (v, base) == ("refuse", P), "it built on %s" % base)
+            v, base, _ = decide("adopt", P, C, L)
+            claim("a tip that moved mid-judge is stale whatever the verdict said",
+                  (v, base) == ("stale", L))
+            v, base, _ = decide("refuse", P, C, L)
+            claim("and a refusal on a moved tip is stale too, not a refusal",
+                  v == "stale")
+            claim("a stale decision never builds on the candidate",
+                  decide("adopt", P, C, L)[1] != C)
+            claim("staleness is decided before the verdict is consulted",
+                  decide("adopt", P, C, L)[0] == decide("refuse", P, C, L)[0])
+            claim("the reason names both trees", P[:12] in decide("adopt", P, C, L)[2]
+                  and L[:12] in decide("adopt", P, C, L)[2])
+            v, base, _ = decide("adopt", P, P, P)
+            claim("an adoption whose candidate IS the parent still answers coherently",
+                  base == P)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd != "decide":
+            print("::error::adopt-decide: no such command: %r" % cmd); sys.exit(1)
+
+        f = {}
+        for line in Path(os.environ["CERT"]).read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition(" ")
+            f[k] = v
+        verdict, base, why = decide(f["verdict"], f["parent-tree"],
+                                    f["candidate-tree"], os.environ["LIVE"].strip())
+        print("  %s" % why)
+        out("verdict", verdict); out("base", base); out("why", why)
+        out("stale", "yes" if verdict == "stale" and f["verdict"] != "stale" else "no")
+        PYEOF

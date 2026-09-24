@@ -1,0 +1,211 @@
+name: goedel-budget
+description: >-
+  How much this trial gets to spend, and which half of the search it is spent
+  on. Schmidhuber's OOPS schedule, read off the ledger.
+
+# The Optimal Ordered Problem Solver's rule is that a search which has not
+# succeeded should double its budget rather than give up, and should spend half
+# of every budget extending what already works and half exploring afresh.
+# Both halves matter here for an unglamorous reason: a trial that comes back
+# `unstable` did not fail, it was STARVED -- the measurement could not tell the
+# change from the day -- and repeating it at the same budget will starve again,
+# every night, for good.
+#
+#   level     how many trials in a row came back unstable, capped. Starts at
+#             zero and returns to zero the moment anything is decided.
+#   minutes   base * 2^level. What the judge job's timeout becomes.
+#   repeats   base * 2^level. **This is what a doubled budget actually buys.**
+#             Not more boots for their own sake: more SAMPLES per arm, which
+#             is the only thing that narrows a confidence interval. The
+#             original of this file spent a raised level on a second boot and
+#             then compared two single readings, which buys nothing.
+#   half      extend or explore, alternating with the trial count so the
+#             record gets equal time. `extend` makes the archive's selection
+#             greedy -- spend this on the clade that is working; `explore`
+#             lets it sample.
+#   alpha-k   how many of the last 32 counted trials were adopted. Not used to
+#             decide anything; it is in the certificate so that an operator
+#             reading a run of refusals can see whether the machine is in a
+#             bad patch or has always been like this.
+
+inputs:
+  command:
+    description: "plan | selftest"
+    required: true
+  root:
+    description: "the tree the ledger lives in"
+    required: false
+    default: "."
+  axis:
+    description: "which axis the level is counted over; empty means all"
+    required: false
+    default: ""
+  config:
+    description: "the validated goedel.toml JSON"
+    required: false
+    default: ""
+
+outputs:
+  level:
+    description: "how many doublings in force"
+    value: ${{ steps.run.outputs.level }}
+  minutes:
+    description: "the judge's timeout for this trial"
+    value: ${{ steps.run.outputs.minutes }}
+  repeats:
+    description: "how many samples each arm takes of each rail"
+    value: ${{ steps.run.outputs.repeats }}
+  half:
+    description: "extend | explore"
+    value: ${{ steps.run.outputs.half }}
+  alpha-k:
+    description: "adoptions among the last 32 counted trials"
+    value: ${{ steps.run.outputs.alpha_k }}
+  why:
+    description: "one line for the log"
+    value: ${{ steps.run.outputs.why }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        ROOT: ${{ inputs.root }}
+        AXIS: ${{ inputs.axis }}
+        CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import json, os, sys
+        from pathlib import Path
+
+        WINDOW = 32
+
+        def out(k, v):
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                fh.write("%s=%s\n" % (k, v))
+
+        def load(root):
+            d = Path(root) / "loop/ledger/entries"
+            if not d.is_dir():
+                return []
+            es = []
+            for p in sorted(d.iterdir()):
+                if p.suffix != ".cert" or p.name.startswith("."):
+                    continue
+                f = {}
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    k, _, v = line.partition(" ")
+                    f[k] = v
+                es.append(f)
+            es.sort(key=lambda f: int(f["seq"]))
+            return es
+
+        def plan(entries, axis, base_minutes, base_repeats, max_level):
+            counted = [f for f in entries if f["verdict"] in ("adopt", "refuse", "stale")]
+            here = [f for f in counted if not axis or f.get("axis") == axis]
+
+            # The level is the run of trailing starved trials. A decided one --
+            # anything that was not `unstable` -- ends the run, because the
+            # budget bought an answer and there is nothing left to double for.
+            level = 0
+            for f in reversed(here):
+                if f.get("moved") == "unstable":
+                    level += 1
+                else:
+                    break
+            level = min(level, max_level)
+
+            half = "extend" if len(here) % 2 == 0 else "explore"
+            window = counted[-WINDOW:]
+            alpha_k = sum(1 for f in window if f["verdict"] == "adopt")
+            minutes = base_minutes * (2 ** level)
+            repeats = base_repeats * (2 ** level)
+            why = ("level %d over %d trial%s on %s, half %s, %d adoption(s) in the last %d"
+                   % (level, len(here), "" if len(here) == 1 else "s", axis or "every axis",
+                      half, alpha_k, len(window)))
+            return level, minutes, repeats, half, alpha_k, why
+
+        def selftest():
+            ok = fail = 0
+            def claim(s, held, detail=""):
+                nonlocal ok, fail
+                if held: ok += 1; print("  ok   " + s)
+                else:
+                    fail += 1; print("  FAIL " + s); print("         " + str(detail))
+
+            def e(seq, verdict, moved="-", axis="a"):
+                return {"seq": str(seq), "verdict": verdict, "moved": moved, "axis": axis}
+
+            lv, mins, rep, half, ak, _ = plan([], "", 45, 3, 3)
+            claim("a fresh ledger is at the base level", lv == 0)
+            claim("and spends the base budget", (mins, rep) == (45, 3))
+            claim("and has adopted nothing", ak == 0)
+            claim("and starts by extending", half == "extend")
+
+            one = [e(1, "refuse", "unstable")]
+            claim("one starved trial raises the level", plan(one, "", 45, 3, 3)[0] == 1)
+            claim("and doubles the minutes", plan(one, "", 45, 3, 3)[1] == 90)
+            claim("and doubles the samples, which is what narrows an interval",
+                  plan(one, "", 45, 3, 3)[2] == 6)
+
+            three = [e(i, "refuse", "unstable") for i in range(1, 4)]
+            claim("three in a row is level three", plan(three, "", 45, 3, 3)[0] == 3)
+            claim("and the cap holds at four", plan(three + [e(4, "refuse", "unstable")],
+                                                   "", 45, 3, 3)[0] == 3)
+            claim("a cap of one is respected", plan(three, "", 45, 3, 1)[0] == 1)
+
+            decided = three + [e(4, "refuse", "worse")]
+            claim("a decided trial returns the level to zero",
+                  plan(decided, "", 45, 3, 3)[0] == 0,
+                  "the budget bought an answer; there is nothing to double for")
+            claim("and a starved one after it starts counting again",
+                  plan(decided + [e(5, "refuse", "unstable")], "", 45, 3, 3)[0] == 1)
+
+            mixed = [e(1, "refuse", "unstable", "a"), e(2, "refuse", "worse", "b"),
+                     e(3, "refuse", "unstable", "a")]
+            claim("the level is counted per axis when one is named",
+                  plan(mixed, "a", 45, 3, 3)[0] == 2,
+                  "a decided trial on ANOTHER axis says nothing about whether this one "
+                  "is starved, so it must not reset this one's run")
+            claim("and across everything when none is, where that decision does interrupt",
+                  plan(mixed, "", 45, 3, 3)[0] == 1)
+
+            claim("the half alternates with the trial count",
+                  plan([e(1, "refuse")], "", 45, 3, 3)[3] == "explore")
+            claim("so the record gets equal time",
+                  plan([e(1, "refuse"), e(2, "refuse")], "", 45, 3, 3)[3] == "extend")
+
+            events = [{"seq": "1", "verdict": "rollback", "moved": "-", "axis": "a"}]
+            claim("an event is not a trial and does not move the schedule",
+                  plan(events, "", 45, 3, 3)[:2] == (0, 45))
+
+            many = [e(i, "adopt") for i in range(1, 41)]
+            claim("alpha-k looks at the last thirty-two only",
+                  plan(many, "", 45, 3, 3)[4] == 32)
+            claim("and counts adoptions among them",
+                  plan([e(1, "adopt"), e(2, "refuse")], "", 45, 3, 3)[4] == 1)
+            print("\n%d/%d claims held" % (ok, ok + fail))
+            return 1 if fail else 0
+
+        cmd = os.environ["COMMAND"].strip()
+        if cmd == "selftest":
+            sys.exit(selftest())
+        if cmd != "plan":
+            print("::error::budget: no such command: %r" % cmd); sys.exit(1)
+
+        cfg = {}
+        if os.environ.get("CONFIG"):
+            cfg = json.loads(Path(os.environ["CONFIG"]).read_text(encoding="utf-8"))
+        j = cfg.get("judge", {})
+        level, minutes, repeats, half, alpha_k, why = plan(
+            load(os.environ.get("ROOT", ".") or "."),
+            os.environ.get("AXIS", "").strip(),
+            int(j.get("base_minutes", 45)), int(j.get("repeats", 3)),
+            int(j.get("max_level", 3)))
+        print("  " + why)
+        out("level", str(level)); out("minutes", str(minutes)); out("repeats", str(repeats))
+        out("half", half); out("alpha_k", str(alpha_k)); out("why", why)
+        PYEOF
