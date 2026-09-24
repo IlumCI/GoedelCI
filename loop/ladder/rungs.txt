@@ -6,5 +6,5 @@ target src/window.py
 title Add a mean() method to WindowStats that returns None when empty and computes the arithmetic mean otherwise.
 witness assert window_stats.mean([1, 2, 3]) == 2.0; assert window_stats.mean([]) is None
 point f46f3075d0e2560e15059766abeb63491da313767a323a67148329f7730f8073
-balks 0
+balks 1
 [end]
