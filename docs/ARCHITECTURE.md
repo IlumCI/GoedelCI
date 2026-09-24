@@ -224,17 +224,27 @@ being aimed at a test file; and the diff budget and path masks are unchanged.
 
 ### How a measurement is decided
 
-In this order, and the order is the design:
+**The samples are taken by alternating between the two trees**, one reading of
+each per round. Measuring all of one arm and then all of the other makes every
+baseline reading older than every candidate reading, so a runner that warms up
+or a neighbour that arrives lands entirely on one side. On two trees whose
+behaviour is byte-for-byte identical, block measurement reported −0.03%, −8.84%
+and −28.27% on three consecutive runs; alternating reported +0.15%, +0.44% and
+−1.12%. `bench-pair` owns that, because it needs git and `harness` deliberately
+does not.
+
+Then, in this order, and the order is the design:
 
 1. **The floor.** Inside its declared floor is not a movement. First, because it
    needs no samples and because a rail whose floor is 5% should not produce a
    confident 0.4% discovery however many times it is measured.
-2. **The run's own wobble.** A second reading of the *same* artifact in each arm
-   (bought by a raised budget). An effect no larger than that pair's own
-   disagreement is `unstable`. This is the gate that catches the day.
+2. **The run's own wobble.** A second reading of the *same* artifact, when the
+   caller supplies one. Redundant once the samples are interleaved — the
+   within-arm spread is in the samples themselves — and kept for callers taking
+   a single reading per arm.
 3. **The interval.** With three or more samples, a percentile bootstrap on the
    relative difference of medians plus a permutation p-value. An interval that
-   straddles zero is `unstable` too.
+   straddles zero is `unstable`.
 4. **The correction.** Benjamini–Hochberg across the comparison's discoveries.
 
 **The asymmetry is the safety property.** `better` is corrected; `worse` is not.
@@ -261,9 +271,10 @@ repeats  base × 2^level      ← what a doubled budget actually buys
 half     extend | explore    ← greedy or sampled clade selection
 ```
 
-`repeats` is the important one. More samples per arm is the only thing that
-narrows a confidence interval; a raised level spent on a second *boot* of the
-same binary, compared as two single readings, buys nothing.
+`repeats` is the important one, and it is spent as ROUNDS of the alternating
+measurement: more samples per arm is the only thing that narrows a confidence
+interval, and taking them alternately is the only thing that keeps them about
+the trees rather than about the hour.
 
 ---
 

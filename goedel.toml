@@ -123,16 +123,18 @@ context = []
 # floor is zero and one byte larger really is larger.
 "cost." = 0.0
 
-# **0.25, and the number is measured rather than chosen.** This started at 0.05
-# and a rehearsal on a shared runner moved `bench.total_ms` by 12.3% between
-# two arms differing by one added module -- so at 5% every night would have
-# refused on the benchmark, for the runner rather than for the code.
+# **0.05, and it holds because the measurement is interleaved.** This was 0.25
+# for a while, to absorb a 12% swing between two arms differing by one added
+# module -- which was not the module. Measured directly, on two trees whose
+# behaviour is byte-for-byte identical: block measurement (all of one arm, then
+# all of the other) reported -0.03%, -8.84% and -28.27% on three consecutive
+# runs, while alternating between the trees reported +0.15%, +0.44% and -1.12%.
 #
-# A wall-clock benchmark on a hosted runner is mostly measuring the neighbours.
-# Replace this with what the `floors` workflow measures on the runner class
-# that will actually judge you, and change it through a `boundary` proposal
-# that cites the measurement.
-"bench." = 0.25
+# The 28% was the runner, and a floor raised to hide it would also have hidden
+# every real improvement smaller than a quarter. `bench-pair` alternates, so
+# the floor can be what a floor should be: a little above the noise that
+# remains.
+"bench." = 0.05
 
 # --- the kinds ------------------------------------------------------------
 #
@@ -153,17 +155,6 @@ targets = ["src/**"]
 # nothing exercises, which is what J1 already refuses.
 allow_rails = ["cost.artifact_bytes"]
 
-# **Reported, and explicitly not attributed to the change.** Adding a module
-# moves every function after it, which on a hot loop is an alignment and
-# instruction-cache effect that nothing in this repository controls for. A
-# timing rail has no control group here, so a movement in it is the change's
-# logic or its layout and there is no instrument that can say which.
-#
-# `adrift` prints the movement and records it, and declines to veto on it. The
-# rails that CAN be attributed -- the cost rails, and anything your benchmark
-# measures deterministically -- still refuse, and so does the claim count.
-# Delete this line once you have a benchmark with a control.
-adrift_rails = ["bench.total_ms", "bench.push_ns"]
 diff_lines = 400
 diff_files = 6
 prompt = """

@@ -192,13 +192,17 @@ jobs:
 
       # --- the baseline arm ------------------------------------------------
 
+      # Counts only. The timing rails are taken later, by alternating between
+      # the two trees, so that the clock is not one of the things being
+      # compared -- see bench-pair/action.yml.
       - id: base
         uses: ./.github/actions/harness
         with:
           command: run
           config: ${{ steps.cfg.outputs.json }}
           arm: a
-          repeats: ${{ inputs.repeats }}
+          repeats: "1"
+          skip-bench: "true"
 
       - name: A baseline that does not build is the branch, not the candidate
         shell: bash
@@ -212,19 +216,6 @@ jobs:
             echo "::error::nothing can be judged against it, and the candidate is not to blame"
             exit 1
           fi
-
-      # **What a level above zero buys.** A second reading of the SAME baseline
-      # artifact, so the judge knows this run's own wobble and can tell a
-      # change in the code from the day the runner is having. It costs a whole
-      # harness run, which is exactly what a raised budget is for.
-      - id: base2
-        if: fromJSON(inputs.level) >= 1
-        uses: ./.github/actions/harness
-        with:
-          command: run
-          config: ${{ steps.cfg.outputs.json }}
-          arm: a2
-          repeats: ${{ inputs.repeats }}
 
       # --- the witness arm, for the kinds whose J1 it is -------------------
       #
@@ -303,17 +294,31 @@ jobs:
           command: run
           config: ${{ steps.cfg.outputs.json }}
           arm: b
-          repeats: ${{ inputs.repeats }}
+          repeats: "1"
+          skip-bench: "true"
 
-      - id: cand2
-        if: fromJSON(inputs.level) >= 1 && steps.cand.outputs.built == 'yes'
+      # --- the measurement, alternating ------------------------------------
+      #
+      # **`repeats` is spent here and only here.** Each round takes one reading
+      # of each tree, so whatever the machine is doing over the run is spread
+      # across both arms instead of landing entirely on whichever was measured
+      # first. A raised OOPS level buys more rounds, which is the only thing
+      # that narrows the interval downstream.
+      #
+      # It leaves the candidate checked out, because the steps after it read
+      # the candidate's files.
+      - id: bench
+        if: steps.cand.outputs.built == 'yes'
         continue-on-error: true
-        uses: ./.github/actions/harness
+        uses: ./.github/actions/bench-pair
         with:
-          command: run
+          base-ref: ${{ inputs.baseline_ref }}
+          cand-ref: ${{ inputs.candidate_ref }}
           config: ${{ steps.cfg.outputs.json }}
-          arm: b2
-          repeats: ${{ inputs.repeats }}
+          rounds: ${{ inputs.repeats }}
+          before: rails-a.txt
+          after: rails-b.txt
+          restore: ${{ inputs.candidate_ref }}
 
       # --- the comparison ---------------------------------------------------
 
@@ -324,8 +329,6 @@ jobs:
           command: judge
           before: rails-a.txt
           after: rails-b.txt
-          again-before: ${{ fromJSON(inputs.level) >= 1 && 'rails-a2.txt' || '' }}
-          again-after: ${{ fromJSON(inputs.level) >= 1 && 'rails-b2.txt' || '' }}
           claims: ${{ steps.kind.outputs.rail }}
           kind: ${{ inputs.kind }}
           config: ${{ steps.cfg.outputs.json }}

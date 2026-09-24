@@ -9,7 +9,7 @@ files a signed record of what it decided and why. Improvements accumulate on a
 branch you merge when you feel like it. Nothing reaches your default branch
 without you.
 
-It is thirteen composite actions and six workflows. There is no package to
+It is fourteen composite actions and six workflows. There is no package to
 install, no service to run, and nothing outside `.github/` except one config
 file. It runs on GitHub's free hosted runners.
 
@@ -116,6 +116,7 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `draft` | the only thing here that writes code |
 | `envelope` | the proposal: admitted before it runs, derived through a temp index |
 | `harness` | your build, tests and benchmark — it knows no language |
+| `bench-pair` | measures two trees by alternating, so time is not compared |
 | `rails` | paired comparison with a floor, an interval and an FDR |
 | `budget` | how much a starved trial gets to spend next time |
 | `adopt-decide` | which tree a commit is built on, as a pure function |
@@ -153,10 +154,13 @@ numbers and a machine that deletes its tests.
 
 ### "Better" is a statistical claim, not a comparison
 
-A rail is a measurement your benchmark prints. Four gates decide whether one
-moved: its declared floor, this run's own second reading of the *same* artifact,
-a percentile bootstrap interval on the difference of medians, and
-Benjamini–Hochberg across every rail in the comparison.
+A rail is a measurement your benchmark prints. The two arms are measured by
+**alternating** between them, one reading of each per round, because measuring
+one arm and then the other puts every warm-up and every noisy neighbour on one
+side of the comparison — on two trees that behave identically, that produced a
+spurious 28% "improvement". Then four gates decide whether anything moved: the
+declared floor, the run's own second reading, a percentile bootstrap interval on
+the difference of medians, and Benjamini–Hochberg across every rail.
 
 Improvements are corrected for multiple comparisons. Regressions are
 deliberately not — a veto that gets weaker the more things you measure is a veto
