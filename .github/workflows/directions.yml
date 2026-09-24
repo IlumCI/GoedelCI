@@ -54,10 +54,26 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      # Not `ref: loop/main`. A repository that has never run a night does
+      # not have that branch, and the checkout answers "A branch or tag with
+      # the name 'loop/main' could not be found" -- a red run, at the first
+      # step, on a workflow that has a perfectly good thing to do without it.
+      # Without it there is no blueprint, so `blueprint phase` refuses, the gate
+      # below reads `done != yes`, and the run does nothing and says so -- which
+      # is exactly right for a repository with no plan to propose past.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: loop/main
           fetch-depth: 0
+
+      - name: The tree the plan lives on, if there is one yet
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify --quiet origin/loop/main >/dev/null; then
+            git checkout -qf -B loop/main origin/loop/main
+          else
+            echo "::notice::no loop/main yet, so there is no plan to propose past"
+          fi
 
       - id: cfg
         uses: ./.github/actions/config

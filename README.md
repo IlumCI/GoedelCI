@@ -168,6 +168,8 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 |---|---|
 | **Workflows** | |
 | `ci.yml` | the gate: the machine proves itself, then your project builds and tests |
+| `genesis.yml` | a name and a type become a brief, a plan and a phase one |
+| `genesis-build.yml` | one attempt at that phase one, called by `genesis` up to three times |
 | `loop-night.yml` | the night — follow, reconsider, ladder, draft, judge, adopt, tidy |
 | `loop-judge.yml` | the two-arm gate, called by the night and runnable by hand |
 | `proof.yml` | two drills end to end, plus a synthetic epoch; no model, no pushes |
@@ -177,6 +179,9 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `floors.yml` | measures this runner class's own noise, as data |
 | **Actions** | |
 | `config` | `goedel.toml` — validated, and the digest of the evaluator judging you |
+| `brief` | a name and a kind of thing, expanded into a specification |
+| `blueprint` | that specification, planned into phases with observable criteria |
+| `scaffold` | phase one, written whole, with `config` assembling the boundary |
 | `cert` | the certificate format; the only place the field table lives |
 | `ledger` | the append-only record, and the fsck that is the whole trust in it |
 | `archive` | the lineage tree, clade metaproductivity, where to build from next |
@@ -194,7 +199,7 @@ Until step 4, everything still works except `draft` and the ladder: `ci` and
 | `template-check` | the machine checked against itself |
 | `selftest-all` | runs every suite from disk, for the one gate that needs it |
 
-Every action answers `command: selftest` and `ci` runs all thirteen. An action
+Every action answers `command: selftest` and `ci` runs all twenty. An action
 that cannot prove itself is refused by `template-check`, because that is how a
 check gets deleted — not by argument, by nobody noticing it went.
 

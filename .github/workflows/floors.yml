@@ -42,10 +42,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Not `ref: loop/main`. A repository that has never run a night does
+      # not have that branch, and the checkout answers "A branch or tag with
+      # the name 'loop/main' could not be found" -- a red run, at the first
+      # step, on a workflow that has a perfectly good thing to do without it.
+      # Measured on loop/main when there is one, because that is the tree the
+      # judge will be running against; on any other, because what this measures
+      # is the runner class and not the code.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: loop/main
           fetch-depth: 0
+
+      - name: The latest adopted tree, or this one
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify --quiet origin/loop/main >/dev/null; then
+            git checkout -qf -B loop/main origin/loop/main
+            echo "  measuring on loop/main"
+          else
+            echo "::notice::no loop/main yet; measuring this ref, and filing the first"
+            echo "::notice::evidence onto a loop/main branched from it"
+          fi
 
       - id: cfg
         uses: ./.github/actions/config

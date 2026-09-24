@@ -46,10 +46,27 @@ jobs:
       declares: ${{ steps.proposal.outputs.declares }}
       moves: ${{ steps.verdict.outputs.moves }}
     steps:
+      # Not `ref: loop/main`. A repository that has never run a night does
+      # not have that branch, and the checkout answers "A branch or tag with
+      # the name 'loop/main' could not be found" -- a red run, at the first
+      # step, on a workflow that has a perfectly good thing to do without it.
+      # Without it there is no ledger, so there are no archived comparisons, so
+      # Moves, Honest and Remembers each refuse on a question that cannot be
+      # asked. That is the documented answer and it should be the one you get,
+      # rather than a checkout error that looks like a broken workflow.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: loop/main
           fetch-depth: 0
+
+      - name: The record this lane is judged against, if there is one yet
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify --quiet origin/loop/main >/dev/null; then
+            git checkout -qf -B loop/main origin/loop/main
+          else
+            echo "::notice::no loop/main yet; there is no record to cross-judge against"
+          fi
 
       - id: cfg
         uses: ./.github/actions/config

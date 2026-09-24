@@ -24,7 +24,7 @@ description: >-
 # readers are independent and neither is allowed to excuse the other: a file
 # has to satisfy both.
 #
-# The four checks:
+# The five checks:
 #
 #   loadable    no duplicate key in one mapping, no tab indentation, and no
 #               block scalar that ends early. The last is this template's own
@@ -65,6 +65,14 @@ description: >-
 #   resolvable  every `uses: ./.github/actions/X` names a directory that is
 #               there. A local `uses:` that does not resolve fails at run time,
 #               in the middle of a night, on a step nobody was watching.
+#
+#   named       every status check RULESETS.md tells an operator to require is
+#               one a job here actually reports. GitHub renders EVERY matrix
+#               key into a job name unless the job declares one, so
+#               `proof / drill (pass)` was really `proof / drill (pass,
+#               adopt)` -- and a required check that never reports does not
+#               fail a merge, it BLOCKS it, for good, while looking like a
+#               queue. Two files nothing else keeps in step.
 #
 #   singular    exactly one action may talk to the network. This was two for a
 #               while -- `draft` and `ladder` both needed a model, so both
@@ -283,6 +291,66 @@ runs:
                         % (n, ref))
             return bad, uses
 
+        # A required status check is named `<workflow> / <job>`, and GitHub
+        # renders every matrix key into the job half unless the job carries an
+        # explicit `name:`. So the names an operator copies into a ruleset are
+        # derived from two files that nothing keeps in step -- and a required
+        # check that does not report does not fail the merge, it BLOCKS it,
+        # for good, while looking like a queue. `proof / drill (pass)` was
+        # already wrong: the matrix had two keys, so the real check was
+        # `proof / drill (pass, adopt)`.
+        # SPACES around the slash, which is how GitHub itself writes a check
+        # name and is what separates one from the backticked paths and branch
+        # patterns the same file is full of: `.github/RULESETS.md` and
+        # `boundary/**` have no spaces, `proof / ledger` does. Anything that
+        # survives and still does not name a workflow here is skipped rather
+        # than reported, because the file is prose.
+        CHECKREF = re.compile(r"`([A-Za-z0-9_-][A-Za-z0-9_.-]*) +/ +([^`/]+)`")
+
+        def rendered_names(text):
+            """(workflow name, [job name patterns]) read structurally.
+
+            `${{ ... }}` becomes `*`, so a matrix-derived name matches what it
+            could render as without this having to expand the matrix.
+            """
+            wf, jobs, in_jobs, job_indent = None, [], False, None
+            pend, prop_indent = None, None
+            for line in text.split("\n"):
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                ind = len(line) - len(line.lstrip())
+                m = re.match(r"^name:\s*(.+?)\s*$", line)
+                if m and wf is None:
+                    wf = m.group(1).strip("'\"")
+                if re.match(r"^jobs:\s*$", line):
+                    in_jobs, job_indent = True, None
+                    continue
+                if not in_jobs:
+                    continue
+                if ind == 0:
+                    in_jobs = False
+                    continue
+                m = re.match(r"^(\s*)([A-Za-z_][\w.-]*):\s*$", line)
+                if m and (job_indent is None or ind == job_indent):
+                    job_indent, prop_indent = ind, None
+                    if pend:
+                        jobs.append(pend)
+                    pend = m.group(2)
+                    continue
+                if job_indent is not None and ind > job_indent and prop_indent is None:
+                    # The first line under the job fixes where its own keys
+                    # live. Anything deeper belongs to a step, a `with:` or a
+                    # matrix -- and `name:` is the commonest key in all three,
+                    # so without this the job list fills with step titles and
+                    # artifact names and loses the jobs themselves.
+                    prop_indent = ind
+                m = re.match(r"^\s*name:\s*(.+?)\s*$", line)
+                if m and pend is not None and ind == prop_indent:
+                    pend = m.group(1).strip("'\"")
+            if pend:
+                jobs.append(pend)
+            return wf, [re.sub(r"\$\{\{.*?\}\}", "*", j) for j in jobs]
+
         def has_selftest(text):
             return "selftest" in text and re.search(r"command.*selftest|selftest.*command",
                                                     text, re.S) is not None
@@ -378,6 +446,29 @@ runs:
                         "ci does not run the claim suite of: %s. The suite exists and "
                         "nothing runs it, which reads as covered and is not."
                         % ", ".join(missing))
+
+            rules = root / ".github/RULESETS.md"
+            if rules.is_file():
+                import fnmatch
+                have = {}
+                for p in sorted(wf.iterdir()) if wf.is_dir() else []:
+                    if p.suffix not in (".yml", ".yaml"):
+                        continue
+                    n, js = rendered_names(p.read_text(encoding="utf-8"))
+                    if n:
+                        have.setdefault(n, []).extend(js)
+                seen = set()
+                for w, j in CHECKREF.findall(rules.read_text(encoding="utf-8")):
+                    j = j.strip()
+                    if (w, j) in seen or w not in have:
+                        continue
+                    seen.add((w, j))
+                    if not any(fnmatch.fnmatchcase(j, pat) for pat in have[w]):
+                        problems.append(
+                            "RULESETS.md names `%s / %s` as a status check and no job in "
+                            "%s.yml renders that name (it has: %s). A required check that "
+                            "never reports does not fail a merge, it blocks it forever."
+                            % (w, j, w, ", ".join(have[w])))
 
             talkers = [name for name, p in actions
                        if NETWORK.search(p.read_text(encoding="utf-8"))]
@@ -499,6 +590,38 @@ runs:
 
             claim("a marker comment is not a heredoc",
                   lo("f", "steps:\n  - run: |\n      # <<< ask\n      x\n") == [])
+
+            wfx = ("name: proof\njobs:\n  ledger:\n    runs-on: x\n  drill:\n"
+                   "    name: drill (${{ matrix.arm }})\n    runs-on: x\n")
+            claim("a workflow's name and its jobs are read out of it",
+                  rendered_names(wfx) == ("proof", ["ledger", "drill (*)"]),
+                  rendered_names(wfx))
+            claim("a job with no explicit name is known by its key",
+                  rendered_names("name: ci\njobs:\n  machine:\n    runs-on: x\n")
+                  == ("ci", ["machine"]))
+            claim("a step's name is not a job's name",
+                  rendered_names("name: ci\njobs:\n  a:\n    steps:\n"
+                                 "      - name: something\n        run: x\n")
+                  == ("ci", ["a"]))
+            claim("nor is an artifact's, under a with: two levels down",
+                  rendered_names("name: ci\njobs:\n  a:\n    runs-on: x\n"
+                                 "    steps:\n      - uses: u\n        with:\n"
+                                 "          name: ci-harness\n  b:\n    runs-on: x\n")
+                  == ("ci", ["a", "b"]),
+                  rendered_names("name: ci\njobs:\n  a:\n    runs-on: x\n"
+                                 "    steps:\n      - uses: u\n        with:\n"
+                                 "          name: ci-harness\n  b:\n    runs-on: x\n"))
+            claim("a matrix-rendered name matches what it can render as",
+                  __import__("fnmatch").fnmatchcase("drill (pass)", "drill (*)"))
+            claim("and the two-key form that was actually shipped does too",
+                  __import__("fnmatch").fnmatchcase("drill (pass, adopt)", "drill (*)"))
+            claim("a check reference is picked out of the ruleset prose",
+                  CHECKREF.findall("- checks: **`ci / machine`**, **`proof / drill (pass)`**")
+                  == [("ci", "machine"), ("proof", "drill (pass)")])
+            claim("and a plain path in prose is not one",
+                  CHECKREF.findall("see `.github/RULESETS.md`, and `loop/ledger/x`") == [])
+            claim("nor is a branch pattern that happens to be named after a workflow",
+                  CHECKREF.findall("Ruleset `boundary` -- branch `boundary/**`") == [])
 
             claim("an action that imports urllib is one that talks to the network",
                   bool(NETWORK.search("        import urllib.request\n")))

@@ -194,6 +194,12 @@ jobs:
           echo "  fsck refused it by name, which is what makes the epoch rules real"
 
   drill:
+    # Named explicitly. Without this the check is called `drill (pass, adopt)`,
+    # because GitHub renders EVERY matrix key into the job name -- so the
+    # required status check an operator configured stops existing the moment
+    # somebody adds a third key to the matrix, and a required check that does
+    # not report blocks every merge forever while looking like a queue.
+    name: drill (${{ matrix.arm }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
