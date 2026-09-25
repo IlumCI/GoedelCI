@@ -46,6 +46,12 @@ inputs:
     description: "which shard this is; picks pool[shard mod len(pool)]"
     required: false
     default: "0"
+  author:
+    description: >-
+      which author to serve, by name. Overrides `shard`, and is how the night
+      hands down the assignment `archive authors` sampled.
+    required: false
+    default: ""
 
 outputs:
   url:
@@ -72,6 +78,7 @@ runs:
         CONFIG: ${{ inputs.config }}
         DIR: ${{ inputs.dir }}
         SHARD: ${{ inputs.shard }}
+        AUTHOR: ${{ inputs.author }}
         RT: ${{ runner.temp }}
       run: |
         set -euo pipefail
