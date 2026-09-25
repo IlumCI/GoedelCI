@@ -242,6 +242,18 @@ jobs:
           WTREE: ${{ steps.wtree.outputs.tree }}
         run: |
           set -euo pipefail
+          # **`commit-tree` wants an identity, and this job had never needed
+          # one.** Every job that writes to a branch sets it; the judge writes
+          # nothing and pushes nothing, so it was the one that did not -- and
+          # the witness arm is the only place it builds a commit at all. The
+          # first night whose drafter produced a `repair` got "fatal: empty
+          # ident name" AFTER the baseline had already built and tested, which
+          # is the most expensive place to discover it.
+          #
+          # Local, not --global: this commit is never pushed and exists only
+          # to be checked out.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           c=$(git commit-tree "$WTREE" -p HEAD -m "witness arm (never pushed)")
           git checkout -f --detach "$c"
 
