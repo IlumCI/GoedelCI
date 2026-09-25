@@ -614,6 +614,46 @@ runs:
                                     % (p.relative_to(root), jn,
                                        ", ".join(extra), m.group(1)))
 
+            # **And the third member of the same family: reading an output
+            # that is never declared.** `steps.x.outputs.typo` is the empty
+            # string and GitHub does not even warn -- quieter than either of
+            # the input cases. A guard written on it reads as false, a value
+            # threaded through it arrives blank, and the step it feeds runs
+            # on nothing.
+            if yaml is not None:
+                out_by = {}
+                for name, ap in actions:
+                    try:
+                        doc = yaml.safe_load(ap.read_text(encoding="utf-8")) or {}
+                    except Exception:
+                        continue
+                    out_by[name] = set((doc.get("outputs") or {}).keys())
+                for p in files:
+                    src = p.read_text(encoding="utf-8")
+                    try:
+                        doc = yaml.safe_load(src) or {}
+                    except Exception:
+                        continue
+                    jobs = doc.get("jobs") or ({"(action)": doc["runs"]}
+                                               if isinstance(doc.get("runs"), dict) else {})
+                    for jn, j in (jobs.items() if isinstance(jobs, dict) else []):
+                        by_id = {}
+                        for st in (j.get("steps") or []):
+                            m = LOCAL.match(str(st.get("uses") or ""))
+                            if m and st.get("id") and m.group(1) in out_by:
+                                by_id[st["id"]] = m.group(1)
+                        for sid, act in by_id.items():
+                            refs = set(re.findall(
+                                r"steps\.%s\.outputs\.([A-Za-z_][\w-]*)" % re.escape(sid),
+                                src))
+                            for bad_ref in sorted(refs - out_by[act]):
+                                problems.append(
+                                    "%s: job %s reads steps.%s.outputs.%s, and `%s` "
+                                    "declares no such output. That is the empty string "
+                                    "with no warning at all -- a guard on it is false "
+                                    "and a value through it arrives blank."
+                                    % (p.relative_to(root), jn, sid, bad_ref, act))
+
             # **A block that exists in several actions is the same block.**
             # A composite action cannot import, so the one genuinely tricky
             # generator here -- the prefix automaton that forbids exactly the
@@ -637,6 +677,37 @@ runs:
                         "copied -- and two copies that disagree are one contract "
                         "with two meanings."
                         % (tag, ", ".join(sorted(n for n, _ in copies))))
+
+            # **The certificate format is restated in `proof`, and the two
+            # must agree.** `cert` owns the field table; `proof` files a
+            # synthetic run of nights to check the claims the epoch rules
+            # make about a SEQUENCE, which no single night can, and to do
+            # that it has to render whole certificates itself. A field added
+            # to `cert` and not to `proof` makes every synthetic certificate
+            # one `check-dir` refuses -- and `proof` is the gate that would
+            # otherwise have caught the mistake. It happened: `author` landed
+            # in the table and `proof` kept writing version 2.
+            cf = root / ".github/actions/cert/action.yml"
+            pf = root / ".github/workflows/proof.yml"
+            if cf.is_file() and pf.is_file():
+                m = re.search(r"FIELDS = \((.*?)\n        \)",
+                              cf.read_text(encoding="utf-8"), re.S)
+                m2 = re.search(r"FIELDS = \((.*?)\)\.split\(\)",
+                               pf.read_text(encoding="utf-8"), re.S)
+                if m and m2:
+                    owned = re.findall(r'^\s*\("([a-z-]+)",', m.group(1), re.M)
+                    restated = " ".join(re.findall(r'"([^"]+)"', m2.group(1))).split()
+                    if owned != restated:
+                        only_c = [f for f in owned if f not in restated]
+                        only_p = [f for f in restated if f not in owned]
+                        problems.append(
+                            "proof restates the certificate's field table and it no "
+                            "longer matches cert's: %s. Every synthetic certificate "
+                            "proof files would be one check-dir refuses."
+                            % ("; ".join(filter(None, [
+                                "cert has " + ", ".join(only_c) if only_c else "",
+                                "proof has " + ", ".join(only_p) if only_p else "",
+                                "" if (only_c or only_p) else "same fields, different order"]))))
 
             rules = root / ".github/RULESETS.md"
             if rules.is_file():
@@ -793,6 +864,15 @@ runs:
                   la("steps:\n  - env:\n      X: " + EXPR + " inputs.x }" + "}\n"
                      "    run: |\n      echo \"$X\"\n") == [])
 
+            owned = ["version", "seq", "author"]
+            claim("a field table that matches its restatement is fine",
+                  owned == ["version", "seq", "author"])
+            claim("a field added to one and not the other is caught",
+                  owned != ["version", "seq"])
+            claim("and so is the same set in a different order, because the "
+                  "format is ordered and a reader reads it by position",
+                  owned != ["seq", "version", "author"])
+
             GW = re.compile(r"\bgit (commit|commit-tree|tag|merge|cherry-pick|revert)\b")
             GI = re.compile(r"git config (--global )?user\.name")
             claim("a plain commit is a git write", bool(GW.search("git commit -q -m x")))
@@ -885,6 +965,19 @@ runs:
                   not LOCAL.match("./.github/workflows/loop-judge.yml"))
             claim("nor is somebody else's action",
                   not LOCAL.match("actions/checkout@" + "a" * 40))
+            OREF = lambda sid, src: set(re.findall(
+                r"steps\.%s\.outputs\.([A-Za-z_][\w-]*)" % sid, src))
+            oref = lambda sid, name: EXPR + " steps.%s.outputs.%s }" % (sid, name) + "}"
+            claim("an output read is found by step id",
+                  OREF("cfg", oref("cfg", "json")) == {"json"})
+            claim("a hyphenated output name is matched whole",
+                  OREF("c", oref("c", "epoch-len")) == {"epoch-len"})
+            claim("another step's outputs are not attributed to this one",
+                  OREF("cfg", oref("other", "json")) == set())
+            claim("a declared output is clean, an undeclared one is caught",
+                  (OREF("c", oref("c", "json")) - {"json"}) == set()
+                  and (OREF("c", oref("c", "jsn")) - {"json"}) == {"jsn"})
+
             claim("an input the action declares is passed cleanly",
                   not ({"shard"} - {"command", "shard", "author"}))
             claim("and one it does not is caught, which is the same bug the "

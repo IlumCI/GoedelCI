@@ -339,8 +339,24 @@ jobs:
                || echo 'Nights stop at a pull request you merge.')")
           n=$(gh pr list --head loop/main --base "$DEFAULT" --state open --json number --jq length)
           if [ "$n" = "0" ]; then
-            gh pr create --head loop/main --base "$DEFAULT" \
-              --title "genesis: $NAME" --body "$body"
+            # The same repository setting `adopt` explains. Here it matters
+            # more, not less: this pull request IS the thing genesis produces,
+            # so failing silently would leave a born repository whose operator
+            # is never shown the brief, the plan or the phase one it wrote.
+            if ! gh pr create --head loop/main --base "$DEFAULT" \
+                   --title "genesis: $NAME" --body "$body" 2>/tmp/pr.err; then
+              err=$(cat /tmp/pr.err)
+              case "$err" in
+                *"not permitted to create"*|*"createPullRequest"*)
+                  echo "::error::$NAME is born on loop/main -- the brief, the plan and"
+                  echo "::error::phase one are all there -- but it could not be opened as"
+                  echo "::error::a pull request. Settings -> Actions -> General -> 'Allow"
+                  echo "::error::GitHub Actions to create and approve pull requests', then"
+                  echo "::error::open loop/main against $DEFAULT yourself, or run this again."
+                  exit 1 ;;
+                *) echo "::error::could not open the genesis pull request: $err"; exit 1 ;;
+              esac
+            fi
           else
             num=$(gh pr list --head loop/main --base "$DEFAULT" --state open \
                     --json number --jq '.[0].number')

@@ -77,7 +77,13 @@ jobs:
           import hashlib, os
           from pathlib import Path
 
-          FIELDS = ("version seq utc point kind lane operator lineage epoch utility rung "
+          # **This list is the certificate format, restated.** It has to
+          # match `cert`'s field table exactly -- a field added there and not
+          # here makes every synthetic certificate one `check-dir` refuses,
+          # and `proof` is the gate that would have caught it. It did not,
+          # because nothing ran it between the field landing and now.
+          FIELDS = ("version seq utc point kind lane operator author lineage epoch "
+                    "utility rung "
                     "axis ladder parent-tree candidate-tree rail corpus alpha-k bar fdr "
                     "minutes half level trials queries suites claims checks witness moved "
                     "effect interval q why verdict runner").split()
@@ -92,9 +98,10 @@ jobs:
 
           def file_one(n, **over):
               epoch = n // length
-              f = dict(version="2", seq=str(n + 1), utc="2026-09-%02dT00:00:00Z" % (n + 2),
+              f = dict(version="3", seq=str(n + 1), utc="2026-09-%02dT00:00:00Z" % (n + 2),
                        point=hashlib.sha256(b"p%d" % n).hexdigest(), kind="feature",
-                       lane="model", operator="clonal", lineage=lineage, epoch=str(epoch),
+                       lane="model", operator="clonal", author="-",
+                       lineage=lineage, epoch=str(epoch),
                        utility=utility, rung="1", axis="src/a.py", ladder="-",
                        rail="none", corpus="0123abcd", bar="-", fdr="-", minutes="30",
                        half="extend", level="0", trials="3", queries="0", suites="-",
@@ -116,8 +123,12 @@ jobs:
                   utility = hashlib.sha256(b"judge-%d" % (n // length)).hexdigest()
               adopt = i % 3 != 0
               cand = hashlib.sha256(b"t%d" % i).hexdigest()[:40] if adopt else "-"
+              # Two authors, alternating, so the portfolio's tally and the
+              # sampler that reads it are exercised over a real sequence and
+              # not only in `archive`'s own claims.
               name, f = file_one(n, verdict="adopt" if adopt else "refuse",
                                  claims="6/7" if adopt else "6/6",
+                                 author="alpha" if i % 2 else "beta",
                                  **{"candidate-tree": cand})
               if adopt:
                   lineage, tree = name, cand
