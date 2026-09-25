@@ -614,6 +614,46 @@ runs:
                                     % (p.relative_to(root), jn,
                                        ", ".join(extra), m.group(1)))
 
+            # **And the third member of the same family: reading an output
+            # that is never declared.** `steps.x.outputs.typo` is the empty
+            # string and GitHub does not even warn -- quieter than either of
+            # the input cases. A guard written on it reads as false, a value
+            # threaded through it arrives blank, and the step it feeds runs
+            # on nothing.
+            if yaml is not None:
+                out_by = {}
+                for name, ap in actions:
+                    try:
+                        doc = yaml.safe_load(ap.read_text(encoding="utf-8")) or {}
+                    except Exception:
+                        continue
+                    out_by[name] = set((doc.get("outputs") or {}).keys())
+                for p in files:
+                    src = p.read_text(encoding="utf-8")
+                    try:
+                        doc = yaml.safe_load(src) or {}
+                    except Exception:
+                        continue
+                    jobs = doc.get("jobs") or ({"(action)": doc["runs"]}
+                                               if isinstance(doc.get("runs"), dict) else {})
+                    for jn, j in (jobs.items() if isinstance(jobs, dict) else []):
+                        by_id = {}
+                        for st in (j.get("steps") or []):
+                            m = LOCAL.match(str(st.get("uses") or ""))
+                            if m and st.get("id") and m.group(1) in out_by:
+                                by_id[st["id"]] = m.group(1)
+                        for sid, act in by_id.items():
+                            refs = set(re.findall(
+                                r"steps\.%s\.outputs\.([A-Za-z_][\w-]*)" % re.escape(sid),
+                                src))
+                            for bad_ref in sorted(refs - out_by[act]):
+                                problems.append(
+                                    "%s: job %s reads steps.%s.outputs.%s, and `%s` "
+                                    "declares no such output. That is the empty string "
+                                    "with no warning at all -- a guard on it is false "
+                                    "and a value through it arrives blank."
+                                    % (p.relative_to(root), jn, sid, bad_ref, act))
+
             # **A block that exists in several actions is the same block.**
             # A composite action cannot import, so the one genuinely tricky
             # generator here -- the prefix automaton that forbids exactly the
@@ -885,6 +925,19 @@ runs:
                   not LOCAL.match("./.github/workflows/loop-judge.yml"))
             claim("nor is somebody else's action",
                   not LOCAL.match("actions/checkout@" + "a" * 40))
+            OREF = lambda sid, src: set(re.findall(
+                r"steps\.%s\.outputs\.([A-Za-z_][\w-]*)" % sid, src))
+            oref = lambda sid, name: EXPR + " steps.%s.outputs.%s }" % (sid, name) + "}"
+            claim("an output read is found by step id",
+                  OREF("cfg", oref("cfg", "json")) == {"json"})
+            claim("a hyphenated output name is matched whole",
+                  OREF("c", oref("c", "epoch-len")) == {"epoch-len"})
+            claim("another step's outputs are not attributed to this one",
+                  OREF("cfg", oref("other", "json")) == set())
+            claim("a declared output is clean, an undeclared one is caught",
+                  (OREF("c", oref("c", "json")) - {"json"}) == set()
+                  and (OREF("c", oref("c", "jsn")) - {"json"}) == {"jsn"})
+
             claim("an input the action declares is passed cleanly",
                   not ({"shard"} - {"command", "shard", "author"}))
             claim("and one it does not is caught, which is the same bug the "
