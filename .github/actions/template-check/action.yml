@@ -678,6 +678,37 @@ runs:
                         "with two meanings."
                         % (tag, ", ".join(sorted(n for n, _ in copies))))
 
+            # **The certificate format is restated in `proof`, and the two
+            # must agree.** `cert` owns the field table; `proof` files a
+            # synthetic run of nights to check the claims the epoch rules
+            # make about a SEQUENCE, which no single night can, and to do
+            # that it has to render whole certificates itself. A field added
+            # to `cert` and not to `proof` makes every synthetic certificate
+            # one `check-dir` refuses -- and `proof` is the gate that would
+            # otherwise have caught the mistake. It happened: `author` landed
+            # in the table and `proof` kept writing version 2.
+            cf = root / ".github/actions/cert/action.yml"
+            pf = root / ".github/workflows/proof.yml"
+            if cf.is_file() and pf.is_file():
+                m = re.search(r"FIELDS = \((.*?)\n        \)",
+                              cf.read_text(encoding="utf-8"), re.S)
+                m2 = re.search(r"FIELDS = \((.*?)\)\.split\(\)",
+                               pf.read_text(encoding="utf-8"), re.S)
+                if m and m2:
+                    owned = re.findall(r'^\s*\("([a-z-]+)",', m.group(1), re.M)
+                    restated = " ".join(re.findall(r'"([^"]+)"', m2.group(1))).split()
+                    if owned != restated:
+                        only_c = [f for f in owned if f not in restated]
+                        only_p = [f for f in restated if f not in owned]
+                        problems.append(
+                            "proof restates the certificate's field table and it no "
+                            "longer matches cert's: %s. Every synthetic certificate "
+                            "proof files would be one check-dir refuses."
+                            % ("; ".join(filter(None, [
+                                "cert has " + ", ".join(only_c) if only_c else "",
+                                "proof has " + ", ".join(only_p) if only_p else "",
+                                "" if (only_c or only_p) else "same fields, different order"]))))
+
             rules = root / ".github/RULESETS.md"
             if rules.is_file():
                 import fnmatch
@@ -832,6 +863,15 @@ runs:
             claim("and one in an action's env:, which is where it belongs, is fine",
                   la("steps:\n  - env:\n      X: " + EXPR + " inputs.x }" + "}\n"
                      "    run: |\n      echo \"$X\"\n") == [])
+
+            owned = ["version", "seq", "author"]
+            claim("a field table that matches its restatement is fine",
+                  owned == ["version", "seq", "author"])
+            claim("a field added to one and not the other is caught",
+                  owned != ["version", "seq"])
+            claim("and so is the same set in a different order, because the "
+                  "format is ordered and a reader reads it by position",
+                  owned != ["seq", "version", "author"])
 
             GW = re.compile(r"\bgit (commit|commit-tree|tag|merge|cherry-pick|revert)\b")
             GI = re.compile(r"git config (--global )?user\.name")

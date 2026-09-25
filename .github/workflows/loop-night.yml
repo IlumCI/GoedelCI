@@ -1147,10 +1147,34 @@ jobs:
           body=$(printf 'Where the loop is going:\n\n```\n%s\n```\n\nAnd what it has judged, newest last:\n\n```\n%s\n```\n\nEvery entry is a content-named certificate under `loop/ledger/entries`, and every night asks `ci.yml` to re-verify this branch on a job the loop does not control. Merging is yours; the machine only ever writes here.\n' \
             "$(cat ladder-progress.txt 2>/dev/null || echo 'see the run log')" \
             "$(cat ledger-tail.txt 2>/dev/null || echo 'see the run log')")
+          # **A repository setting is not a failed night.** By the time
+          # this runs the certificate is filed, loop/main is pushed and the
+          # candidate ref is tidied -- the whole night succeeded. Failing
+          # here paints it red and points at the loop, when what is missing
+          # is Settings -> Actions -> General -> "Allow GitHub Actions to
+          # create and approve pull requests", which is off by default.
+          #
+          # Said the way `promote` says its own: precisely, once, and
+          # without pretending the work did not happen. Withholding the
+          # setting does not contain the loop, it silences it.
+          say_pr_setting() {
+            echo "::warning::the adoption is on loop/main and could not be offered as a"
+            echo "::warning::pull request: GitHub Actions is not permitted to create one"
+            echo "::warning::in this repository. Settings -> Actions -> General ->"
+            echo "::warning::'Allow GitHub Actions to create and approve pull requests'."
+            echo "::warning::It does not widen what the loop may do -- the token still"
+            echo "::warning::has no workflows write and the branch is still protected."
+          }
           n=$(gh pr list --head loop/main --base "$DEFAULT" --state open --json number --jq length)
           if [ "$n" = "0" ]; then
-            gh pr create --head loop/main --base "$DEFAULT" \
-              --title "The loop ledger" --body "$body"
+            if ! gh pr create --head loop/main --base "$DEFAULT" \
+                   --title "The loop ledger" --body "$body" 2>/tmp/pr.err; then
+              err=$(cat /tmp/pr.err)
+              case "$err" in
+                *"not permitted to create"*|*"createPullRequest"*) say_pr_setting ;;
+                *) echo "::error::could not open the audit pull request: $err"; exit 1 ;;
+              esac
+            fi
           else
             num=$(gh pr list --head loop/main --base "$DEFAULT" --state open \
                     --json number --jq '.[0].number')
