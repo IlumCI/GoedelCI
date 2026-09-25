@@ -137,6 +137,10 @@ runs:
         # A draw that produced nothing is not a failure of the rung. The night
         # separates the two, because three balks retire a rung and an
         # afternoon of 503s would otherwise retire the whole ladder.
+        # The share of a reply's non-empty lines that must be distinct. Below
+        # this it is a decoding loop. 0.6 is the figure the original of this
+        # machine settled on over seven nights of measured draws.
+        MIN_DISTINCT = 0.6
         NO_ANSWER = 3
         # A different thing from NO_ANSWER, and the difference is whether
         # waiting helps. An endpoint that timed out may answer tomorrow; a
@@ -295,6 +299,23 @@ runs:
                     "the reply is truncated, not malformed."
                     % a["max_tokens"])
             text = pick(data)
+            # **A reply that is mostly one line repeated is a loop, not a
+            # draw.** The card for these weights warns that greedy decoding
+            # on a long generation can fall into one, and shard 0 decodes at
+            # zero by design. Without this the loop runs to max_tokens and is
+            # reported as a budget problem, which sends you to raise a number
+            # that was never the fault.
+            body = [l.strip() for l in text.split("\n") if l.strip()]
+            if len(body) >= 12:
+                distinct = len(set(body)) / float(len(body))
+                if distinct < MIN_DISTINCT:
+                    raise NoAnswer(
+                        "the answer repeats itself: %d of %d non-empty lines are "
+                        "distinct (%.0f%%, the floor is %.0f%%). That is a decoding "
+                        "loop rather than a draft, and more tokens would only make "
+                        "it longer."
+                        % (len(set(body)), len(body), distinct * 100,
+                           MIN_DISTINCT * 100))
             # **An answer given only inside the think block is not an answer,
             # and it is not the milestone's fault either.** It means the two
             # switches above did not reach the template, which is a fact about
@@ -914,6 +935,24 @@ runs:
             claim("a witness kind's envelope carries both patches",
                   "[witness]" in wenv and "[patch]" in wenv)
             claim("a greedy draw records no seed", "seed -" in wenv)
+            # -- a decoding loop is not a draw ----------------------------
+            def distinct_of(lines):
+                b = [l.strip() for l in lines if l.strip()]
+                return len(set(b)) / float(len(b)) if b else 1.0
+
+            claim("a file of ordinary code is distinct enough",
+                  distinct_of(["def a():", "    return 1", "", "def b():",
+                               "    return 2"]) >= MIN_DISTINCT)
+            claim("and a block repeated twenty times is not",
+                  distinct_of(["    self.x += 1"] * 20) < MIN_DISTINCT)
+            claim("blank lines are not counted either way, or a file with "
+                  "generous spacing would read as a loop",
+                  distinct_of(["a", "", "", "b"]) == 1.0)
+            claim("a short reply is never called a loop: twelve lines is too "
+                  "few to tell repetition from a small file",
+                  len(["x"] * 8) < 12)
+            claim("the floor is the one the original settled on", MIN_DISTINCT == 0.6)
+
             # -- the draw contract, as a grammar --------------------------
             #
             # Measured on a real night: two shards came back "the reply
