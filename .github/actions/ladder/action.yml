@@ -490,13 +490,50 @@ runs:
                     done.append("  %s: %s" % (r["target"], r["title"]))
                 elif s == "retired":
                     gone.append("  %s: %s" % (r["target"], r["title"]))
+            # **Each file with what it DEFINES, not just its name.**
+            #
+            # The card used to list paths alone, so the model had no way to
+            # know what was inside one -- and it invented. A real night
+            # proposed "add a mean() method to WindowStats" against a file
+            # whose only class is `Window`. The draw that followed was asked
+            # to add a method to a symbol that does not exist, ran away, and
+            # burned all six attempts against max_tokens: seven and a half
+            # minutes to produce nothing, and the fault was three words in a
+            # milestone.
+            #
+            # Regexes and no parser, deliberately: `class X`, `def x`,
+            # `function x`, `fn x`, `type X`, `struct X`, `const x =` covers
+            # python, javascript, typescript, rust and go well enough to stop
+            # the inventing, and a language it does not know degrades to the
+            # bare path it had before.
+            DEFS = re.compile(
+                r"^(?:export\s+)?(?:async\s+)?"
+                r"(?:class|def|function|fn|type|struct|interface)\s+([A-Za-z_]\w*)",
+                re.M)
             tree = []
             for p in sorted(Path(root).rglob("*")):
                 if not p.is_file():
                     continue
                 rel = p.relative_to(root).as_posix()
-                if matches(rel, cfg["allow"]) and not matches(rel, cfg["evaluator"]):
-                    tree.append("  " + rel)
+                if not (matches(rel, cfg["allow"]) and not matches(rel, cfg["evaluator"])):
+                    continue
+                # Build output and dot-directories are inside the allow masks
+                # by construction -- `src/**` admits `src/__pycache__/x.pyc` --
+                # and a card offering the model a compiled artifact to aim a
+                # milestone at is a card inviting a refusal.
+                if any(c == "__pycache__" or c.startswith(".") for c in rel.split("/")):
+                    continue
+                if p.suffix in (".pyc", ".pyo", ".so", ".o", ".a", ".class", ".wasm"):
+                    continue
+                try:
+                    names = DEFS.findall(p.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    names = []
+                # Capped: a file with ninety definitions is a file whose list
+                # of them is not the useful thing about it.
+                shown = sorted(dict.fromkeys(names))[:12]
+                tree.append("  %s%s" % (rel, ("  defines: " + ", ".join(shown))
+                                        if shown else ""))
             parts = ["THE GOAL\n" + goal_body]
             if criteria:
                 # The plan, ahead of everything else. A night works the next
