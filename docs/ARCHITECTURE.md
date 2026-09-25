@@ -22,6 +22,7 @@ rung 3
 corpus 00000000
 parent-tree 8c31760b…          the tree the drafter was looking at
 operator cross-lineage          which comparative evidence wrote it
+author qwen38-4b-q4             which model drew it, of the pool
 lineage a4f2…                   the certificate this descends from
 seed 2                          which shard, or `-` for the greedy one
 witness a test that evicts past the bound
@@ -66,13 +67,14 @@ change in the code from the day the runner is having.
 One line per field, content-named, written once and never edited:
 
 ```
-version 2
+version 3
 seq 14
 utc 2026-09-24T02:17:41Z
 point 561ad711…
 kind feature
 lane model
 operator cross-lineage
+author qwen38-4b-q4         which model drew it
 lineage a4f2…
 epoch 0
 utility 391563f2…            the digest of the judge that decided this
@@ -101,6 +103,57 @@ cannot learn from.
 candidate tree equals its parent changed nothing; an adoption on a `worse` or
 `unstable` reading adopted noise; an adoption whose interval straddles zero
 adopted noise more precisely; an adoption that reduces a count deleted a test.
+
+---
+
+## What a model is allowed to answer
+
+Every contract here is a fenced block — `<<<RUNG>>>`, `<<<FILE path>>>`,
+`<<<BLUEPRINT>>>`, `<<<DIRECTION>>>`, `<<<BRIEF>>>`, `<<<HARNESS>>>` — and
+every one of them is enforced by a **GBNF grammar**, not by asking nicely.
+
+That is not a preference. Asked for a milestone in a sentinel block, a 4B
+wrote six thousand characters of the file instead: it matched the coding task
+and never saw the meta-task. Shown its own refusal in as many words, it made
+the same mistake again. Constrained, the same question answered correctly in
+ten seconds. The prose in each system prompt still says the same thing,
+because a hosted provider is sent no grammar and the two must not disagree.
+
+**The body is never constrained.** A draw's body is source, so the grammar has
+to forbid precisely one line — the closing fence — and leave every other byte
+free. That is a prefix automaton, and `not_exactly` generates it rather than
+anybody writing it out:
+
+```
+line ::= "\n" | [^<\n] [^\n]* "\n" | "<" [^<\n] [^\n]* "\n" | "<" "\n" | …
+```
+
+One alternative per position in `<<<END>>>`: a line may end there, or carry a
+character that differs there, and after either it runs free to the newline.
+A line that merely *begins* with the fence is excluded rather than allowed and
+continued, because `line.strip()` is what decides a close.
+
+A composite action cannot import, so that generator is **copied** into every
+action that builds a grammar, bracketed by `# >>> grammar`. `template-check`
+compares the copies on bytes and refuses one that has drifted.
+
+**What a grammar deliberately does not do is judge.** `directions`' count is
+not in it — a reply with one direction earns the refusal "fewer than two is
+not a choice", which is a better message than a sampler that cannot stop.
+`blueprint`'s phases are not either: a criterion that is a feeling is a
+judgement, and `admit` is where judgements live.
+
+Three failures the grammar cannot prevent, each named where it happens:
+
+- **the answer hit `max_tokens`** — with the fence generated last, a truncated
+  reply looks like a formatting failure. `draft` reads `finish_reason` and says
+  which it was.
+- **a decoding loop** — greedy decoding on a long generation can repeat. Under
+  60% distinct non-empty lines the reply is refused as a loop, because more
+  tokens would only make it longer.
+- **a milestone naming something that is not there** — the ladder's card lists
+  each file with what it *defines*, so the model has real symbols to name
+  rather than guesses.
 
 ---
 

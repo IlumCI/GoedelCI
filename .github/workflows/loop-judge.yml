@@ -336,6 +336,30 @@ jobs:
 
       # --- the comparison ---------------------------------------------------
 
+      # **A benchmark that did not run removes a veto, silently.** J2 says no
+      # rail may read `worse`; with no rail files that is vacuously true, so
+      # a broken benchmark turns the regression gate off and the night goes
+      # on looking identical to one where nothing regressed. `bench` is
+      # tolerated on purpose -- a project with no benchmark is a project the
+      # counts decide, and that is fine -- but the DIFFERENCE between "no
+      # benchmark" and "the benchmark broke tonight" has to reach the record.
+      - id: benched
+        if: steps.cand.outputs.built == 'yes'
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.bench.outcome }}
+          HAS_BENCH: ${{ steps.cfg.outputs.json && 'yes' }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" = "failure" ]; then
+            echo "::warning::the benchmark failed, so no rail was measured and the"
+            echo "::warning::'no rail may regress' gate could not fire. The verdict"
+            echo "::warning::below rests on the counts alone, and says so."
+            echo "note=the benchmark did not run, so no rail was checked" >> "$GITHUB_OUTPUT"
+          else
+            echo "note=" >> "$GITHUB_OUTPUT"
+          fi
+
       - id: rails
         if: steps.cand.outputs.built == 'yes'
         uses: ./.github/actions/rails
@@ -368,6 +392,7 @@ jobs:
           UNSTABLE: ${{ steps.rails.outputs.unstable }}
           MOVED: ${{ steps.rails.outputs.moved }}
           RAIL_WHY: ${{ steps.rails.outputs.why }}
+          BENCH_NOTE: ${{ steps.benched.outputs.note }}
           CLAIMED: ${{ steps.kind.outputs.rail }}
           EFFECT: ${{ steps.rails.outputs.effect }}
           INTERVAL: ${{ steps.rails.outputs.interval }}
@@ -419,11 +444,22 @@ jobs:
           worse = int(env("WORSE", "0"))
           unstable = int(env("UNSTABLE", "0"))
 
+          # **Every verdict carries the benchmark's own state.** Without
+          # this an adoption reads "no rail regressed" on a night where no
+          # rail was measured at all -- a sentence that is true only in the
+          # way a vacuous quantifier is true, in the one file a reader is
+          # meant to be able to trust.
+          NOTE = env("BENCH_NOTE")
+
           def refuse(why):
-              out("verdict", "refuse"); out("why", why); raise SystemExit(0)
+              out("verdict", "refuse")
+              out("why", why + ("; " + NOTE if NOTE else ""))
+              raise SystemExit(0)
 
           def adopt(why):
-              out("verdict", "adopt"); out("why", why); raise SystemExit(0)
+              out("verdict", "adopt")
+              out("why", why + ("; " + NOTE if NOTE else ""))
+              raise SystemExit(0)
 
           # **The counts that may not fall, checked before any kind's J1.**
           # Keeping this ahead of the branch is what makes it an invariant
@@ -469,8 +505,9 @@ jobs:
               if b["claims"] <= a["claims"]:
                   refuse("a %s that adds no claim is code nothing exercises (claims %d->%d)"
                          % (env("KIND"), a["claims"], b["claims"]))
-              adopt("it builds, it passes, it added %d claim(s) and lost none; no rail "
-                    "regressed" % (b["claims"] - a["claims"]))
+              adopt("it builds, it passes, it added %d claim(s) and lost none%s"
+                    % (b["claims"] - a["claims"],
+                       "" if NOTE else "; no rail regressed"))
 
           if j1 in ("rail", "cost"):
               want = env("CLAIMED", "none")

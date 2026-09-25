@@ -734,6 +734,18 @@ runs:
             # of a traversal survives by being spelled differently.
             if posixpath.normpath(path) != path:
                 return False
+            # **Generated output is inside the masks by construction.**
+            # `src/**` admits `src/__pycache__/window.cpython-311.pyc`, and
+            # nothing in the masks distinguishes a source file from something
+            # the build wrote. A draw aiming at one is refused downstream --
+            # `envelope` will not take a binary patch -- but downstream is an
+            # attempt already spent, and the same reasoning that puts the
+            # traversal check here puts this one here.
+            if any(seg == "__pycache__" or seg.startswith(".") for seg in parts):
+                return False
+            if path.rsplit(".", 1)[-1] in ("pyc", "pyo", "so", "o", "a", "class",
+                                           "wasm", "dll", "dylib", "exe"):
+                return False
             def m(p, masks):
                 for x in masks:
                     if fnmatch.fnmatch(p, x):
@@ -935,6 +947,20 @@ runs:
             claim("a witness kind's envelope carries both patches",
                   "[witness]" in wenv and "[patch]" in wenv)
             claim("a greedy draw records no seed", "seed -" in wenv)
+            # -- generated output is not a target -------------------------
+            AC = {"allow": ["src/**", "tests/**"], "evaluator": [".github/**"]}
+            claim("an ordinary source path is writable", allowed("src/window.py", AC))
+            claim("but compiled output is not, though the mask admits it",
+                  not allowed("src/__pycache__/window.cpython-311.pyc", AC))
+            claim("nor is a shared object", not allowed("src/native.so", AC))
+            claim("nor anything under a dot-directory",
+                  not allowed("src/.venv/pyvenv.cfg", AC))
+            claim("a dotfile the project owns is still refused, which is the "
+                  "conservative half of one rule rather than two rules",
+                  not allowed("src/.keep", AC))
+            claim("and the traversal check still comes first",
+                  not allowed("src/../../etc/passwd", AC))
+
             # -- a decoding loop is not a draw ----------------------------
             def distinct_of(lines):
                 b = [l.strip() for l in lines if l.strip()]

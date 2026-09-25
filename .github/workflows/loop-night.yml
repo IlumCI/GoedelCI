@@ -767,7 +767,14 @@ jobs:
           ref: ${{ needs.plan.outputs.tip }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      # **Tolerated, but not unnoticed.** A download that fails leaves no
+      # shards on disk, and `pick` then reports "no shard drew a usable
+      # candidate" -- which is exactly what a night where every model refused
+      # looks like. One of those is a fact about the milestone and files a
+      # balk against it; the other is a fact about the artifact service and
+      # should file nothing.
+      - id: shards
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
         with:
           pattern: loop-shard-*
@@ -779,6 +786,8 @@ jobs:
 
       - id: pick
         shell: bash
+        env:
+          SHARDS_FETCHED: ${{ steps.shards.outcome }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -789,6 +798,12 @@ jobs:
           # A glob rather than `ls`, because `ls` on an absent directory exits
           # 2 and `pipefail` makes that the shell's last word.
           shopt -s nullglob
+          if [ "$SHARDS_FETCHED" != "success" ] && [ ! -d shards ]; then
+            echo "::error::the shard artifacts could not be downloaded, so there is"
+            echo "::error::nothing here to judge. That is the artifact service and not"
+            echo "::error::the milestone, so no balk is filed against it."
+            exit 1
+          fi
           took=""; drew=0; balked=0; nokey=0; why=""
           for d in shards/loop-shard-*; do
             state=$(cat "$d/state" 2>/dev/null || echo none)
