@@ -141,6 +141,7 @@ jobs:
           survey: survey.txt
           card-out: directions-card.txt
           system-out: directions-system.txt
+          grammar-out: directions.gbnf
 
       - id: ask
         if: steps.gate.outputs.go == 'yes'
@@ -149,6 +150,7 @@ jobs:
           command: ask
           config: ${{ steps.cfg.outputs.json }}
           system: directions-system.txt
+          grammar: directions.gbnf
           user: directions-card.txt
           out: directions-reply.txt
 

@@ -65,6 +65,7 @@ jobs:
           because: ${{ inputs.because }}
           card-out: scaffold-card.txt
           system-out: scaffold-system.txt
+          grammar-out: scaffold.gbnf
 
       # There is no config yet, and `ask` only needs the [author] table -- so
       # it is handed one built from the same defaults the night uses, rather
@@ -91,6 +92,7 @@ jobs:
           command: ask
           config: ${{ runner.temp }}/ask.json
           system: scaffold-system.txt
+          grammar: scaffold.gbnf
           user: scaffold-card.txt
           out: scaffold-reply.txt
           seed: ${{ inputs.attempt }}

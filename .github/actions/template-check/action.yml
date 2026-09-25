@@ -575,6 +575,30 @@ runs:
                                     % (p.relative_to(root), jn,
                                        (st.get("name") or st.get("id") or "?")[:50]))
 
+            # **A block that exists in several actions is the same block.**
+            # A composite action cannot import, so the one genuinely tricky
+            # generator here -- the prefix automaton that forbids exactly the
+            # closing fence -- is copied into every action that builds a
+            # grammar. Copies drift, and a drifted copy is a contract two
+            # actions disagree about while both look right. `# >>> NAME` and
+            # `# <<< NAME` bracket it; this compares them.
+            marked = {}
+            for name, p in actions:
+                for tag in set(re.findall(r"#\s*>>>\s*([a-z][\w-]*)",
+                                          p.read_text(encoding="utf-8"))):
+                    b = block(p.read_text(encoding="utf-8"), tag)
+                    if b is not None:
+                        marked.setdefault(tag, []).append((name, b))
+            for tag, copies in sorted(marked.items()):
+                bodies = {c for _, c in copies}
+                if len(bodies) > 1:
+                    problems.append(
+                        "the `%s` block has drifted: %s do not all carry the same "
+                        "text. A composite action cannot import, so this block is "
+                        "copied -- and two copies that disagree are one contract "
+                        "with two meanings."
+                        % (tag, ", ".join(sorted(n for n, _ in copies))))
+
             rules = root / ".github/RULESETS.md"
             if rules.is_file():
                 import fnmatch
@@ -813,6 +837,12 @@ runs:
                   bool(NETWORK.search("        from urllib.request import urlopen\n")))
             claim("and a mention of it in a comment is not",
                   not NETWORK.search("        # urllib would do it\n"))
+
+            same = {"a": "BODY", "b": "BODY"}
+            claim("copies that agree are not a problem", len(set(same.values())) == 1)
+            claim("and copies that have drifted are",
+                  len({"BODY", "BODY "}) > 1,
+                  "a trailing space is a drift; the comparison is on bytes")
 
             claim("a marked block is extracted",
                   block("# >>> ask -- a note\nBODY\n# <<< ask\n", "ask") == "BODY")

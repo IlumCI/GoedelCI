@@ -75,6 +75,10 @@ inputs:
     description: "for card: where to write the question"
     required: false
     default: scaffold-card.txt
+  grammar-out:
+    description: "where to write the GBNF the reply must take"
+    required: false
+    default: ""
   system-out:
     description: "for card: where to write the rules the answer is held to"
     required: false
@@ -109,6 +113,7 @@ runs:
         REPLY: ${{ inputs.reply }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
+        GRAMMAR_OUT: ${{ inputs.grammar-out }}
         HARNESS_OUT: ${{ inputs.harness-out }}
       run: |
         set -euo pipefail
@@ -119,6 +124,54 @@ runs:
         FENCE_OPEN = re.compile(r"^<<<FILE (.+?)>>>\s*$")
         FENCE_CLOSE = "<<<END>>>"
         HARNESS_OPEN = "<<<HARNESS>>>"
+
+        # >>> grammar -- byte-identical in every action that builds one.
+        #                `template-check` refuses a copy that has drifted.
+        def not_exactly(lit):
+            """GBNF alternatives for one line that is NOT exactly `lit`.
+
+            **Generated, because writing it out is how you get it wrong.**
+            The draw's body is source, so the grammar has to forbid precisely
+            one line -- the closing fence -- and leave every other byte free.
+            That is a prefix automaton: for each position in the literal, a
+            line may end there, or carry a character that differs there, and
+            after either it is unconstrained to the newline.
+
+            A line that merely BEGINS with the fence is excluded too, rather
+            than allowed and then continued. `line.strip()` is what decides a
+            close, so `<<<END>>>` and two spaces closes it -- and the
+            alternative that let a fence-prefixed line through would have had
+            to exclude trailing whitespace, which is an edge case bought for
+            a line shape no source file has.
+            """
+            alts = ['"\\n"']                              # the empty line
+            for i in range(len(lit)):
+                head = '"%s" ' % lit[:i] if i else ""
+                alts.append('%s[^%s\\n] [^\\n]* "\\n"' % (head, lit[i]))
+                if i:
+                    alts.append('%s"\\n"' % head)
+            return alts
+
+        # <<< grammar
+
+        def reply_grammar():
+            """Whole files, then the harness answers.
+
+            `<<<FILE path>>>` blocks followed by one `<<<HARNESS>>>` block,
+            which is the order `admit` reads them in and the order the card
+            asks for. The bodies are source and answers, so neither is
+            constrained -- only the envelope around them.
+            """
+            return (
+                'root ::= file+ harness\n'
+                'file ::= "<<<FILE " path ">>>" nl body "<<<END>>>" nl\n'
+                'harness ::= "<<<HARNESS>>>" nl body "<<<END>>>" nl\n'
+                'path ::= [^>\\n]+\n'
+                'body ::= line*\n'
+                'line ::= ' + " | ".join(not_exactly("<<<END>>>")) + '\n'
+                'nl   ::= "\\n"\n'
+            )
+
 
         # The only places a scaffold may write. Fixed here rather than asked
         # for: these become the `allow` masks, and a machine that picks its own
@@ -414,6 +467,9 @@ runs:
                     card(bp.read_text(encoding="utf-8"), os.environ.get("PHASE", "1"),
                          os.environ.get("BECAUSE", "")), encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                if os.environ.get("GRAMMAR_OUT", "").strip():
+                    Path(os.environ["GRAMMAR_OUT"]).write_text(
+                        reply_grammar(), encoding="utf-8")
                 print("  asked for phase %s" % os.environ.get("PHASE", "1"))
                 out("files", "0"); out("written", ""); out("why", "")
             elif cmd == "admit":

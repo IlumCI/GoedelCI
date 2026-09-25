@@ -78,6 +78,10 @@ inputs:
     description: "for card: where to write the question"
     required: false
     default: blueprint-card.txt
+  grammar-out:
+    description: "where to write the GBNF the reply must take"
+    required: false
+    default: ""
   system-out:
     description: "for card: where to write the rules the answer is held to"
     required: false
@@ -129,6 +133,7 @@ runs:
         REPLY: ${{ inputs.reply }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
+        GRAMMAR_OUT: ${{ inputs.grammar-out }}
         CRITERIA_OUT: ${{ inputs.criteria-out }}
       run: |
         set -euo pipefail
@@ -137,6 +142,52 @@ runs:
         from pathlib import Path
 
         OPEN, CLOSE = "[blueprint] v1", "[end]"
+
+        # >>> grammar -- byte-identical in every action that builds one.
+        #                `template-check` refuses a copy that has drifted.
+        def not_exactly(lit):
+            """GBNF alternatives for one line that is NOT exactly `lit`.
+
+            **Generated, because writing it out is how you get it wrong.**
+            The draw's body is source, so the grammar has to forbid precisely
+            one line -- the closing fence -- and leave every other byte free.
+            That is a prefix automaton: for each position in the literal, a
+            line may end there, or carry a character that differs there, and
+            after either it is unconstrained to the newline.
+
+            A line that merely BEGINS with the fence is excluded too, rather
+            than allowed and then continued. `line.strip()` is what decides a
+            close, so `<<<END>>>` and two spaces closes it -- and the
+            alternative that let a fence-prefixed line through would have had
+            to exclude trailing whitespace, which is an edge case bought for
+            a line shape no source file has.
+            """
+            alts = ['"\\n"']                              # the empty line
+            for i in range(len(lit)):
+                head = '"%s" ' % lit[:i] if i else ""
+                alts.append('%s[^%s\\n] [^\\n]* "\\n"' % (head, lit[i]))
+                if i:
+                    alts.append('%s"\\n"' % head)
+            return alts
+
+        # <<< grammar
+
+        def reply_grammar():
+            """One `<<<BLUEPRINT>>> ... <<<END>>>` block, and nothing else.
+
+            The PHASES inside are checked by `admit`, which refuses a
+            criterion that is a feeling and a phase that skips a number --
+            those are judgements and a grammar cannot make them. What a
+            grammar can do is stop the answer arriving as markdown, which is
+            the failure every other contract here had before it got one.
+            """
+            return (
+                'root ::= "<<<BLUEPRINT>>>" nl body "<<<END>>>" nl\n'
+                'body ::= line*\n'
+                'line ::= ' + " | ".join(not_exactly("<<<END>>>")) + '\n'
+                'nl   ::= "\\n"\n'
+            )
+
         HEAD = ("name", "stack", "verify", "summary")
         PHASE = re.compile(r"^\[phase\]\s+(\d+)\s+(.+)$")
         DONE = re.compile(r"^\s*done\s+(.+)$")
@@ -459,6 +510,9 @@ runs:
                     card(os.environ["NAME"], description, cfg or None),
                     encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                if os.environ.get("GRAMMAR_OUT", "").strip():
+                    Path(os.environ["GRAMMAR_OUT"]).write_text(
+                        reply_grammar(), encoding="utf-8")
                 print("  asked for a plan for: %s" % os.environ["NAME"])
                 out("have", "no"); out("why", "a question was written")
                 sys.exit(0)

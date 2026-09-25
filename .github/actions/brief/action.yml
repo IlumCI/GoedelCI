@@ -73,6 +73,10 @@ inputs:
   card-out:
     required: false
     default: brief-card.txt
+  grammar-out:
+    description: "where to write the GBNF the reply must take"
+    required: false
+    default: ""
   system-out:
     required: false
     default: brief-system.txt
@@ -108,6 +112,7 @@ runs:
         FOUND: ${{ inputs.found }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
+        GRAMMAR_OUT: ${{ inputs.grammar-out }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -115,6 +120,45 @@ runs:
         from pathlib import Path
 
         OPEN, CLOSE = "<!-- goedel:brief -->", "<!-- /goedel:brief -->"
+
+        # >>> grammar -- byte-identical in every action that builds one.
+        #                `template-check` refuses a copy that has drifted.
+        def not_exactly(lit):
+            """GBNF alternatives for one line that is NOT exactly `lit`.
+
+            **Generated, because writing it out is how you get it wrong.**
+            The draw's body is source, so the grammar has to forbid precisely
+            one line -- the closing fence -- and leave every other byte free.
+            That is a prefix automaton: for each position in the literal, a
+            line may end there, or carry a character that differs there, and
+            after either it is unconstrained to the newline.
+
+            A line that merely BEGINS with the fence is excluded too, rather
+            than allowed and then continued. `line.strip()` is what decides a
+            close, so `<<<END>>>` and two spaces closes it -- and the
+            alternative that let a fence-prefixed line through would have had
+            to exclude trailing whitespace, which is an edge case bought for
+            a line shape no source file has.
+            """
+            alts = ['"\\n"']                              # the empty line
+            for i in range(len(lit)):
+                head = '"%s" ' % lit[:i] if i else ""
+                alts.append('%s[^%s\\n] [^\\n]* "\\n"' % (head, lit[i]))
+                if i:
+                    alts.append('%s"\\n"' % head)
+            return alts
+
+        # <<< grammar
+
+        def reply_grammar():
+            """One `<<<BRIEF>>> ... <<<END>>>` block, and nothing else."""
+            return (
+                'root ::= "<<<BRIEF>>>" nl body "<<<END>>>" nl\n'
+                'body ::= line*\n'
+                'line ::= ' + " | ".join(not_exactly("<<<END>>>")) + '\n'
+                'nl   ::= "\\n"\n'
+            )
+
         FENCE = re.compile(r"<<<BRIEF>>>\s*(.*?)\s*<<<END>>>", re.S)
         SECTIONS = ("what it is", "who it is for", "what it does",
                     "done means", "not doing")
@@ -583,6 +627,9 @@ runs:
                 Path(os.environ["CARD_OUT"]).write_text(
                     card(name, kind, text, "file" if text else "none"), encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                if os.environ.get("GRAMMAR_OUT", "").strip():
+                    Path(os.environ["GRAMMAR_OUT"]).write_text(
+                        reply_grammar(), encoding="utf-8")
                 print("  asked for a brief for %s (%s)" % (name, kind))
                 out("type", kind); out("why", "a question was written")
             elif cmd == "admit":
