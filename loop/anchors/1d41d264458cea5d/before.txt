@@ -1,0 +1,4 @@
+[rail] v2
+bench.push_ns 115.024,117.391,108.11 ns lower
+bench.total_ms 23.005,23.478,21.622 ms lower
+[rail] end
