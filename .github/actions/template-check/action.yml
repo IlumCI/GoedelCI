@@ -575,6 +575,45 @@ runs:
                                     % (p.relative_to(root), jn,
                                        (st.get("name") or st.get("id") or "?")[:50]))
 
+            # **And the mirror of it, on the CALLER's side.** An action that
+            # reads an undeclared input gets the empty string; a caller that
+            # PASSES one gets "Unexpected input(s)" in the log and is
+            # otherwise obeyed. Both are silent, both were the same bug -- the
+            # night that passed `author:` to an action without the input hit
+            # the second half first -- and a rule for one of them only catches
+            # it from whichever side happened to be edited.
+            if yaml is not None:
+                declared_by = {}
+                for name, ap in actions:
+                    try:
+                        doc = yaml.safe_load(ap.read_text(encoding="utf-8")) or {}
+                    except Exception:
+                        continue
+                    declared_by[name] = set((doc.get("inputs") or {}).keys())
+                LOCAL = re.compile(r"^\./\.github/actions/([a-z0-9-]+)$")
+                for p in files:
+                    try:
+                        doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+                    except Exception:
+                        continue
+                    jobs = doc.get("jobs") or ({"(action)": doc["runs"]}
+                                               if isinstance(doc.get("runs"), dict) else {})
+                    for jn, j in (jobs.items() if isinstance(jobs, dict) else []):
+                        for st in (j.get("steps") or []):
+                            m = LOCAL.match(str(st.get("uses") or ""))
+                            if not m or m.group(1) not in declared_by:
+                                continue
+                            extra = sorted(set((st.get("with") or {}).keys())
+                                           - declared_by[m.group(1)])
+                            if extra:
+                                problems.append(
+                                    "%s: job %s passes %s to `%s`, which declares no "
+                                    "such input. GitHub warns and carries on, so the "
+                                    "value is simply dropped and the step runs without "
+                                    "it."
+                                    % (p.relative_to(root), jn,
+                                       ", ".join(extra), m.group(1)))
+
             # **A block that exists in several actions is the same block.**
             # A composite action cannot import, so the one genuinely tricky
             # generator here -- the prefix automaton that forbids exactly the
@@ -837,6 +876,20 @@ runs:
                   bool(NETWORK.search("        from urllib.request import urlopen\n")))
             claim("and a mention of it in a comment is not",
                   not NETWORK.search("        # urllib would do it\n"))
+
+            LOCAL = re.compile(r"^\./\.github/actions/([a-z0-9-]+)$")
+            claim("a local action step is recognised by its uses",
+                  LOCAL.match("./.github/actions/model").group(1) == "model")
+            claim("a reusable WORKFLOW is not an action, so its inputs are "
+                  "not checked against one",
+                  not LOCAL.match("./.github/workflows/loop-judge.yml"))
+            claim("nor is somebody else's action",
+                  not LOCAL.match("actions/checkout@" + "a" * 40))
+            claim("an input the action declares is passed cleanly",
+                  not ({"shard"} - {"command", "shard", "author"}))
+            claim("and one it does not is caught, which is the same bug the "
+                  "reader-side rule catches from the other side",
+                  sorted({"authr"} - {"command", "shard", "author"}) == ["authr"])
 
             same = {"a": "BODY", "b": "BODY"}
             claim("copies that agree are not a problem", len(set(same.values())) == 1)
