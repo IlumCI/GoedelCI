@@ -282,6 +282,18 @@ runs:
                 raise NoAnswer("the endpoint answered %d: %s" % (exc.code, detail)) from None
             except Exception as exc:
                 raise NoAnswer("the endpoint did not answer: %s" % exc) from None
+            # **A truncated answer says so, rather than blaming the fence.**
+            # With a grammar the closing sentinel is the last thing generated,
+            # so an answer that hits the ceiling is one the parser then
+            # refuses for "the fence was never closed" -- which points at the
+            # model's formatting when the actual fault is the budget.
+            fin = ((data.get("choices") or [{}])[0] or {}).get("finish_reason")
+            if fin == "length":
+                raise NoAnswer(
+                    "the answer hit max_tokens (%d) and stopped mid-file. Raise "
+                    "[author] max_tokens, or aim the milestone at a smaller file: "
+                    "the reply is truncated, not malformed."
+                    % a["max_tokens"])
             text = pick(data)
             # **An answer given only inside the think block is not an answer,
             # and it is not the milestone's fault either.** It means the two
@@ -308,6 +320,8 @@ runs:
 
         # -- reading the reply -------------------------------------------
 
+        # >>> grammar -- byte-identical in every action that builds one.
+        #                `template-check` refuses a copy that has drifted.
         def not_exactly(lit):
             """GBNF alternatives for one line that is NOT exactly `lit`.
 
@@ -332,6 +346,8 @@ runs:
                 if i:
                     alts.append('%s"\\n"' % head)
             return alts
+
+        # <<< grammar
 
         def draw_grammar():
             """The draw contract as a grammar: at least one closed fence.

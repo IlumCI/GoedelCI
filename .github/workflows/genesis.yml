@@ -150,6 +150,7 @@ jobs:
           input-out: brief-input.txt
           card-out: brief-card.txt
           system-out: brief-system.txt
+          grammar-out: brief.gbnf
 
       - id: brief-ask
         uses: ./.github/actions/draft
@@ -157,6 +158,7 @@ jobs:
           command: ask
           config: ${{ runner.temp }}/ask.json
           system: brief-system.txt
+          grammar: brief.gbnf
           user: brief-card.txt
           out: brief-reply.txt
 
@@ -178,6 +180,7 @@ jobs:
           brief: loop/brief.md
           card-out: blueprint-card.txt
           system-out: blueprint-system.txt
+          grammar-out: blueprint.gbnf
 
       - id: ask
         uses: ./.github/actions/draft
@@ -185,6 +188,7 @@ jobs:
           command: ask
           config: ${{ runner.temp }}/ask.json
           system: blueprint-system.txt
+          grammar: blueprint.gbnf
           user: blueprint-card.txt
           out: blueprint-reply.txt
 

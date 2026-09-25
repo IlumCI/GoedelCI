@@ -162,7 +162,19 @@ base_url_env = "GOEDEL_INFERENCE_URL"
 # and the reason this is six rather than one.
 attempts = 6
 temperature = 0.0
-max_tokens = 8000
+# **What one answer may be, in tokens.** A draw is ONE file, and 3000 tokens
+# is about 250 lines of it -- generous for the unit this machine works in.
+#
+# 8000 was the timeout. A 4B on four vCPU decodes at roughly 13 tokens a
+# second, so an answer allowed to run to 8000 takes about ten minutes, which
+# IS the per-request timeout; the Q8 author is slower again by roughly the
+# ratio of the files and never finished one. Three of four shards on a real
+# night came back "the endpoint did not answer: timed out".
+#
+# Running out is now a clean refusal rather than a mystery: the reply stops
+# mid-file, the grammar's closing fence never arrives, and `draft` says the
+# answer hit max_tokens rather than blaming the fence.
+max_tokens = 3000
 
 # How many independent draws a night fans out over. Shard 0 is greedy -- the
 # night the loop would have had anyway -- and the rest draw at a raised

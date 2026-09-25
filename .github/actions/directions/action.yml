@@ -62,6 +62,10 @@ inputs:
   card-out:
     required: false
     default: directions-card.txt
+  grammar-out:
+    description: "where to write the GBNF the reply must take"
+    required: false
+    default: ""
   system-out:
     required: false
     default: directions-system.txt
@@ -92,6 +96,7 @@ runs:
         OUT_DIR: ${{ inputs.out-dir }}
         CARD_OUT: ${{ inputs.card-out }}
         SYSTEM_OUT: ${{ inputs.system-out }}
+        GRAMMAR_OUT: ${{ inputs.grammar-out }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -101,6 +106,53 @@ runs:
         FENCE = re.compile(r"<<<DIRECTION>>>\s*(.*?)\s*<<<END>>>", re.S)
         HEAD = ("title", "because", "gives up")
         BP_OPEN, BP_CLOSE = "[blueprint] v1", "[end]"
+
+        # >>> grammar -- byte-identical in every action that builds one.
+        #                `template-check` refuses a copy that has drifted.
+        def not_exactly(lit):
+            """GBNF alternatives for one line that is NOT exactly `lit`.
+
+            **Generated, because writing it out is how you get it wrong.**
+            The draw's body is source, so the grammar has to forbid precisely
+            one line -- the closing fence -- and leave every other byte free.
+            That is a prefix automaton: for each position in the literal, a
+            line may end there, or carry a character that differs there, and
+            after either it is unconstrained to the newline.
+
+            A line that merely BEGINS with the fence is excluded too, rather
+            than allowed and then continued. `line.strip()` is what decides a
+            close, so `<<<END>>>` and two spaces closes it -- and the
+            alternative that let a fence-prefixed line through would have had
+            to exclude trailing whitespace, which is an edge case bought for
+            a line shape no source file has.
+            """
+            alts = ['"\\n"']                              # the empty line
+            for i in range(len(lit)):
+                head = '"%s" ' % lit[:i] if i else ""
+                alts.append('%s[^%s\\n] [^\\n]* "\\n"' % (head, lit[i]))
+                if i:
+                    alts.append('%s"\\n"' % head)
+            return alts
+
+        # <<< grammar
+
+        def reply_grammar():
+            """Two to five `<<<DIRECTION>>> ... <<<END>>>` blocks.
+
+            The COUNT is not in the grammar. GBNF can express a repetition
+            bound, but a reply with one direction is a reply worth reading
+            the refusal for -- `admit` says "fewer than two is not a choice"
+            and that is a better message than a sampler that simply cannot
+            stop. What the grammar stops is markdown.
+            """
+            return (
+                'root ::= block+\n'
+                'block ::= "<<<DIRECTION>>>" nl body "<<<END>>>" nl\n'
+                'body ::= line*\n'
+                'line ::= ' + " | ".join(not_exactly("<<<END>>>")) + '\n'
+                'nl   ::= "\\n"\n'
+            )
+
 
         MIN, MAX = 2, 5
 
@@ -341,6 +393,9 @@ runs:
                          bp.read_text(encoding="utf-8"), survey, count),
                     encoding="utf-8")
                 Path(os.environ["SYSTEM_OUT"]).write_text(SYSTEM, encoding="utf-8")
+                if os.environ.get("GRAMMAR_OUT", "").strip():
+                    Path(os.environ["GRAMMAR_OUT"]).write_text(
+                        reply_grammar(), encoding="utf-8")
                 print("  asked for %d direction(s)" % count)
                 out("count", "0"); out("slugs", ""); out("why", "a question was written")
             elif cmd == "admit":

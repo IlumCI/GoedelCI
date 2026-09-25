@@ -467,8 +467,9 @@ runs:
                 import yaml  # noqa: F401
             except ImportError:
                 yaml = None
-                print("::warning::no yaml module here; the structural pass is "
-                      "the only reader")
+                print("::warning::no yaml module here, so two checks do not run: "
+                      "the real-parser second opinion, and the git identity rule "
+                      "below, which needs step ORDER within a job")
 
             action_paths = {p for _, p in actions}
             for p in files:
@@ -537,6 +538,66 @@ runs:
                         "ci does not run the claim suite of: %s. The suite exists and "
                         "nothing runs it, which reads as covered and is not."
                         % ", ".join(missing))
+
+            # **A job that writes with git must set an identity first.**
+            # `git commit` and `git commit-tree` both refuse with "fatal:
+            # empty ident name" on a bare runner. Every job that pushes sets
+            # it; the JUDGE pushes nothing, so it was the one that did not --
+            # and its only commit is the witness arm, which no night reached
+            # until the drafter first produced a `repair`. It failed AFTER
+            # the baseline had built and tested, which is the most expensive
+            # place to find it.
+            #
+            # Per JOB and in step order, because the setting persists across
+            # steps of one job and not beyond it.
+            if yaml is not None:
+                GIT_W = re.compile(r"\bgit (commit|commit-tree|tag|merge|cherry-pick"
+                                   r"|revert)\b")
+                GIT_ID = re.compile(r"git config (--global )?user\.name")
+                for p in files:
+                    try:
+                        doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+                    except Exception:
+                        continue
+                    jobs = doc.get("jobs") or ({"(action)": doc["runs"]}
+                                               if isinstance(doc.get("runs"), dict) else {})
+                    for jn, j in (jobs.items() if isinstance(jobs, dict) else []):
+                        named = False
+                        for st in (j.get("steps") or []):
+                            r = st.get("run") or ""
+                            if GIT_ID.search(r):
+                                named = True
+                            if GIT_W.search(r) and not named:
+                                problems.append(
+                                    "%s: job %s writes with git in %r before any step "
+                                    "sets user.name. A bare runner answers 'fatal: empty "
+                                    "ident name' and the job dies wherever that lands."
+                                    % (p.relative_to(root), jn,
+                                       (st.get("name") or st.get("id") or "?")[:50]))
+
+            # **A block that exists in several actions is the same block.**
+            # A composite action cannot import, so the one genuinely tricky
+            # generator here -- the prefix automaton that forbids exactly the
+            # closing fence -- is copied into every action that builds a
+            # grammar. Copies drift, and a drifted copy is a contract two
+            # actions disagree about while both look right. `# >>> NAME` and
+            # `# <<< NAME` bracket it; this compares them.
+            marked = {}
+            for name, p in actions:
+                for tag in set(re.findall(r"#\s*>>>\s*([a-z][\w-]*)",
+                                          p.read_text(encoding="utf-8"))):
+                    b = block(p.read_text(encoding="utf-8"), tag)
+                    if b is not None:
+                        marked.setdefault(tag, []).append((name, b))
+            for tag, copies in sorted(marked.items()):
+                bodies = {c for _, c in copies}
+                if len(bodies) > 1:
+                    problems.append(
+                        "the `%s` block has drifted: %s do not all carry the same "
+                        "text. A composite action cannot import, so this block is "
+                        "copied -- and two copies that disagree are one contract "
+                        "with two meanings."
+                        % (tag, ", ".join(sorted(n for n, _ in copies))))
 
             rules = root / ".github/RULESETS.md"
             if rules.is_file():
@@ -693,6 +754,19 @@ runs:
                   la("steps:\n  - env:\n      X: " + EXPR + " inputs.x }" + "}\n"
                      "    run: |\n      echo \"$X\"\n") == [])
 
+            GW = re.compile(r"\bgit (commit|commit-tree|tag|merge|cherry-pick|revert)\b")
+            GI = re.compile(r"git config (--global )?user\.name")
+            claim("a plain commit is a git write", bool(GW.search("git commit -q -m x")))
+            claim("and so is commit-tree, which is the one that was missed",
+                  bool(GW.search('c=$(git commit-tree "$T" -p HEAD -m w)')))
+            claim("reading git is not writing it",
+                  not GW.search("git rev-parse HEAD") and not GW.search("git status"))
+            claim("a local identity counts, not only a global one",
+                  bool(GI.search('git config user.name "github-actions[bot]"'))
+                  and bool(GI.search("git config --global user.name x")))
+            claim("setting only the email is not setting an identity",
+                  not GI.search('git config user.email "a@b"'))
+
             di = declared_inputs
             man = "name: x\ninputs:\n  command:\n    required: true\n  shard:\n" \
                   "    default: \"0\"\noutputs:\n  author:\n    value: y\n"
@@ -763,6 +837,12 @@ runs:
                   bool(NETWORK.search("        from urllib.request import urlopen\n")))
             claim("and a mention of it in a comment is not",
                   not NETWORK.search("        # urllib would do it\n"))
+
+            same = {"a": "BODY", "b": "BODY"}
+            claim("copies that agree are not a problem", len(set(same.values())) == 1)
+            claim("and copies that have drifted are",
+                  len({"BODY", "BODY "}) > 1,
+                  "a trailing space is a drift; the comparison is on bytes")
 
             claim("a marked block is extracted",
                   block("# >>> ask -- a note\nBODY\n# <<< ask\n", "ask") == "BODY")
