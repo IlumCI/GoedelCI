@@ -308,6 +308,57 @@ runs:
 
         # -- reading the reply -------------------------------------------
 
+        def not_exactly(lit):
+            """GBNF alternatives for one line that is NOT exactly `lit`.
+
+            **Generated, because writing it out is how you get it wrong.**
+            The draw's body is source, so the grammar has to forbid precisely
+            one line -- the closing fence -- and leave every other byte free.
+            That is a prefix automaton: for each position in the literal, a
+            line may end there, or carry a character that differs there, and
+            after either it is unconstrained to the newline.
+
+            A line that merely BEGINS with the fence is excluded too, rather
+            than allowed and then continued. `line.strip()` is what decides a
+            close, so `<<<END>>>` and two spaces closes it -- and the
+            alternative that let a fence-prefixed line through would have had
+            to exclude trailing whitespace, which is an edge case bought for
+            a line shape no source file has.
+            """
+            alts = ['"\\n"']                              # the empty line
+            for i in range(len(lit)):
+                head = '"%s" ' % lit[:i] if i else ""
+                alts.append('%s[^%s\\n] [^\\n]* "\\n"' % (head, lit[i]))
+                if i:
+                    alts.append('%s"\\n"' % head)
+            return alts
+
+        def draw_grammar():
+            """The draw contract as a grammar: at least one closed fence.
+
+            Measured: two shards of a real night came back "the reply carries
+            no fenced file" -- a FORMAT failure, not a wrong patch. The author
+            wrote the code and wrapped it in markdown, which is the same thing
+            the ladder did before it got one of these.
+
+            The PATH is constrained (no newline, no closing bracket) and the
+            BODY is not, because the body is the answer and a grammar over it
+            would be this file having opinions about the project's source.
+            """
+            return (
+                'root ::= file+\n'
+                'file ::= "<<<FILE " path ">>>" nl body "<<<END>>>" nl\n'
+                'path ::= [^>\\n]+\n'
+                'body ::= line*\n'
+                # **One line, however long.** llama.cpp's GBNF parser takes
+                # alternatives only on the rule's own line -- a continuation
+                # beginning `| ...` is a parse failure, and the server answers
+                # 400 "failed to parse grammar" rather than naming the line.
+                # Found by bisecting constructs against the real parser.
+                'line ::= ' + " | ".join(not_exactly(FENCE_CLOSE)) + '\n'
+                'nl   ::= "\\n"\n'
+            )
+
         def files_in(reply):
             """Every `<<<FILE path>>> ... <<<END>>>` block, in order.
 
@@ -565,7 +616,8 @@ runs:
 
             for attempt in range(1, cfg["author"]["attempts"] + 1):
                 attempts = attempt
-                reply = ask(cfg, SYSTEM, card(rung, cfg, root, ev, last_error), seed)
+                reply = ask(cfg, SYSTEM, card(rung, cfg, root, ev, last_error), seed,
+                            grammar=draw_grammar())
                 try:
                     files = files_in(reply)
                 except DraftError as exc:
@@ -846,6 +898,44 @@ runs:
             claim("a witness kind's envelope carries both patches",
                   "[witness]" in wenv and "[patch]" in wenv)
             claim("a greedy draw records no seed", "seed -" in wenv)
+            # -- the draw contract, as a grammar --------------------------
+            #
+            # Measured on a real night: two shards came back "the reply
+            # carries no fenced file". The author wrote the code and wrapped
+            # it in markdown -- a FORMAT failure, not a wrong patch, and the
+            # same thing the ladder did before it got one of these.
+            G = draw_grammar()
+            claim("the grammar forces at least one fenced file",
+                  "root ::= file+" in G)
+            claim("and a file that is opened has to be closed",
+                  'file ::= "<<<FILE " path ">>>" nl body "<<<END>>>" nl' in G, G)
+            claim("the path may not run past the closing bracket or the line",
+                  "path ::= [^>\\n]+" in G)
+            claim("the BODY is unconstrained, because the body is the answer "
+                  "and a grammar over it would be this file having opinions "
+                  "about the project's source",
+                  "body ::= line*" in G)
+            claim("every alternative is on the rule's own line: llama.cpp's "
+                  "parser answers 400 on a continuation beginning with a bar, "
+                  "and does not say which line",
+                  all(not l.lstrip().startswith("|")
+                      for l in G.split("\n") if l.strip()), G)
+
+            ne = not_exactly("<<<END>>>")
+            claim("the automaton has an alternative per position, plus the "
+                  "empty line: diverge here, or end here",
+                  len(ne) == 2 * len("<<<END>>>"), len(ne))
+            claim("an ordinary source line is admitted",
+                  '[^<\\n] [^\\n]* "\\n"' in ne)
+            claim("a line that merely starts with an angle bracket is too, "
+                  "because source carries those",
+                  '"<" [^<\\n] [^\\n]* "\\n"' in ne)
+            claim("and the full fence has no alternative of its own, so no "
+                  "body line can be one",
+                  not any(a.startswith('"<<<END>>>"') for a in ne), ne)
+            claim("a shorter terminator generates a shorter automaton",
+                  len(not_exactly("<<")) == 4)
+
             # -- the local lane's wire format -----------------------------
             #
             # Measured against a real llama-server before these were written.
