@@ -57,3 +57,11 @@ def test_an_empty_window_refuses_variance_rather_than_inventing_a_number():
     except ValueError:
         return
     raise AssertionError("variance answered for an empty window")
+
+
+def test_a_window_of_zero_is_refused_at_construction():
+    try:
+        Window(0)
+    except ValueError:
+        return
+    raise AssertionError("a window of no values was accepted")
