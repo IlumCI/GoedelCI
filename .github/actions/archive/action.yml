@@ -38,8 +38,9 @@ description: >-
 # adopted, and has a smaller sequence number. Nothing else was ever true of a
 # backtrack either.
 #
-# What a move costs is the same in both directions -- the working tree becomes
-# that node's tree and the ledger is carried forward whole -- so restricting it
+# What a move costs is the same in both directions -- the project becomes that
+# node's project, and the evaluator and the record are carried forward whole,
+# because a move changes what is judged and never the judge -- so restricting it
 # to ancestors bought nothing and removed every branch of the archive that was
 # not on the tip's own line. On a tree where one early decision seeded two
 # lineages, that is most of the search space.

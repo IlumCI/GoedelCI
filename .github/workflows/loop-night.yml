@@ -150,7 +150,7 @@ jobs:
             kind=event
             lane=event
             epoch=${{ steps.seq.outputs.epoch }}
-            utility=${{ steps.cfg.outputs.utility }}
+            utility=${{ steps.seq.outputs.utility || steps.cfg.outputs.utility }}
             rung=0
             axis=none
             why=main overrode: ${{ steps.follow.outputs.conflicted }}
@@ -227,6 +227,75 @@ jobs:
           command: start
           config: ${{ steps.cfg.outputs.json }}
 
+      # **A judge that changed on the default branch is recorded before
+      # anything is judged by it.** `follow` merged main, and main is where the
+      # operator edits the template -- which is the evaluator. That change did
+      # not come through `boundary` and is not the machine's to refuse, but a
+      # record that let it in silently would file tonight's verdict in the
+      # same epoch as verdicts the OLD judge gave, and fsck would rightly
+      # refuse the ledger from then on. An `amended` entry closes the epoch
+      # the change arrived in and opens the next one under the new digest.
+      # Here rather than in `follow`: this job checked out the merged tree, so
+      # `cfg` above is the digest the new judge actually has.
+      - id: before
+        uses: ./.github/actions/ledger
+        with:
+          command: count
+          epoch-len: ${{ steps.cfg.outputs.epoch-len }}
+
+      - id: amend
+        name: Has the judge changed since the newest entry
+        shell: bash
+        env:
+          WAS: ${{ steps.before.outputs.utility }}
+          IS: ${{ steps.cfg.outputs.utility }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WAS" ] || [ "$WAS" = "$IS" ]; then
+            echo "  the judge is the one the newest entry was judged by"
+            echo "go=no" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "::notice::the evaluator changed on the default branch (${WAS:0:16} -> ${IS:0:16}); filing an amendment, which opens a new epoch"
+          {
+            echo "go=yes"
+            echo "now=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "point=$(printf 'amended %s to %s' "$WAS" "$IS" | sha256sum | cut -d' ' -f1)"
+            echo "why=the evaluator changed on the default branch: ${WAS:0:16} -> ${IS:0:16}"
+          } >> "$GITHUB_OUTPUT"
+
+      - if: steps.amend.outputs.go == 'yes'
+        uses: ./.github/actions/cert
+        with:
+          command: emit
+          out: amended.cert
+          set: |
+            seq=${{ steps.before.outputs.seq }}
+            utc=${{ steps.amend.outputs.now }}
+            point=${{ steps.amend.outputs.point }}
+            kind=event
+            lane=event
+            epoch=${{ steps.before.outputs.amend-epoch }}
+            utility=${{ steps.cfg.outputs.utility }}
+            rung=0
+            axis=none
+            why=${{ steps.amend.outputs.why }}
+            verdict=amended
+            runner=${{ github.run_id }}/${{ github.run_attempt }}
+
+      - name: File the amendment, and push
+        if: steps.amend.outputs.go == 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          name=$(sha256sum amended.cert | cut -c1-16)
+          mkdir -p loop/ledger/entries
+          mv amended.cert "loop/ledger/entries/$name.cert"
+          git add loop/ledger/entries
+          git commit -q -m "loop: the evaluator was amended on the default branch"
+          git push origin HEAD:refs/heads/loop/main
+
       - id: seq
         uses: ./.github/actions/ledger
         with:
@@ -294,10 +363,12 @@ jobs:
 
       # Clade before anything else. Under the evidence floor this answers
       # `stay` by construction, so early nights report and move on; when it
-      # answers `move`, the move is a real commit -- the chosen state's tree
-      # restored, the ledger carried forward WHOLE (a restore that restored its
-      # own record would be a lineage erasing the decision that moved it), and
-      # a `restore` event appended.
+      # answers `move`, the move is a real commit -- the chosen state's project
+      # restored, the evaluator and the record carried forward WHOLE (a restore
+      # that restored its own record would be a lineage erasing the decision
+      # that moved it, and one that restored its judge would undo the
+      # operator's template without an amendment), and a `restore` event
+      # appended.
       #
       # The chosen state may be an ancestor of the tip or a cousin. Both cost
       # the same and both keep every invariant fsck enforces; see the long note
@@ -358,17 +429,54 @@ jobs:
         env:
           TARGET: ${{ steps.clade.outputs.tree }}
           NODE: ${{ steps.clade.outputs.node }}
+          CFGJSON: ${{ steps.cfg.outputs.json }}
         run: |
           set -euo pipefail
           name=$(sha256sum restore.cert | cut -c1-16)
           blob=$(git hash-object -w restore.cert)
-          # The commit's tree is the target, with the CURRENT ledger overlaid,
-          # plus the event entry. Pure plumbing, so there is no deleted-file or
+          # The commit's tree is the target's PROJECT, with the CURRENT
+          # evaluator and record overlaid, plus the event entry. A restore
+          # moves the thing being judged; it may not move the judge. The
+          # target was adopted under whatever template main carried then, so
+          # taking its `.github/` whole would quietly undo every change the
+          # operator has made since -- and the ladder and anchors under
+          # `loop/` with it. Pure plumbing, so there is no deleted-file or
           # stale-file class of mistake to make.
           export GIT_INDEX_FILE=/tmp/rb-index
           git read-tree "$TARGET"
-          git rm -r --cached loop/ledger --quiet 2>/dev/null || true
-          git read-tree --prefix=loop/ledger/ 'HEAD:loop/ledger'
+          python3 - <<'PYEOF'
+          import fnmatch, json, os, subprocess
+          from pathlib import Path
+          cfg = json.loads(Path(os.environ["CFGJSON"]).read_text(encoding="utf-8"))
+          masks = list(cfg["evaluator"]) + ["loop/**"]
+          def matches(path):
+              for m in masks:
+                  if fnmatch.fnmatch(path, m):
+                      return True
+                  if m.endswith("/**") and (path == m[:-3] or path.startswith(m[:-2])):
+                      return True
+              return False
+          def ls(tree):
+              raw = subprocess.run(["git", "ls-tree", "-r", "-z", "--full-tree", tree],
+                                   check=True, capture_output=True).stdout
+              rows = []
+              for rec in raw.split(b"\0"):
+                  if rec:
+                      meta, _, path = rec.partition(b"\t")
+                      rows.append((meta.decode(), path.decode("utf-8", "surrogateescape")))
+              return rows
+          drop = [p for _, p in ls(os.environ["TARGET"]) if matches(p)]
+          keep = [(m, p) for m, p in ls("HEAD") if matches(p)]
+          enc = lambda t: t.encode("utf-8", "surrogateescape") + b"\0"
+          if drop:
+              subprocess.run(["git", "update-index", "--force-remove", "-z", "--stdin"],
+                             input=b"".join(enc(p) for p in drop), check=True)
+          if keep:
+              subprocess.run(["git", "update-index", "-z", "--index-info"],
+                             input=b"".join(enc(m + "\t" + p) for m, p in keep), check=True)
+          print("  the project from the target; %d evaluator and record file(s) kept as they are"
+                % len(keep))
+          PYEOF
           git update-index --add --cacheinfo "100644,$blob,loop/ledger/entries/$name.cert"
           tree=$(git write-tree)
           unset GIT_INDEX_FILE
@@ -1020,6 +1128,20 @@ jobs:
           cert: judge/certificate.cert
           live: ${{ steps.live.outputs.tree }}
 
+      # **seq AND epoch are re-read under the lock, where they are
+      # authoritative.** The judge stamped both at the start of the trial, and
+      # the night may have filed entries since -- `follow` records a
+      # supersession when main overrode an adoption, `plan` records an
+      # amendment or a restore. Two entries is enough to carry the count
+      # across an epoch boundary, and an entry whose epoch disagrees with its
+      # position is one `ledger fsck` refuses outright. `ledger` is the one
+      # place that knows how epochs count; nothing here repeats it.
+      - id: at
+        uses: ./.github/actions/ledger
+        with:
+          command: count
+          epoch-len: ${{ steps.cfg.outputs.epoch-len }}
+
       - name: File it, in one commit with whatever it adopted
         shell: bash
         env:
@@ -1027,10 +1149,9 @@ jobs:
           BASE: ${{ steps.decide.outputs.base }}
           STALE: ${{ steps.decide.outputs.stale }}
           POINT: ${{ needs.stage.outputs.point }}
-          # Named here rather than relied on from $GITHUB_ENV: an unset name in
-          # a bash arithmetic expansion is zero, and `n / 0` ends the step with
-          # a division error in the middle of the one job that writes history.
-          EPOCH_LEN: ${{ steps.cfg.outputs.epoch-len }}
+          SEQ: ${{ steps.at.outputs.seq }}
+          EPOCH: ${{ steps.at.outputs.epoch }}
+          WAS: ${{ steps.at.outputs.utility }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -1043,22 +1164,18 @@ jobs:
             sed -i "s/^verdict .*/verdict stale/" "$cert"
             echo "::notice::the tip moved mid-judge; filed as stale"
           fi
-          # **seq AND epoch are re-derived under the lock, where they are
-          # authoritative.** The judge stamped both at the start of the trial,
-          # and the night may have filed entries since -- `follow` records a
-          # supersession when main overrode an adoption, and `plan` records a
-          # restore when the clade moved. Two entries is enough to carry the
-          # count across an epoch boundary, and an entry whose epoch disagrees
-          # with its position is one `ledger fsck` refuses outright: the branch
-          # goes red with a corrupt record and the night's work is unmergeable.
-          n=0
-          if [ -d loop/ledger/entries ]; then
-            n=$(find loop/ledger/entries -name '*.cert' | wc -l)
+          test -n "$SEQ" && test -n "$EPOCH" \
+            || { echo "::error::the ledger did not say where the next entry goes"; exit 1; }
+          # A certificate judged by another evaluator than the one the record
+          # is at would be filed into an epoch it does not belong to. `plan`
+          # amends before anything is drafted, so this is a guard, not a path.
+          is=$(sed -n 's/^utility //p' "$cert")
+          if [ -n "$WAS" ] && [ "$is" != "$WAS" ]; then
+            echo "::error::the certificate was judged by ${is:0:16} and the record is at ${WAS:0:16}, with no amendment between them"
+            exit 1
           fi
-          sed -i "s/^seq .*/seq $(( n + 1 ))/" "$cert"
-          test "${EPOCH_LEN:-0}" -gt 0 \
-            || { echo "::error::no epoch length; the config step did not run"; exit 1; }
-          sed -i "s|^epoch .*|epoch $(( n / EPOCH_LEN ))|" "$cert"
+          sed -i "s/^seq .*/seq $SEQ/" "$cert"
+          sed -i "s|^epoch .*|epoch $EPOCH|" "$cert"
           name=$(sha256sum "$cert" | cut -c1-16)
           blob=$(git hash-object -w "$cert")
           # Pure plumbing: the commit's tree is built in an index, so the
@@ -1073,7 +1190,7 @@ jobs:
           tree=$(git write-tree)
           unset GIT_INDEX_FILE
           new=$(git commit-tree "$tree" -p HEAD \
-                  -m "loop: $VERDICT ${POINT:0:16} (seq $(( n + 1 )))")
+                  -m "loop: $VERDICT ${POINT:0:16} (seq $SEQ)")
           git checkout -f --detach "$new"
           git push origin "$new:refs/heads/loop/main"
           git push origin --delete "loop/cand/${POINT:0:16}" || true

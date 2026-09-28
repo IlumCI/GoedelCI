@@ -100,8 +100,11 @@ runs:
         VERSION = "3"
         # `restore` rather than `rollback`: the archive may move to any adopted
         # state, including a cousin lineage, and "rollback" names only half of
-        # what that is.
-        VERDICTS = ("adopt", "refuse", "stale", "restore", "superseded")
+        # what that is. `amended` is the operator changing the evaluator on the
+        # default branch: the one change to the criterion that does not come
+        # through `boundary`, and so the one the ledger has to be told about.
+        VERDICTS = ("adopt", "refuse", "stale", "restore", "superseded", "amended")
+        EVENTS = ("restore", "superseded", "amended")
         MOVED = ("better", "worse", "same", "unstable", "absent", "-")
         OPERATORS = ("clonal", "reaction-norm", "cross-lineage", "-")
         LANES = ("grid", "template", "model", "event")
@@ -254,7 +257,7 @@ runs:
                 raise CertError("a stale verdict is about a candidate, and names none")
             if f["witness"] == "fail-then-pass" and verdict not in ("adopt", "refuse", "stale"):
                 raise CertError("a witness result on a %s entry describes a trial that was not one" % verdict)
-            if verdict in ("restore", "superseded") and f["lane"] != "event":
+            if verdict in EVENTS and f["lane"] != "event":
                 raise CertError("a %s is something that happened to the ledger, so its lane is event" % verdict)
             for key in ("suites", "claims", "checks"):
                 if f[key] == "-":
@@ -359,6 +362,8 @@ runs:
             raises("an adoption that reduces the claim count is refused", lambda: mut(claims="11/10"))
             raises("a restore is an event and may not claim a lane",
                    lambda: mut(verdict="restore", lane="model", moved="-"))
+            raises("an amendment is an event and may not claim a lane",
+                   lambda: mut(verdict="amended", lane="model", moved="-"))
 
             r = parse(mut(verdict="refuse", moved="worse", witness="-", claims="11/10",
                           interval="-", effect="-", q="-"))
