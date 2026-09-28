@@ -257,11 +257,9 @@ runs:
                 if grammar:
                     body["grammar"] = grammar
                 if a["provider"] == "local":
-                    # **Greedy decoding on a long generation can fall into a
-                    # repetition loop**, which the card for these weights says
-                    # outright and shard 0 decodes at 0 by design. The penalty
-                    # is what stops a draw that is syntactically perfect and
-                    # eight hundred lines of the same block.
+                    # Sent as configured, so the server's own default never
+                    # decides it. It is 1.0 (off) unless an operator says
+                    # otherwise; see `config` for the draw it corrupted.
                     body["repeat_penalty"] = a["repeat_penalty"]
                     # **Thinking off HERE as well as at the server.** These
                     # are the same switch arriving by a second road, so a
@@ -1071,7 +1069,6 @@ runs:
             # balk. Three balks retire a milestone the model never saw.
             def local_body(key):
                 b = {"model": "local", "messages": []}
-                b["repeat_penalty"] = 1.15
                 b["reasoning_effort"] = "none"
                 b["chat_template_kwargs"] = {"enable_thinking": False}
                 h = {"content-type": "application/json"}
@@ -1085,9 +1082,6 @@ runs:
             claim("and enable_thinking goes as a JSON boolean, which the runtime "
                   "requires: it refuses the string false-as-text",
                   lbody["chat_template_kwargs"]["enable_thinking"] is False)
-            claim("greedy decoding carries a repeat penalty, because the card "
-                  "warns it can fall into a repetition loop on long generations",
-                  lbody["repeat_penalty"] > 1.0)
             claim("no key means no Authorization header at all",
                   "authorization" not in lheaders,
                   "llama-server authenticates nobody, and a Bearer header sent "
@@ -1151,7 +1145,7 @@ runs:
             saved = os.environ.get("U")
             os.environ["U"] = "http://127.0.0.1:%d/v1" % srv.server_address[1]
             LOCAL = dict(CFG, author=dict(CFG["author"], provider="local", attempts=3,
-                                          repeat_penalty=1.1, timeout=10))
+                                          repeat_penalty=1.0, timeout=10))
             RUNG = {"kind": "feature", "target": "src/new.py", "title": "t", "witness": "w"}
             RUNAWAY = ("<<<FILE src/new.py>>>\nx = 1\n<<<END>>>\n"
                        "<<<FILE src/new.py>>>\nx = 2\n<<<END>>>\n<<<FILE src/ne", "length")
@@ -1173,6 +1167,9 @@ runs:
                     claim("and the feedback says what it opened, so the model can see "
                           "it wrote the same file twice",
                           "opened 2 file(s): src/new.py, src/new.py" in retry, retry[-400:])
+                    claim("the repeat penalty is sent as configured, so the server's "
+                          "default does not decide it", heard[0].get("repeat_penalty") == 1.0,
+                          heard[0].get("repeat_penalty"))
                     claim("the grammar it was held to has a ceiling on files",
                           heard[0].get("grammar", "").startswith(
                               "root ::= file file? file?\n"), heard[0].get("grammar", "")[:60])
