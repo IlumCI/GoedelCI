@@ -516,6 +516,22 @@ runs:
             else:
                 parts.append("THE FILE %s DOES NOT EXIST YET; you are creating it."
                              % rung["target"])
+            # **How this project writes a test, from a test it already has.**
+            # Measured: told three times, verbatim, "No module named 'pytest'",
+            # a 4B imported pytest a fourth time. It had never been shown this
+            # project's runner, and its prior is the most common one. A test
+            # that already exercises the target is the one example that is
+            # certainly right about the imports and the conventions.
+            if kind["j1"] in ("witness", "claims"):
+                example = sibling_test(root, cfg, rung["target"],
+                                       [rel for rel, _ in shown])
+                if example:
+                    rel, text = example
+                    parts.append(
+                        "HOW THIS PROJECT'S TESTS ARE WRITTEN -- %s, which already tests "
+                        "this code. Write yours the same way: the same imports, the same "
+                        "style, nothing it does not use.\n<<<FILE %s>>>\n%s<<<END>>>"
+                        % (rel, rel, text))
 
             if evidence["text"]:
                 parts.append("WHAT THE RECORD SAYS (%s)\n%s"
@@ -525,6 +541,51 @@ runs:
                     "YOUR LAST ANSWER DID NOT SURVIVE THE PROJECT'S OWN CHECK. Fix exactly "
                     "this and answer again with the whole file:\n" + last_error[:4000])
             return "\n\n".join(parts)
+
+        def sibling_test(root, cfg, target, exclude=()):
+            """(path, text) of an existing test that names the target's module,
+            or None. The smallest such file, because it is the example and not
+            the reading."""
+            stem = Path(target).stem
+            if not stem:
+                return None
+            found = []
+            for p in sorted(Path(root).rglob("*")):
+                if not p.is_file() or p.suffix != Path(target).suffix:
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if rel in exclude or rel == target or not allowed(rel, cfg):
+                    continue
+                if any(c.startswith(".") or c == "__pycache__" for c in rel.split("/")):
+                    continue
+                if "test" not in p.name.lower():
+                    continue
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if re.search(r"\b%s\b" % re.escape(stem), text) and len(text) <= 6000:
+                    found.append((len(text), rel, text))
+            if not found:
+                return None
+            _, rel, text = min(found)
+            return rel, text
+
+        def failing_only(output, cfg):
+            """The test output with the lines that PASSED taken out.
+
+            The project says what a pass looks like (`claims_re`); everything
+            else -- the failures, the tracebacks, the summary -- is what the
+            model has to read, and six `ok` lines in front of it were most of
+            what it was shown."""
+            pat = cfg["harness"].get("claims_re", "")
+            if not pat:
+                return output
+            try:
+                rx = re.compile(pat)
+            except re.error:
+                return output
+            return "\n".join(l for l in output.splitlines() if not rx.search(l))
 
         # -- the Mendel-Goedel evidence choice ---------------------------
 
@@ -686,7 +747,8 @@ runs:
                                    "fix and pass after it.")
                 return True, ""
             if not ok:
-                return False, "the project's tests do not pass with your answer:\n" + err[-3000:]
+                return False, ("the project's tests do not pass with your answer:\n"
+                               + failing_only(err, cfg)[-3000:])
             return True, ""
 
         def draft(root, rung, cfg, seed, lineage):
@@ -934,6 +996,26 @@ runs:
                 claim("a claims kind is told its code must be exercised",
                       "exercised by a test" in c)
                 rr = dict(rung, kind="repair", target="src/a.py")
+                (Path(td) / "src").mkdir()
+                (Path(td) / "src/a.py").write_text("def f():\n    return 1\n")
+                (Path(td) / "src/test_a.py").write_text("from src.a import f\n\ndef test_f():\n"
+                                                        "    assert f() == 1\n")
+                (Path(td) / "src/test_other.py").write_text("def test_g():\n    pass\n")
+                ex = card(rr, CFG, td, {"operator": "clonal", "text": ""})
+                claim("a test-judged kind is shown the test that already exercises its "
+                      "target, as the example of how this project writes one",
+                      "HOW THIS PROJECT'S TESTS ARE WRITTEN -- src/test_a.py" in ex
+                      and "from src.a import f" in ex, ex[-400:])
+                claim("and not a test that does not name it",
+                      "test_other" not in ex)
+                claim("with no such test there is no example, rather than a wrong one",
+                      sibling_test(td, CFG, "src/absent.py") is None)
+                out_ = ("ok t.a\nok t.b\nnot ok t.c -- boom\nTraceback\n"
+                        "ModuleNotFoundError: No module named 'pytest'\n2 tests passed, 1 failed")
+                fo = failing_only(out_, dict(CFG, harness={"claims_re": r"^\s*ok\b"}))
+                claim("the feedback drops the lines that passed, by the project's own "
+                      "pattern for a pass", "ok t.a" not in fo and "not ok t.c" in fo
+                      and "pytest" in fo, fo)
                 claim("a witness kind is told it needs a failing test first",
                       "FAIL-THEN-PASS" in card(rr, CFG, td, {"operator": "clonal", "text": ""}))
                 claim("a retry carries the check's refusal",
