@@ -1,5 +1,5 @@
 version 3
-seq 2
+seq 3
 utc 2026-09-25T08:02:26Z
 point 1d41d264458cea5d83a78387ca7d0af841df9463a536c85c2fc9a5731cfa3384
 kind repair
@@ -7,7 +7,7 @@ lane model
 operator clonal
 author qwen38-4b-q4
 lineage root
-epoch 0
+epoch 1
 utility c3fcd92b6276af3071c340f2e0704bf033ece5a00412d4e6309bc19b298a5fa2
 rung 1
 axis src/window.py
