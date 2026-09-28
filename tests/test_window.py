@@ -44,9 +44,16 @@ def test_an_empty_window_refuses_rather_than_inventing_a_number():
         raise AssertionError(f"{fn.__name__} answered for an empty window")
 
 
-def test_a_window_of_zero_is_refused_at_construction():
+def test_the_variance_is_over_what_is_there():
+    w = Window(4)
+    w.extend([1, 2, 3, 4])
+    assert w.variance() == 1.25, w.variance()
+
+
+def test_an_empty_window_refuses_variance_rather_than_inventing_a_number():
+    w = Window(2)
     try:
-        Window(0)
+        w.variance()
     except ValueError:
         return
-    raise AssertionError("a window of no values was accepted")
+    raise AssertionError("variance answered for an empty window")

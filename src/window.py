@@ -44,3 +44,10 @@ class Window:
         if not self._values:
             raise ValueError("an empty window has no peak")
         return max(self._values)
+
+    def variance(self) -> float:
+        if not self._values:
+            raise ValueError("an empty window has no variance")
+        n = len(self._values)
+        mean = self.mean()
+        return sum(v ** 2 for v in self._values) / n - mean ** 2
