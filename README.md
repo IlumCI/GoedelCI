@@ -369,8 +369,16 @@ judged by nothing.
 Test suites, passing assertions, and harness commands that succeeded. None of
 the three may be lower in the new tree than the old one, for any kind of change,
 and it is checked in the certificate format itself so that no rule can forget
-it. It is the only thing standing between a machine that improves its test
-numbers and a machine that deletes its tests.
+it.
+
+**And no claim that passed may disappear, by name.** A count cannot tell an
+added test from a replaced one. The first adoption this machine made deleted a
+passing test and added two — claims 6 → 7, every count up — so the judge now
+compares *which* claims passed on each arm, by the lines your runner prints for
+a pass (`claims_re`), and refuses a candidate that lost any of them whatever
+the totals say. The drafter checks the same thing before it hands a candidate
+over, so the model is told which test it dropped while it can still put it
+back.
 
 ### "Better" is a statistical claim, not a comparison
 

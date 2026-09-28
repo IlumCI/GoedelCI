@@ -382,11 +382,13 @@ jobs:
           A_SUITES: ${{ steps.base.outputs.suites }}
           A_CLAIMS: ${{ steps.base.outputs.claims }}
           A_CHECKS: ${{ steps.base.outputs.checks }}
+          A_HELD: ${{ steps.base.outputs.held }}
           B_BUILT: ${{ steps.cand.outputs.built }}
           B_TESTED: ${{ steps.cand.outputs.tested }}
           B_SUITES: ${{ steps.cand.outputs.suites }}
           B_CLAIMS: ${{ steps.cand.outputs.claims }}
           B_CHECKS: ${{ steps.cand.outputs.checks }}
+          B_HELD: ${{ steps.cand.outputs.held }}
           B_WHY: ${{ steps.cand.outputs.why }}
           WORSE: ${{ steps.rails.outputs.worse }}
           UNSTABLE: ${{ steps.rails.outputs.unstable }}
@@ -466,6 +468,24 @@ jobs:
           # rather than one more thing a kind could forget, and it is the only
           # thing standing between this machine and deleting its own tests to
           # make the numbers go up.
+          # **Which claims, and then how many.** The first adoption this
+          # machine ever made deleted a passing test and added two: claims
+          # 6 -> 7, every count up, and a promise the project had made was
+          # gone. A count cannot tell an added test from a replaced one; the
+          # names can. A claim that held on the baseline and is absent from
+          # the candidate is refused whatever the totals say.
+          def held(k):
+              p = env(k)
+              if not p or not Path(p).is_file():
+                  return None
+              return {l for l in Path(p).read_text(encoding="utf-8").splitlines() if l.strip()}
+          ha, hb = held("A_HELD"), held("B_HELD")
+          if ha is not None and hb is not None:
+              lost = sorted(ha - hb)
+              if lost:
+                  refuse("the candidate lost %d claim(s) that held on the baseline: %s"
+                         % (len(lost), "; ".join(lost[:3])[:240]))
+
           fell = [k for k in ("suites", "claims", "checks") if b[k] < a[k]]
           if fell:
               refuse("the candidate answers less than the baseline (%s)"

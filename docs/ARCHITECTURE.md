@@ -266,6 +266,8 @@ same rule: a baseline that will not build is the branch, not the candidate.
 Every kind carries the same **J2**, checked before its own criterion is even
 looked at:
 
+- no claim that passed on the baseline may be missing from the candidate, by
+  name — a count cannot tell an added test from a replaced one;
 - suites, claims and checks may not fall;
 - the candidate's tests must pass;
 - no rail may read `worse` unless the kind declared it in `allow_rails`;
