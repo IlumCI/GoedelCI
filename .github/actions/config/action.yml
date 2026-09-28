@@ -354,12 +354,27 @@ runs:
                 "shards": int(a.get("shards", 6)),
                 # Named here so `draft` reads them off the config like
                 # everything else, rather than carrying two magic numbers.
-                "repeat_penalty": float(a.get("repeat_penalty", 1.15)),
+                # **1.0, which is off, and that is measured.** It was 1.15,
+                # against the weights card's warning about repetition loops on
+                # greedy decoding. Captured from a real draw: every repeat of
+                # `(x - mean)**2` in a variance test came back as
+                # `**(3-mean)2`, because the penalty pushes the model off the
+                # tokens it just used and correct code repeats itself. That is
+                # a syntax error on every attempt. Loops are caught where they
+                # can be caught without touching correct code: the draw
+                # grammar's file ceiling, the distinct-line floor, and a
+                # truncated reply fed back as a refusal.
+                "repeat_penalty": float(a.get("repeat_penalty", 1.0)),
                 "timeout": int(a.get("timeout", 600)),
                 "context": list(a.get("context", [])),
             }
             if author["shards"] < 1:
                 raise ConfigError("[author] shards must be at least 1")
+            if not 1.0 <= author["repeat_penalty"] <= 2.0:
+                raise ConfigError(
+                    "[author] repeat_penalty is %s; 1.0 is off, below it REWARDS "
+                    "repetition, and above 2.0 no token can be said twice"
+                    % author["repeat_penalty"])
             if author["provider"] not in ("local", "anthropic", "openai"):
                 raise ConfigError(
                     "[author] provider is 'local' (the model runs on the runner and "
@@ -743,6 +758,11 @@ runs:
                    "not derivable from its URL",
                    local(runtime_dir=" "))
             raises("a context of zero is refused", local(context=0))
+            claim("the repeat penalty is off unless somebody turns it on, because "
+                  "it corrupts code that correctly repeats itself",
+                  cfg["author"]["repeat_penalty"] == 1.0)
+            raises("a repeat penalty below 1.0 is refused: it rewards repetition",
+                   lambda: load(dict(base, author={"repeat_penalty": 0.9}), "."))
             # --- the pool: one author per shard, every one named -----------
             claim("no pool declared means the single author IS the pool",
                   [e["name"] for e in cfg["author"]["local"]["pool"]]

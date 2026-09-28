@@ -159,6 +159,17 @@ runs:
         # callers that only care about "nothing came back" keep working. The
         # two places that report it look at the type and say something else.
         class NoCredential(NoAnswer): pass
+        # **The model answered, and the answer cannot be used**: it ran to
+        # max_tokens, or it is a decoding loop. A subclass of NoAnswer so that
+        # a caller that only asks (`ladder`, `brief`) still reads it as nothing
+        # usable came back. `draft` catches it per attempt instead, because
+        # there it IS evidence about the milestone -- a model that runs past
+        # the files every time is a model that cannot write this one, and
+        # waiting until tomorrow does not change that.
+        class Unusable(NoAnswer):
+            def __init__(self, message, text=""):
+                super().__init__(message)
+                self.text = text
 
         def out(k, v):
             """A step output, and never more than one.
@@ -246,11 +257,9 @@ runs:
                 if grammar:
                     body["grammar"] = grammar
                 if a["provider"] == "local":
-                    # **Greedy decoding on a long generation can fall into a
-                    # repetition loop**, which the card for these weights says
-                    # outright and shard 0 decodes at 0 by design. The penalty
-                    # is what stops a draw that is syntactically perfect and
-                    # eight hundred lines of the same block.
+                    # Sent as configured, so the server's own default never
+                    # decides it. It is 1.0 (off) unless an operator says
+                    # otherwise; see `config` for the draw it corrupted.
                     body["repeat_penalty"] = a["repeat_penalty"]
                     # **Thinking off HERE as well as at the server.** These
                     # are the same switch arriving by a second road, so a
@@ -292,13 +301,13 @@ runs:
             # refuses for "the fence was never closed" -- which points at the
             # model's formatting when the actual fault is the budget.
             fin = ((data.get("choices") or [{}])[0] or {}).get("finish_reason")
+            text = pick(data)
             if fin == "length":
-                raise NoAnswer(
+                raise Unusable(
                     "the answer hit max_tokens (%d) and stopped mid-file. Raise "
                     "[author] max_tokens, or aim the milestone at a smaller file: "
                     "the reply is truncated, not malformed."
-                    % a["max_tokens"])
-            text = pick(data)
+                    % a["max_tokens"], text)
             # **A reply that is mostly one line repeated is a loop, not a
             # draw.** The card for these weights warns that greedy decoding
             # on a long generation can fall into one, and shard 0 decodes at
@@ -309,13 +318,13 @@ runs:
             if len(body) >= 12:
                 distinct = len(set(body)) / float(len(body))
                 if distinct < MIN_DISTINCT:
-                    raise NoAnswer(
+                    raise Unusable(
                         "the answer repeats itself: %d of %d non-empty lines are "
                         "distinct (%.0f%%, the floor is %.0f%%). That is a decoding "
                         "loop rather than a draft, and more tokens would only make "
                         "it longer."
                         % (len(set(body)), len(body), distinct * 100,
-                           MIN_DISTINCT * 100))
+                           MIN_DISTINCT * 100), text)
             # **An answer given only inside the think block is not an answer,
             # and it is not the milestone's fault either.** It means the two
             # switches above did not reach the template, which is a fact about
@@ -370,8 +379,21 @@ runs:
 
         # <<< grammar
 
-        def draw_grammar():
-            """The draw contract as a grammar: at least one closed fence.
+        # A milestone is its target, and for a witness kind the test that
+        # shows it; a third file is slack for a helper. More than that is not
+        # a milestone.
+        MAX_FILES = 3
+
+        def draw_grammar(least=1, most=MAX_FILES):
+            """The draw contract as a grammar: between `least` and `most` closed
+            fences, and then the end of the reply.
+
+            **Bounded, and that is measured.** It was `file+`. Prose is outside
+            the grammar, so once the last file closed the model's only choices
+            were to stop or to open another file -- and a 4B that wanted to
+            explain itself opened another file, and another, until every shard
+            of a night ran into max_tokens on a 46-line target. With a ceiling
+            the grammar reaches a state where the end is the only thing left.
 
             Measured: two shards of a real night came back "the reply carries
             no fenced file" -- a FORMAT failure, not a wrong patch. The author
@@ -382,8 +404,10 @@ runs:
             BODY is not, because the body is the answer and a grammar over it
             would be this file having opinions about the project's source.
             """
+            least = max(1, least)
+            most = max(least, most)
             return (
-                'root ::= file+\n'
+                'root ::= ' + " ".join(["file"] * least + ["file?"] * (most - least)) + '\n'
                 'file ::= "<<<FILE " path ">>>" nl body "<<<END>>>" nl\n'
                 'path ::= [^>\\n]+\n'
                 'body ::= line*\n'
@@ -492,6 +516,22 @@ runs:
             else:
                 parts.append("THE FILE %s DOES NOT EXIST YET; you are creating it."
                              % rung["target"])
+            # **How this project writes a test, from a test it already has.**
+            # Measured: told three times, verbatim, "No module named 'pytest'",
+            # a 4B imported pytest a fourth time. It had never been shown this
+            # project's runner, and its prior is the most common one. A test
+            # that already exercises the target is the one example that is
+            # certainly right about the imports and the conventions.
+            if kind["j1"] in ("witness", "claims"):
+                example = sibling_test(root, cfg, rung["target"],
+                                       [rel for rel, _ in shown])
+                if example:
+                    rel, text = example
+                    parts.append(
+                        "HOW THIS PROJECT'S TESTS ARE WRITTEN -- %s, which already tests "
+                        "this code. Write yours the same way: the same imports, the same "
+                        "style, nothing it does not use.\n<<<FILE %s>>>\n%s<<<END>>>"
+                        % (rel, rel, text))
 
             if evidence["text"]:
                 parts.append("WHAT THE RECORD SAYS (%s)\n%s"
@@ -501,6 +541,51 @@ runs:
                     "YOUR LAST ANSWER DID NOT SURVIVE THE PROJECT'S OWN CHECK. Fix exactly "
                     "this and answer again with the whole file:\n" + last_error[:4000])
             return "\n\n".join(parts)
+
+        def sibling_test(root, cfg, target, exclude=()):
+            """(path, text) of an existing test that names the target's module,
+            or None. The smallest such file, because it is the example and not
+            the reading."""
+            stem = Path(target).stem
+            if not stem:
+                return None
+            found = []
+            for p in sorted(Path(root).rglob("*")):
+                if not p.is_file() or p.suffix != Path(target).suffix:
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if rel in exclude or rel == target or not allowed(rel, cfg):
+                    continue
+                if any(c.startswith(".") or c == "__pycache__" for c in rel.split("/")):
+                    continue
+                if "test" not in p.name.lower():
+                    continue
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if re.search(r"\b%s\b" % re.escape(stem), text) and len(text) <= 6000:
+                    found.append((len(text), rel, text))
+            if not found:
+                return None
+            _, rel, text = min(found)
+            return rel, text
+
+        def failing_only(output, cfg):
+            """The test output with the lines that PASSED taken out.
+
+            The project says what a pass looks like (`claims_re`); everything
+            else -- the failures, the tracebacks, the summary -- is what the
+            model has to read, and six `ok` lines in front of it were most of
+            what it was shown."""
+            pat = cfg["harness"].get("claims_re", "")
+            if not pat:
+                return output
+            try:
+                rx = re.compile(pat)
+            except re.error:
+                return output
+            return "\n".join(l for l in output.splitlines() if not rx.search(l))
 
         # -- the Mendel-Goedel evidence choice ---------------------------
 
@@ -632,6 +717,40 @@ runs:
                 return True, ""
             return False, ((r.stdout or "") + (r.stderr or "")).strip()
 
+        def rehearse(root, cfg, witness_only=False):
+            """The judge's own build and test, over whatever is staged now.
+
+            (passed, what to tell the model). The judge runs exactly these, so
+            a candidate that fails them here is one the night would have spent
+            a judge on and refused; here the refusal costs one attempt and the
+            model gets to read it. `check` alone is whatever the project calls
+            fast -- `compileall` here -- and it passed a test file that never
+            imported the class it tested.
+            """
+            h = cfg["harness"]
+            if h.get("clean"):
+                run_check(root, h["clean"], h["timeout"])
+            if h.get("build"):
+                ok, err = run_check(root, h["build"], h["timeout"])
+                if not ok:
+                    return False, ("the build failed with only your test applied, so it "
+                                   "tested nothing:\n" if witness_only else
+                                   "the build failed:\n") + err[-3000:]
+            if not h.get("test"):
+                return (not witness_only), ("" if not witness_only else
+                                            "the project has no test command to fail")
+            ok, err = run_check(root, h["test"], h["timeout"])
+            if witness_only:
+                if ok:
+                    return False, ("Your test passes on the file as it stands, without your "
+                                   "fix, so it witnesses nothing. It has to FAIL before the "
+                                   "fix and pass after it.")
+                return True, ""
+            if not ok:
+                return False, ("the project's tests do not pass with your answer:\n"
+                               + failing_only(err, cfg)[-3000:])
+            return True, ""
+
         def draft(root, rung, cfg, seed, lineage):
             """Up to `attempts` draws, each held to the project's fast check."""
             es = entries(root)
@@ -653,8 +772,21 @@ runs:
 
             for attempt in range(1, cfg["author"]["attempts"] + 1):
                 attempts = attempt
-                reply = ask(cfg, SYSTEM, card(rung, cfg, root, ev, last_error), seed,
-                            grammar=draw_grammar())
+                try:
+                    reply = ask(cfg, SYSTEM, card(rung, cfg, root, ev, last_error), seed,
+                                grammar=draw_grammar(2 if is_witness else 1))
+                except Unusable as exc:
+                    opened = [m.group(1).strip() for m in
+                              (FENCE_OPEN.match(l) for l in exc.text.split("\n")) if m]
+                    print("  attempt %d: %s%s" % (attempt, exc, (" Opened: %s."
+                          % ", ".join(opened)) if opened else ""))
+                    last_error = (
+                        "Your last answer could not be used: %s\n"
+                        "It opened %d file(s)%s. Write each file once, in full, close "
+                        "it with %s, and stop after the last one."
+                        % (str(exc).split(". Raise")[0], len(opened),
+                           (": " + ", ".join(opened[:8])) if opened else "", FENCE_CLOSE))
+                    continue
                 try:
                     files = files_in(reply)
                 except DraftError as exc:
@@ -695,6 +827,10 @@ runs:
                     if not ok:
                         last_error = err[-4000:]
                         continue
+                    ok, err = rehearse(root, cfg)
+                    if not ok:
+                        last_error = err
+                        continue
                     witness_paths = ([p for p, _ in files if p != rung["target"]]
                                      if is_witness else [])
                     fix_paths = [p for p in paths if p not in witness_paths]
@@ -703,6 +839,14 @@ runs:
                     git(root, "add", "-N", "--", *paths)
                     patch = git(root, "diff", "--", *fix_paths)
                     wpatch = git(root, "diff", "--", *witness_paths) if witness_paths else ""
+                    if is_witness and fix_paths:
+                        # The judge's witness arm: the parent, plus the test
+                        # alone. It must build and it must fail.
+                        unstage(root, fix_paths, existed)
+                        ok, err = rehearse(root, cfg, witness_only=True)
+                        if not ok:
+                            last_error = err
+                            continue
                 finally:
                     unstage(root, paths, existed)
 
@@ -852,6 +996,26 @@ runs:
                 claim("a claims kind is told its code must be exercised",
                       "exercised by a test" in c)
                 rr = dict(rung, kind="repair", target="src/a.py")
+                (Path(td) / "src").mkdir()
+                (Path(td) / "src/a.py").write_text("def f():\n    return 1\n")
+                (Path(td) / "src/test_a.py").write_text("from src.a import f\n\ndef test_f():\n"
+                                                        "    assert f() == 1\n")
+                (Path(td) / "src/test_other.py").write_text("def test_g():\n    pass\n")
+                ex = card(rr, CFG, td, {"operator": "clonal", "text": ""})
+                claim("a test-judged kind is shown the test that already exercises its "
+                      "target, as the example of how this project writes one",
+                      "HOW THIS PROJECT'S TESTS ARE WRITTEN -- src/test_a.py" in ex
+                      and "from src.a import f" in ex, ex[-400:])
+                claim("and not a test that does not name it",
+                      "test_other" not in ex)
+                claim("with no such test there is no example, rather than a wrong one",
+                      sibling_test(td, CFG, "src/absent.py") is None)
+                out_ = ("ok t.a\nok t.b\nnot ok t.c -- boom\nTraceback\n"
+                        "ModuleNotFoundError: No module named 'pytest'\n2 tests passed, 1 failed")
+                fo = failing_only(out_, dict(CFG, harness={"claims_re": r"^\s*ok\b"}))
+                claim("the feedback drops the lines that passed, by the project's own "
+                      "pattern for a pass", "ok t.a" not in fo and "not ok t.c" in fo
+                      and "pytest" in fo, fo)
                 claim("a witness kind is told it needs a failing test first",
                       "FAIL-THEN-PASS" in card(rr, CFG, td, {"operator": "clonal", "text": ""}))
                 claim("a retry carries the check's refusal",
@@ -986,8 +1150,13 @@ runs:
             # it in markdown -- a FORMAT failure, not a wrong patch, and the
             # same thing the ladder did before it got one of these.
             G = draw_grammar()
-            claim("the grammar forces at least one fenced file",
-                  "root ::= file+" in G)
+            claim("the grammar forces at least one fenced file, and at most %d"
+                  % MAX_FILES, "root ::= file file? file?\n" in G, G)
+            claim("a witness kind is held to at least its test and its fix",
+                  "root ::= file file file?\n" in draw_grammar(2))
+            claim("so the end of the reply is reachable, and past the ceiling it is "
+                  "the only thing left",
+                  "file+" not in G and "file*" not in G)
             claim("and a file that is opened has to be closed",
                   'file ::= "<<<FILE " path ">>>" nl body "<<<END>>>" nl' in G, G)
             claim("the path may not run past the closing bracket or the line",
@@ -1027,7 +1196,6 @@ runs:
             # balk. Three balks retire a milestone the model never saw.
             def local_body(key):
                 b = {"model": "local", "messages": []}
-                b["repeat_penalty"] = 1.15
                 b["reasoning_effort"] = "none"
                 b["chat_template_kwargs"] = {"enable_thinking": False}
                 h = {"content-type": "application/json"}
@@ -1041,9 +1209,6 @@ runs:
             claim("and enable_thinking goes as a JSON boolean, which the runtime "
                   "requires: it refuses the string false-as-text",
                   lbody["chat_template_kwargs"]["enable_thinking"] is False)
-            claim("greedy decoding carries a repeat penalty, because the card "
-                  "warns it can fall into a repetition loop on long generations",
-                  lbody["repeat_penalty"] > 1.0)
             claim("no key means no Authorization header at all",
                   "authorization" not in lheaders,
                   "llama-server authenticates nobody, and a Bearer header sent "
@@ -1078,6 +1243,124 @@ runs:
                   NO_CREDENTIAL != NO_ANSWER)
             claim("an endpoint that timed out is still only a no-answer",
                   not isinstance(NoAnswer("the endpoint did not answer"), NoCredential))
+
+            # -- an answer that runs away, over a real socket -------------
+            #
+            # Measured: every shard of a night ran into max_tokens on a
+            # 46-line target, and each ended its whole draw on the first
+            # attempt as "no answer" -- not fed back, not a balk, a green night
+            # that tried nothing. This is `draft` end to end against a
+            # scripted endpoint: `ask`, the card, the attempts, the check.
+            import http.server, threading
+            script, heard = [], []
+            class Scripted(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    n = int(self.headers.get("content-length", "0"))
+                    heard.append(json.loads(self.rfile.read(n).decode("utf-8")))
+                    text, fin = script.pop(0)
+                    body = json.dumps({"choices": [{"message": {"content": text},
+                                                    "finish_reason": fin}]}).encode()
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def log_message(self, *a):
+                    pass
+            srv = http.server.HTTPServer(("127.0.0.1", 0), Scripted)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            saved = os.environ.get("U")
+            os.environ["U"] = "http://127.0.0.1:%d/v1" % srv.server_address[1]
+            LOCAL = dict(CFG, author=dict(CFG["author"], provider="local", attempts=3,
+                                          repeat_penalty=1.0, timeout=10))
+            RUNG = {"kind": "feature", "target": "src/new.py", "title": "t", "witness": "w"}
+            RUNAWAY = ("<<<FILE src/new.py>>>\nx = 1\n<<<END>>>\n"
+                       "<<<FILE src/new.py>>>\nx = 2\n<<<END>>>\n<<<FILE src/ne", "length")
+            GOOD = ("<<<FILE src/new.py>>>\nx = 1\n<<<END>>>\n", "stop")
+            try:
+                with tempfile.TemporaryDirectory() as td:
+                    subprocess.run(["git", "init", "-q", td], check=True)
+                    (Path(td) / "src").mkdir()
+                    (Path(td) / "src/a.py").write_text("a = 0\n")
+                    subprocess.run(["git", "-C", td, "add", "-A"], check=True)
+                    subprocess.run(["git", "-C", td, "-c", "user.name=t", "-c",
+                                    "user.email=t@t", "commit", "-qm", "0"], check=True)
+
+                    script[:] = [RUNAWAY, GOOD]; heard.clear()
+                    got = draft(td, dict(RUNG), LOCAL, 1, "root")
+                    claim("a reply that ran into max_tokens is fed back and the next "
+                          "attempt drawn, rather than ending the draw", got[3] == 2, got[3])
+                    retry = heard[1]["messages"][1]["content"] if len(heard) > 1 else ""
+                    claim("and the feedback says what it opened, so the model can see "
+                          "it wrote the same file twice",
+                          "opened 2 file(s): src/new.py, src/new.py" in retry, retry[-400:])
+                    claim("the repeat penalty is sent as configured, so the server's "
+                          "default does not decide it", heard[0].get("repeat_penalty") == 1.0,
+                          heard[0].get("repeat_penalty"))
+                    claim("the grammar it was held to has a ceiling on files",
+                          heard[0].get("grammar", "").startswith(
+                              "root ::= file file? file?\n"), heard[0].get("grammar", "")[:60])
+
+                    script[:] = [RUNAWAY] * 3; heard.clear()
+                    try:
+                        draft(td, dict(RUNG), LOCAL, 1, "root")
+                        said = None
+                    except DraftError as exc:
+                        said = exc
+                    claim("a model that runs away on every attempt has not answered this "
+                          "milestone, and that is a balk: a DraftError, not a no-answer",
+                          isinstance(said, DraftError) and not isinstance(said, NoAnswer),
+                          repr(said))
+                    claim("after every attempt it was given", len(heard) == 3, len(heard))
+                    claim("and the workspace is as it was",
+                          not (Path(td) / "src/new.py").exists()
+                          and subprocess.run(["git", "-C", td, "status", "--porcelain"],
+                                             capture_output=True, text=True).stdout == "")
+
+                    # -- the judge's build and test, rehearsed ----------------
+                    #
+                    # Captured from a real draw: `check` was compileall, and it
+                    # passed a witness that never imported the class it tested
+                    # -- a NameError on both arms, which the judge would have
+                    # spent a night refusing.
+                    (Path(td) / "src/a.py").write_text("def f():\n    return 1\n")
+                    subprocess.run(["git", "-C", td, "add", "-A"], check=True)
+                    subprocess.run(["git", "-C", td, "-c", "user.name=t", "-c",
+                                    "user.email=t@t", "commit", "-qm", "1"], check=True)
+                    TESTED = dict(LOCAL, harness={
+                        "check": "", "timeout": 60, "clean": "rm -rf src/__pycache__",
+                        "build": "",
+                        "test": "for t in src/test_*.py; do python3 \"$t\" || exit 1; done"})
+                    FIX = "<<<FILE src/a.py>>>\ndef f():\n    return 2\n<<<END>>>\n"
+                    UNIMPORTED = ("<<<FILE src/test_a.py>>>\nassert f() == 2\n<<<END>>>\n"
+                                  + FIX, "stop")
+                    VACUOUS = ("<<<FILE src/test_a.py>>>\nassert True\n<<<END>>>\n"
+                               + FIX, "stop")
+                    WITNESS = ("<<<FILE src/test_a.py>>>\nfrom a import f\n"
+                               "assert f() == 2\n<<<END>>>\n" + FIX, "stop")
+                    REPAIR = {"kind": "repair", "target": "src/a.py", "title": "t",
+                              "witness": "w"}
+                    script[:] = [UNIMPORTED, VACUOUS, WITNESS]; heard.clear()
+                    got = draft(td, dict(REPAIR), TESTED, 1, "root")
+                    said = [m["messages"][1]["content"] for m in heard]
+                    claim("a witness whose tests fail WITH the fix is fed back with the "
+                          "failure, rather than handed to the judge",
+                          len(said) > 1 and "do not pass with your answer" in said[1]
+                          and "NameError" in said[1], said[1][-300:] if len(said) > 1 else said)
+                    claim("a witness that passes WITHOUT the fix is fed back as witnessing "
+                          "nothing", len(said) > 2 and "witnesses nothing" in said[2])
+                    claim("and one that fails before and passes after is drawn",
+                          got[3] == 3 and "assert f() == 2" in got[1] and "return 2" in got[2],
+                          got[1:])
+                    claim("with the workspace as it was, both arms having been run in it",
+                          (Path(td) / "src/a.py").read_text() == "def f():\n    return 1\n"
+                          and not (Path(td) / "src/test_a.py").exists())
+            finally:
+                srv.shutdown()
+                if saved is None:
+                    os.environ.pop("U", None)
+                else:
+                    os.environ["U"] = saved
 
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0

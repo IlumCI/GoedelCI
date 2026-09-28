@@ -146,14 +146,21 @@ judgement, and `admit` is where judgements live.
 Three failures the grammar cannot prevent, each named where it happens:
 
 - **the answer hit `max_tokens`** — with the fence generated last, a truncated
-  reply looks like a formatting failure. `draft` reads `finish_reason` and says
-  which it was.
+  reply looks like a formatting failure. `draft` reads `finish_reason`, tells
+  the next attempt which files the reply opened, and files a balk if every
+  attempt runs away. The draw grammar also has a ceiling — one to three files,
+  two to three for a witness kind — because with `file+` a model that wanted
+  to explain itself could only open another file, and every shard of a real
+  night ran into the limit on a 46-line target.
 - **a decoding loop** — greedy decoding on a long generation can repeat. Under
   60% distinct non-empty lines the reply is refused as a loop, because more
-  tokens would only make it longer.
+  tokens would only make it longer. There is no token-level repeat penalty by
+  default: at 1.15 it turned every second `(x - mean)**2` in a captured draw
+  into `**(3-mean)2`, because correct code repeats itself.
 - **a milestone naming something that is not there** — the ladder's card lists
-  each file with what it *defines*, so the model has real symbols to name
-  rather than guesses.
+  each file with what it *defines*, and `admit` refuses a title that adds a
+  method to, or reads an attribute of, a class nothing in the tree defines,
+  naming what the target does define.
 
 ---
 

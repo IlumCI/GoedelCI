@@ -163,6 +163,24 @@ runs:
         KEYS = ("seq", "goal", "kind", "target", "title", "witness", "point", "balks")
         DECLARED = ("kind", "target", "title", "witness")
 
+        # What a file defines, at the top level: the names the card shows next
+        # to each path, and the names a title may speak of as already there.
+        DEFS = re.compile(
+            r"^(?:export\s+)?(?:async\s+)?"
+            r"(?:class|def|function|fn|type|struct|interface)\s+([A-Za-z_]\w*)",
+            re.M)
+        # A title speaking of a name as something that already exists: a
+        # method added TO it, an attribute OF it, `X.y`, `the X class`. These
+        # are the shapes a small model uses when it has misremembered what the
+        # file calls its class, and the only ones checked -- a proper noun in
+        # prose ("parse what GitHub sends") is none of them.
+        SPOKEN_OF = (
+            re.compile(r"\b(?:method|attribute|property|field|member)s?\b[^.;]*?\b"
+                       r"(?:to|in|on|of)\s+(?:the\s+)?`?([A-Z][A-Za-z0-9_]*)`?"),
+            re.compile(r"\b([A-Z][A-Za-z0-9_]*)\.[a-z_]\w*"),
+            re.compile(r"\b(?:the|existing)\s+`?([A-Z][A-Za-z0-9_]*)`?\s+(?:class|type)\b"),
+        )
+
         class LadderError(Exception):
             """A refusal, optionally carrying the verb that would have worked.
 
@@ -411,6 +429,38 @@ runs:
                     return True
             return False
 
+        def read_text(p):
+            try:
+                return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+            except OSError:
+                return ""
+
+        def builtin(name):
+            import builtins
+            return name in dir(builtins) or name.endswith(("Error", "Exception", "Warning"))
+
+        def listed(root, cfg):
+            """(path, text) for every file the card may show: writable, not the
+            evaluator, not build output, not a dot-directory."""
+            for p in sorted(Path(root).rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(root).as_posix()
+                if not (matches(rel, cfg["allow"]) and not matches(rel, cfg["evaluator"])):
+                    continue
+                # Build output and dot-directories are inside the allow masks
+                # by construction -- `src/**` admits `src/__pycache__/x.pyc` --
+                # and a card offering the model a compiled artifact to aim a
+                # milestone at is a card inviting a refusal.
+                if any(c == "__pycache__" or c.startswith(".") for c in rel.split("/")):
+                    continue
+                if p.suffix in (".pyc", ".pyo", ".so", ".o", ".a", ".class", ".wasm"):
+                    continue
+                yield rel, read_text(p)
+
+        def defined(root, cfg):
+            return {n for _, text in listed(root, cfg) for n in DEFS.findall(text)}
+
         def admit(fields, cfg, root, rungs, goal, criteria=()):
             """`criteria` empty means maintenance: the witness is free, because
             there is no phase left for it to complete. It is still refused if
@@ -466,6 +516,24 @@ runs:
                     "and the plan never moves on. Open:\n  " + "\n  ".join(criteria))
             if not fields["title"]:
                 raise LadderError("a milestone with no title says nothing")
+            # **A milestone about a name the tree does not have is refused
+            # here, where the retry is one line of grammar, rather than in the
+            # draft, where it costs a whole night.** Measured: a card without
+            # the definitions got "add mean() to WindowStats" for a file whose
+            # class is `Window`, and every shard timed out building against a
+            # class that was not there. The card now lists what each file
+            # defines and a 4B still wrote WindowStats once; this is the
+            # check that does not depend on it reading the card.
+            known = defined(root, cfg)
+            for rx in SPOKEN_OF:
+                for name in rx.findall(fields["title"]):
+                    if name in known or builtin(name):
+                        continue
+                    here = sorted(set(DEFS.findall(read_text(Path(root) / target))))
+                    raise LadderError(
+                        "the title speaks of %s as something that exists, and nothing in "
+                        "the writable tree defines it. %s defines: %s. Name what is there."
+                        % (name, target, ", ".join(here) if here else "nothing yet"))
             for k, v in fields.items():
                 if "\n" in v:
                     raise LadderError("%s carries a newline; the format is one line each" % k)
@@ -506,29 +574,9 @@ runs:
             # python, javascript, typescript, rust and go well enough to stop
             # the inventing, and a language it does not know degrades to the
             # bare path it had before.
-            DEFS = re.compile(
-                r"^(?:export\s+)?(?:async\s+)?"
-                r"(?:class|def|function|fn|type|struct|interface)\s+([A-Za-z_]\w*)",
-                re.M)
             tree = []
-            for p in sorted(Path(root).rglob("*")):
-                if not p.is_file():
-                    continue
-                rel = p.relative_to(root).as_posix()
-                if not (matches(rel, cfg["allow"]) and not matches(rel, cfg["evaluator"])):
-                    continue
-                # Build output and dot-directories are inside the allow masks
-                # by construction -- `src/**` admits `src/__pycache__/x.pyc` --
-                # and a card offering the model a compiled artifact to aim a
-                # milestone at is a card inviting a refusal.
-                if any(c == "__pycache__" or c.startswith(".") for c in rel.split("/")):
-                    continue
-                if p.suffix in (".pyc", ".pyo", ".so", ".o", ".a", ".class", ".wasm"):
-                    continue
-                try:
-                    names = DEFS.findall(p.read_text(encoding="utf-8", errors="replace"))
-                except OSError:
-                    names = []
+            for rel, text in listed(root, cfg):
+                names = DEFS.findall(text)
                 # Capped: a file with ninety definitions is a file whose list
                 # of them is not the useful thing about it.
                 shown = sorted(dict.fromkeys(names))[:12]
@@ -768,6 +816,31 @@ runs:
                        adm(witness=""))
                 raises("a witness of `-` is refused too", adm(witness="-"))
                 raises("a milestone with no title is refused", adm(title=""))
+                (root / "src/stats.py").write_text("class Window:\n    def mean(self): pass\n")
+                def about(title):
+                    return lambda: admit({"kind": "repair", "target": "src/stats.py",
+                                          "title": title, "witness": "w"}, CFG, root, [], G)
+                raises("a title adding a method to a class the tree does not define is "
+                       "refused", about("Add variance() method to WindowStats returning None"))
+                try:
+                    about("Add a mean() method to WindowStats")()
+                    said = ""
+                except LadderError as exc:
+                    said = str(exc)
+                claim("and the refusal names what the file does define",
+                      "WindowStats" in said and "Window" in said.split("defines:")[-1])
+                raises("`X.y` of an undefined X is refused", about("make WindowStats.mean exact"))
+                raises("`the X class` of an undefined X is refused",
+                       about("give the WindowStats class a variance"))
+                claim("the same title about the class that exists is admitted",
+                      about("Add variance() method to Window returning None")()["kind"]
+                      == "repair")
+                claim("a builtin is not taken for a class of the project's",
+                      about("make the method on Window raise ValueError when empty")()
+                      ["kind"] == "repair")
+                claim("nor is a proper noun in prose",
+                      about("Parse the payload GitHub sends into a Window")()["kind"]
+                      == "repair")
                 raises("a milestone already on the ladder is refused",
                        lambda: admit({"kind": "feature", "target": "src/new.py",
                                       "title": "t", "witness": "w"}, CFG, root,

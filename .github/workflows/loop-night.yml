@@ -912,7 +912,7 @@ jobs:
             echo "::error::the milestone, so no balk is filed against it."
             exit 1
           fi
-          took=""; drew=0; balked=0; nokey=0; why=""
+          took=""; drew=0; balked=0; nokey=0; silent=0; why=""; said=""
           for d in shards/loop-shard-*; do
             state=$(cat "$d/state" 2>/dev/null || echo none)
             case "$state" in
@@ -924,9 +924,18 @@ jobs:
               # $GITHUB_OUTPUT that the runner obeys.
               balk) balked=$((balked+1))
                     [ -n "$why" ] || why=$(head -c 300 "$d/why" | tr '\n\r' '  ') ;;
+              # Counted and named. It was neither of the above, so a night on
+              # which every shard's endpoint failed printed "0 drew, 0 balked,
+              # 0 had nothing to ask with" -- four shards, and a summary that
+              # accounted for none of them.
+              *) silent=$((silent+1))
+                    [ -n "$said" ] || said=$(head -c 300 "$d/why" 2>/dev/null | tr '\n\r' '  ') ;;
             esac
           done
-          echo "  $drew shard(s) drew, $balked balked, $nokey had nothing to ask with"
+          echo "  $drew shard(s) drew, $balked balked, $nokey had nothing to ask with, $silent got no answer"
+          if [ "$drew" = "0" ] && [ "$silent" != "0" ]; then
+            echo "::warning::$silent shard(s) got no answer from the model: ${said:-no reason was written}"
+          fi
           # Loud, and before anything is recorded. A night that could not ask
           # is not a night the milestone failed, and a schedule that goes
           # green on it goes green every night for good.
