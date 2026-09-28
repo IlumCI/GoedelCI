@@ -8,3 +8,13 @@ witness assert window_stats.mean([1, 2, 3]) == 2.0; assert window_stats.mean([])
 point f46f3075d0e2560e15059766abeb63491da313767a323a67148329f7730f8073
 balks 1
 [end]
+[rung] v2
+seq 2
+goal 9a4ca95d454ab2b3
+kind repair
+target src/window.py
+title Add variance() method to WindowStats returning None when empty and sample variance otherwise
+witness test_the_variance_is_over_what_is_there
+point 18be73c33c4ca7a607d365f84d0c1e94df23008db4ecf264a23737c65610c413
+balks 0
+[end]
