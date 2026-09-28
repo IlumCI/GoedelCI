@@ -656,6 +656,39 @@ runs:
                 return True, ""
             return False, ((r.stdout or "") + (r.stderr or "")).strip()
 
+        def rehearse(root, cfg, witness_only=False):
+            """The judge's own build and test, over whatever is staged now.
+
+            (passed, what to tell the model). The judge runs exactly these, so
+            a candidate that fails them here is one the night would have spent
+            a judge on and refused; here the refusal costs one attempt and the
+            model gets to read it. `check` alone is whatever the project calls
+            fast -- `compileall` here -- and it passed a test file that never
+            imported the class it tested.
+            """
+            h = cfg["harness"]
+            if h.get("clean"):
+                run_check(root, h["clean"], h["timeout"])
+            if h.get("build"):
+                ok, err = run_check(root, h["build"], h["timeout"])
+                if not ok:
+                    return False, ("the build failed with only your test applied, so it "
+                                   "tested nothing:\n" if witness_only else
+                                   "the build failed:\n") + err[-3000:]
+            if not h.get("test"):
+                return (not witness_only), ("" if not witness_only else
+                                            "the project has no test command to fail")
+            ok, err = run_check(root, h["test"], h["timeout"])
+            if witness_only:
+                if ok:
+                    return False, ("Your test passes on the file as it stands, without your "
+                                   "fix, so it witnesses nothing. It has to FAIL before the "
+                                   "fix and pass after it.")
+                return True, ""
+            if not ok:
+                return False, "the project's tests do not pass with your answer:\n" + err[-3000:]
+            return True, ""
+
         def draft(root, rung, cfg, seed, lineage):
             """Up to `attempts` draws, each held to the project's fast check."""
             es = entries(root)
@@ -732,6 +765,10 @@ runs:
                     if not ok:
                         last_error = err[-4000:]
                         continue
+                    ok, err = rehearse(root, cfg)
+                    if not ok:
+                        last_error = err
+                        continue
                     witness_paths = ([p for p, _ in files if p != rung["target"]]
                                      if is_witness else [])
                     fix_paths = [p for p in paths if p not in witness_paths]
@@ -740,6 +777,14 @@ runs:
                     git(root, "add", "-N", "--", *paths)
                     patch = git(root, "diff", "--", *fix_paths)
                     wpatch = git(root, "diff", "--", *witness_paths) if witness_paths else ""
+                    if is_witness and fix_paths:
+                        # The judge's witness arm: the parent, plus the test
+                        # alone. It must build and it must fail.
+                        unstage(root, fix_paths, existed)
+                        ok, err = rehearse(root, cfg, witness_only=True)
+                        if not ok:
+                            last_error = err
+                            continue
                 finally:
                     unstage(root, paths, existed)
 
@@ -1189,6 +1234,45 @@ runs:
                           not (Path(td) / "src/new.py").exists()
                           and subprocess.run(["git", "-C", td, "status", "--porcelain"],
                                              capture_output=True, text=True).stdout == "")
+
+                    # -- the judge's build and test, rehearsed ----------------
+                    #
+                    # Captured from a real draw: `check` was compileall, and it
+                    # passed a witness that never imported the class it tested
+                    # -- a NameError on both arms, which the judge would have
+                    # spent a night refusing.
+                    (Path(td) / "src/a.py").write_text("def f():\n    return 1\n")
+                    subprocess.run(["git", "-C", td, "add", "-A"], check=True)
+                    subprocess.run(["git", "-C", td, "-c", "user.name=t", "-c",
+                                    "user.email=t@t", "commit", "-qm", "1"], check=True)
+                    TESTED = dict(LOCAL, harness={
+                        "check": "", "timeout": 60, "clean": "rm -rf src/__pycache__",
+                        "build": "",
+                        "test": "for t in src/test_*.py; do python3 \"$t\" || exit 1; done"})
+                    FIX = "<<<FILE src/a.py>>>\ndef f():\n    return 2\n<<<END>>>\n"
+                    UNIMPORTED = ("<<<FILE src/test_a.py>>>\nassert f() == 2\n<<<END>>>\n"
+                                  + FIX, "stop")
+                    VACUOUS = ("<<<FILE src/test_a.py>>>\nassert True\n<<<END>>>\n"
+                               + FIX, "stop")
+                    WITNESS = ("<<<FILE src/test_a.py>>>\nfrom a import f\n"
+                               "assert f() == 2\n<<<END>>>\n" + FIX, "stop")
+                    REPAIR = {"kind": "repair", "target": "src/a.py", "title": "t",
+                              "witness": "w"}
+                    script[:] = [UNIMPORTED, VACUOUS, WITNESS]; heard.clear()
+                    got = draft(td, dict(REPAIR), TESTED, 1, "root")
+                    said = [m["messages"][1]["content"] for m in heard]
+                    claim("a witness whose tests fail WITH the fix is fed back with the "
+                          "failure, rather than handed to the judge",
+                          len(said) > 1 and "do not pass with your answer" in said[1]
+                          and "NameError" in said[1], said[1][-300:] if len(said) > 1 else said)
+                    claim("a witness that passes WITHOUT the fix is fed back as witnessing "
+                          "nothing", len(said) > 2 and "witnesses nothing" in said[2])
+                    claim("and one that fails before and passes after is drawn",
+                          got[3] == 3 and "assert f() == 2" in got[1] and "return 2" in got[2],
+                          got[1:])
+                    claim("with the workspace as it was, both arms having been run in it",
+                          (Path(td) / "src/a.py").read_text() == "def f():\n    return 1\n"
+                          and not (Path(td) / "src/test_a.py").exists())
             finally:
                 srv.shutdown()
                 if saved is None:
