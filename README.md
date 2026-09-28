@@ -412,7 +412,10 @@ construction: the machine skips them and writes fresh ones. No bookkeeping.
 hand, and it refuses unless:
 
 - the ledger sits exactly at an epoch boundary (the criterion holds still
-  *within* an epoch, or nothing in the record is comparable);
+  *within* an epoch, or nothing in the record is comparable). Editing the
+  template on `main` yourself is the other way the judge changes; the next
+  night files an `amended` entry for it, which opens a new epoch, and
+  nothing is refused;
 - every action still proves itself with the change applied;
 - the old and new judges **disagree** about at least one archived comparison
   (a judge change that changes no verdict is a diff with a story);

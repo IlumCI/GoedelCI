@@ -132,8 +132,29 @@ jobs:
                                  **{"candidate-tree": cand})
               if adopt:
                   lineage, tree = name, cand
-          print("  %d certificate(s) filed across %d epoch(s)"
-                % (nights, (nights - 1) // length + 1))
+
+          # **And the operator changes the template mid-epoch.** That is the
+          # other way the judge changes, and the one the record did not know
+          # how to hold: a night follows main, the digest moves, and the
+          # entries after it sat in the epoch of the judge before. An
+          # `amended` entry closes that epoch wherever it is and opens the
+          # next; the nights after it count their epoch from there.
+          n = len(list(entries.glob("*.cert")))
+          assert n % length, "the amendment must land mid-epoch to mean anything"
+          was = n // length
+          utility = hashlib.sha256(b"operator-edit").hexdigest()
+          file_one(n, epoch=str(was + 1), kind="event", lane="event", operator="-",
+                   lineage="root", rung="0", axis="none", trials="0", minutes="0",
+                   verdict="amended", why="the evaluator changed on the default branch",
+                   **{"parent-tree": "-", "candidate-tree": "-", "claims": "-"})
+          for k in range(length):
+              n = len(list(entries.glob("*.cert")))
+              name, f = file_one(n, epoch=str(was + 1 + (k + 1) // length),
+                                 verdict="refuse", claims="6/6", author="alpha",
+                                 **{"candidate-tree": "-"})
+          total = len(list(entries.glob("*.cert")))
+          print("  %d certificate(s) filed, one of them an amendment mid-epoch %d"
+                % (total, was))
           PYEOF
 
       - uses: ./.github/actions/cert

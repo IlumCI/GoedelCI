@@ -180,10 +180,18 @@ it, and checks what the *directory* claims about itself:
 - every `lineage` names an earlier entry that was **adopted** — a tree that was
   never adopted is not a state anything could have been built from;
 - entries within one epoch carry one `utility` digest, epochs advance by
-  exactly one, and only at a multiple of `epoch_len`. The digest covers the
-  `criterion` masks — the judge — and deliberately not the record, which
-  changes every night and would otherwise make every entry in an epoch
-  disagree about which judge decided it;
+  exactly one, and only when the epoch is full (`epoch_len` entries) or the
+  next entry is an `amended` event. The digest covers the `criterion` masks —
+  the judge — and deliberately not the record, which changes every night and
+  would otherwise make every entry in an epoch disagree about which judge
+  decided it;
+- an `amended` entry records the operator changing the evaluator on the
+  default branch — the one change to the judge that does not come through
+  `boundary`. The night that follows main files it before drafting anything:
+  it closes the epoch the change arrived in, whatever its fill, and opens the
+  next, so epochs are counted from their own first entry rather than from
+  seq 1. Absent amendments the two readings are the same. `epoch_len` is part
+  of the judge, so fill is checked only from the newest amendment on;
 - every tried marker hashes to the point it is named for.
 
 Per-field validity is delegated to `cert check-dir`, so the field table exists

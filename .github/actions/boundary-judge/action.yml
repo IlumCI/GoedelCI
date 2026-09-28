@@ -63,10 +63,10 @@ inputs:
     description: "how many entries the ledger holds, for the message"
     required: false
     default: "0"
-  epoch-len:
-    description: "how many entries an epoch holds"
+  to-go:
+    description: "how many entries until the current epoch is full, for the message"
     required: false
-    default: "16"
+    default: "0"
 
 outputs:
   ok:
@@ -90,7 +90,7 @@ runs:
         NEW: ${{ inputs.new }}
         BOUNDARY: ${{ inputs.boundary }}
         ENTRIES: ${{ inputs.entries }}
-        EPOCH_LEN: ${{ inputs.epoch-len }}
+        TO_GO: ${{ inputs.to-go }}
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
@@ -255,9 +255,10 @@ runs:
 
         try:
             if os.environ.get("BOUNDARY", "no") != "yes":
+                # The distance is the ledger's to say: an amendment opens an
+                # epoch wherever it lands, so it is not `n % epoch_len`.
                 n = int(os.environ.get("ENTRIES", "0") or "0")
-                length = int(os.environ.get("EPOCH_LEN", "16") or "16")
-                to_go = length - (n % length) if n else length
+                to_go = int(os.environ.get("TO_GO", "0") or "0")
                 raise BoundaryError(
                     "the ledger holds %d entr%s; the criterion is questionable only at an "
                     "epoch boundary, %d away" % (n, "y" if n == 1 else "ies", to_go))

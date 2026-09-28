@@ -114,9 +114,18 @@ guarantee holds per epoch.
 **Here.** Every certificate carries `utility`, the digest of every file the
 evaluator masks cover, and `epoch`. `ledger fsck` enforces three things as
 properties of the record: entries within one epoch carry one utility digest,
-epochs advance by exactly one, and only at a multiple of `epoch_len`. Without
-those, two certificates are two different machines' opinions and nothing
-downstream can tell.
+epochs advance by exactly one, and only at a boundary. Without those, two
+certificates are two different machines' opinions and nothing downstream can
+tell.
+
+A boundary is a full epoch or an **amendment**. The machine changes its judge
+only through `boundary`, at a full epoch. The operator can change it too, by
+editing the template on the default branch that every night follows; that is
+the human's authority, and the record's job is to hold it rather than refuse
+it. So the night files an `amended` entry, which closes the current epoch
+wherever it stands and opens the next under the new digest. RQGM's guarantee
+is per epoch, and an epoch that silently spanned two judges would carry a
+guarantee about neither.
 
 `boundary` is the lane that changes the evaluator, and RQGM's adversarial
 finding — that a naive judge over-accepts what it should refuse — is why

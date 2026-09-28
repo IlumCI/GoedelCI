@@ -100,8 +100,6 @@ jobs:
           WON: ${{ github.event.pull_request.number }}
           TITLE: ${{ github.event.pull_request.title }}
           CLOSED: ${{ steps.close.outputs.closed }}
-          EPOCH_LEN: ${{ steps.cfg.outputs.epoch-len }}
-          UTILITY: ${{ steps.cfg.outputs.utility }}
         shell: bash
         run: |
           set -euo pipefail
@@ -112,19 +110,24 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -qf -B loop/main origin/loop/main
-          n=0
-          if [ -d loop/ledger/entries ]; then
-            n=$(find loop/ledger/entries -name '*.cert' | wc -l)
-          fi
-          test "${EPOCH_LEN:-0}" -gt 0 || { echo "::error::no epoch length"; exit 1; }
           {
-            echo "SEQ=$(( n + 1 ))"
-            echo "EPOCH=$(( n / EPOCH_LEN ))"
             echo "NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "POINT=$(printf 'direction %s merged as %s' "$WON" "$TITLE" \
                           | sha256sum | cut -d' ' -f1)"
           } >> "$GITHUB_ENV"
           echo "go=yes" >> "$GITHUB_OUTPUT"
+
+      # Where the entry goes, and which judge it sits under, are the ledger's
+      # to say. The utility is the RECORD's, not main's: this merge may have
+      # changed the evaluator, and that change is filed as an amendment by the
+      # next night that follows main -- not smuggled into the current epoch
+      # under a note about something else.
+      - id: at
+        if: steps.note.outputs.go == 'yes'
+        uses: ./.github/actions/ledger
+        with:
+          command: count
+          epoch-len: ${{ steps.cfg.outputs.epoch-len }}
 
       - if: steps.note.outputs.go == 'yes'
         uses: ./.github/actions/cert
@@ -132,13 +135,13 @@ jobs:
           command: emit
           out: direction.cert
           set: |
-            seq=${{ env.SEQ }}
+            seq=${{ steps.at.outputs.seq }}
             utc=${{ env.NOW }}
             point=${{ env.POINT }}
             kind=event
             lane=event
-            epoch=${{ env.EPOCH }}
-            utility=${{ steps.cfg.outputs.utility }}
+            epoch=${{ steps.at.outputs.epoch }}
+            utility=${{ steps.at.outputs.utility || steps.cfg.outputs.utility }}
             rung=0
             axis=none
             why=a new direction was chosen: ${{ github.event.pull_request.title }} (#${{ github.event.pull_request.number }}), ${{ steps.close.outputs.closed }} alternative(s) closed

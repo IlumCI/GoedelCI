@@ -27,6 +27,18 @@ description: >-
 # one utility digest, epochs advance by exactly one, and only at a boundary.
 # Without those three, two certificates are two machines' opinions and
 # comparing them is a category error nothing downstream can detect.
+#
+# **A boundary is either a full epoch or an amendment.** `boundary` is the
+# machine's way to change its judge, and it may only do so when an epoch is
+# full. The operator has a second way: edit the template on the default
+# branch, which a night then follows. That is the human's authority and not
+# the machine's to refuse -- but it is still a new judge, and a record that
+# let it arrive silently mid-epoch would compare the two judges' verdicts as
+# if they were one. So the night files an `amended` entry, and an amendment
+# closes the epoch it arrives in, whatever its fill, and opens the next.
+# Epochs are therefore counted from their own first entry, not from seq 1:
+# absent any amendment the two readings are identical, and with one only
+# the relative reading is true.
 
 inputs:
   command:
@@ -53,11 +65,20 @@ outputs:
     description: "the sequence number the next entry takes"
     value: ${{ steps.run.outputs.seq }}
   epoch:
-    description: "the epoch the next entry belongs to"
+    description: "the epoch the next entry belongs to, judged by the same evaluator"
     value: ${{ steps.run.outputs.epoch }}
   boundary:
-    description: "yes when the ledger sits exactly at an epoch edge"
+    description: "yes when the current epoch is full, so the next entry opens one"
     value: ${{ steps.run.outputs.boundary }}
+  utility:
+    description: "the evaluator digest the newest entry was judged by; empty for an empty ledger"
+    value: ${{ steps.run.outputs.utility }}
+  amend-epoch:
+    description: "the epoch an `amended` entry filed now would open"
+    value: ${{ steps.run.outputs.amend_epoch }}
+  to-go:
+    description: "how many more entries the current epoch takes before it is full"
+    value: ${{ steps.run.outputs.to_go }}
   tip:
     description: "the name of the newest adopted entry, or `root`"
     value: ${{ steps.run.outputs.tip }}
@@ -204,8 +225,30 @@ runs:
                         % (e.seq, by_name[parent].seq, by_name[parent]["verdict"]))
 
             # --- the epoch claims ---------------------------------------
-            for a, b in zip(es, es[1:]):
+            if es and es[0].epoch != 0:
+                raise LedgerError("seq 1 is in epoch %d; the record starts at epoch 0"
+                                  % es[0].epoch)
+            if es and es[0]["verdict"] == "amended":
+                raise LedgerError("seq 1 is an amendment, and there is no judge before it "
+                                  "to have amended")
+            # epoch_len is part of the evaluator, so an amendment may have
+            # changed it. Fill is checked only from the newest amendment on,
+            # where the length in force is the one this was given; before it,
+            # every other claim still holds and fill is not this reader's to know.
+            since = max([i for i, e in enumerate(es) if e["verdict"] == "amended"], default=0)
+            held = {}
+            for i, e in enumerate(es):
+                held[e.epoch] = held.get(e.epoch, 0) + 1
+                if i >= since and held[e.epoch] > epoch_len:
+                    raise LedgerError("epoch %d holds more than %d entries at seq %d"
+                                      % (e.epoch, epoch_len, e.seq))
+            for i, (a, b) in enumerate(zip(es, es[1:]), start=1):
+                amended = b["verdict"] == "amended"
                 if b.epoch == a.epoch:
+                    if amended:
+                        raise LedgerError(
+                            "seq %d is an amendment inside epoch %d; an amendment is a new "
+                            "judge, so it opens an epoch" % (b.seq, a.epoch))
                     if b["utility"] != a["utility"]:
                         raise LedgerError(
                             "seq %d and seq %d are both in epoch %d and were judged by "
@@ -215,11 +258,19 @@ runs:
                 if b.epoch != a.epoch + 1:
                     raise LedgerError("the epoch jumps from %d to %d at seq %d"
                                       % (a.epoch, b.epoch, b.seq))
-                if a.seq % epoch_len != 0:
+                if amended:
+                    if b["utility"] == a["utility"]:
+                        raise LedgerError(
+                            "seq %d is an amendment that carries the evaluator seq %d already "
+                            "had; it amends nothing" % (b.seq, a.seq))
+                    continue
+                if i > since and held[a.epoch] != epoch_len:
                     raise LedgerError(
-                        "the epoch advances at seq %d, which is not an epoch boundary "
-                        "(epoch_len %d); the criterion may change only at one"
-                        % (b.seq, epoch_len))
+                        "the epoch advances at seq %d, after %d entr%s of epoch %d and not "
+                        "%d, and seq %d is not an amendment; the criterion may change only "
+                        "at a boundary" % (b.seq, held[a.epoch],
+                                           "y" if held[a.epoch] == 1 else "ies",
+                                           a.epoch, epoch_len, b.seq))
 
             # --- the tried markers --------------------------------------
             td = Path(root) / "loop/ledger/tried"
@@ -234,6 +285,17 @@ runs:
                         raise LedgerError(
                             "tried/%s is named for a point the file does not hash to" % p.name)
             return es
+
+        def position(es, epoch_len):
+            """(the epoch the next entry takes under the same judge, whether the
+            current epoch is full, the epoch an amendment filed now opens, how
+            many entries the current epoch still takes)."""
+            if not es:
+                return 0, False, 0, epoch_len
+            last = es[-1].epoch
+            held = sum(1 for e in es if e.epoch == last)
+            full = held >= epoch_len
+            return (last + 1 if full else last), full, last + 1, max(0, epoch_len - held)
 
         def tip(es):
             for e in reversed(es):
@@ -333,26 +395,64 @@ runs:
             with tempfile.TemporaryDirectory() as td:
                 write(td); write(td, epoch="2", utility="e"*64)
                 raises("an epoch that skips a number is refused", lambda: fsck(td, 1))
+            AM = dict(verdict="amended", lane="event", kind="event")
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, epoch="1", utility="e"*64, **AM)
+                claim("an amendment opens an epoch wherever it arrives", len(fsck(td, 16)) == 2)
+                claim("and the next entry joins it, under the new judge",
+                      position(load(td), 16) == (1, False, 2, 15))
+                write(td, epoch="1", utility="e"*64)
+                claim("so the entry after it is in epoch 1", len(fsck(td, 16)) == 3)
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, utility="e"*64, **AM)
+                raises("an amendment inside an epoch is refused", lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, epoch="1", **AM)
+                raises("an amendment that changes nothing is refused", lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td, **AM)
+                raises("an amendment with nothing before it is refused", lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td, epoch="1")
+                raises("a record that does not start at epoch 0 is refused", lambda: fsck(td, 16))
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td); write(td)
+                raises("an epoch fuller than its length is refused", lambda: fsck(td, 2))
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, epoch="1", utility="e"*64, **AM)
+                write(td, epoch="1", utility="e"*64)
+                write(td, epoch="2", utility="e"*64)
+                claim("epochs are counted from their first entry, not from seq 1",
+                      len(fsck(td, 2)) == 4)
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td, epoch="1", utility="e"*64, **AM)
+                write(td, epoch="2", utility="e"*64)
+                raises("an epoch opened by an amendment still fills before it closes",
+                       lambda: fsck(td, 2))
+            with tempfile.TemporaryDirectory() as td:
+                write(td); write(td); write(td, epoch="1"); write(td, epoch="1")
+                write(td, epoch="2", utility="e"*64, **AM)
+                claim("an amendment that changed epoch_len does not unmake the epochs "
+                      "written under the old one", len(fsck(td, 3)) == 5)
+                claim("a full epoch is a boundary", position(load(td)[:4], 2) == (2, True, 2, 0))
+
             with tempfile.TemporaryDirectory() as td:
                 d = Path(td) / "loop/ledger/tried"; d.mkdir(parents=True)
                 (d / ("0"*16 + ".env")).write_bytes(b"not what this names")
                 raises("a tried marker that is not the envelope it names is refused",
                        lambda: fsck(td, 16))
 
-            claim("genesis is not an epoch boundary", not is_boundary(0, 16))
-            claim("sixteen entries is one", is_boundary(16, 16))
-            claim("seventeen is not", not is_boundary(17, 16))
-            claim("the first entry belongs to epoch zero", 0 // 16 == 0)
-            claim("the seventeenth belongs to epoch one", 16 // 16 == 1)
+            with tempfile.TemporaryDirectory() as td:
+                claim("genesis is not an epoch boundary",
+                      position(load(td), 16) == (0, False, 0, 16))
+                for _ in range(16):
+                    write(td)
+                claim("sixteen entries is one", position(load(td), 16) == (1, True, 1, 0))
+                write(td, epoch="1")
+                claim("seventeen is not, and the seventeenth entry was epoch one",
+                      position(load(td), 16) == (1, False, 2, 15) and len(fsck(td, 16)) == 17)
             print("\n%d/%d claims held" % (ok, ok + fail))
             return 1 if fail else 0
-
-        def is_boundary(n, epoch_len):
-            # Genesis is deliberately not a boundary. A criterion with no track
-            # record to gate against is a criterion nothing has tested, and
-            # letting the first evaluator change through for free is the one
-            # moment the gate would have cost nothing to pass.
-            return n > 0 and n % epoch_len == 0
 
         cmd = os.environ["COMMAND"].strip()
         root = os.environ.get("ROOT", ".")
@@ -377,14 +477,22 @@ runs:
                 adopted = sum(1 for e in es if e.adopted)
                 counted = sum(1 for e in es if e.counted)
                 print("  %d entries, %d counted trials, %d adopted, epoch %d"
-                      % (n, counted, adopted, n // epoch_len))
+                      % (n, counted, adopted, es[-1].epoch if es else 0))
                 print(tail(es, 10))
             elif cmd not in ("fsck", "count", "seq"):
                 raise LedgerError("no such command: %r" % cmd)
             out("count", str(n))
             out("seq", str(n + 1))
-            out("epoch", str(n // epoch_len))
-            out("boundary", "yes" if is_boundary(n, epoch_len) else "no")
+            # Genesis is deliberately not a boundary. A criterion with no track
+            # record to gate against is a criterion nothing has tested, and
+            # letting the first evaluator change through for free is the one
+            # moment the gate would have cost nothing to pass.
+            nxt, full, amend, to_go = position(es, epoch_len)
+            out("epoch", str(nxt))
+            out("boundary", "yes" if full else "no")
+            out("utility", es[-1]["utility"] if es else "")
+            out("amend_epoch", str(amend))
+            out("to_go", str(to_go))
             out("tip", tip(es))
             out("why", "")
         except LedgerError as exc:
