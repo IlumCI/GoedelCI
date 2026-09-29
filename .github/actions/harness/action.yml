@@ -85,6 +85,9 @@ outputs:
   rails:
     description: "the rail file this arm produced"
     value: ${{ steps.run.outputs.rails }}
+  held:
+    description: "the file naming every claim that passed in this arm, one per line"
+    value: ${{ steps.run.outputs.held }}
   why:
     description: "when something did not survive, what"
     value: ${{ steps.run.outputs.why }}
@@ -170,6 +173,22 @@ runs:
             rx = re.compile(pattern, re.M)
             return sum(1 for line in text.splitlines() if rx.search(line))
 
+        # >>> held -- byte-identical in `harness` and `draft`; template-check
+        #             refuses a copy that has drifted.
+        # A trailing duration is the one part of a pass line that changes run
+        # to run without the claim changing: `ok x (3ms)`, `PASS x in 0.2s`.
+        TIMING = re.compile(r"\s*(?:\(\s*\d+(?:\.\d+)?\s*[mun]?s\s*\)|in\s+\d+(?:\.\d+)?\s*[mun]?s)\s*$")
+
+        def held_claims(text, pattern):
+            """WHICH claims passed, not how many: each pass line, trimmed of a
+            trailing duration. A count cannot tell a test that was added from
+            one that replaced another -- measured on the first adoption, which
+            deleted a passing test, added two, and read as 6 -> 7."""
+            rx = re.compile(pattern, re.M)
+            return sorted({TIMING.sub("", line.strip())
+                           for line in text.splitlines() if rx.search(line)})
+        # <<< held
+
         def count_suites(text, pattern):
             """The LAST match wins. A runner prints a per-file tally as it goes
             and a grand total at the end, and the grand total is the one that
@@ -251,6 +270,7 @@ runs:
                     why = "the build failed: %s" % (errs or "no error line")
 
             suites = claims = 0
+            held = []
             tested = False
             if built and h["test"]:
                 attempted += 1
@@ -258,6 +278,7 @@ runs:
                 log.append("$ %s\n%s" % (h["test"], text))
                 suites = count_suites(text, h["suites_re"])
                 claims = count_claims(text, h["claims_re"])
+                held = held_claims(text, h["claims_re"])
                 if code == 0:
                     succeeded += 1
                     tested = True
@@ -324,7 +345,7 @@ runs:
 
             return dict(built=built, tested=tested, verified=verified, suites=suites,
                         claims=claims, checks=succeeded, rails=samples,
-                        log="\n".join(log), why=why)
+                        log="\n".join(log), why=why, held=held)
 
         # ------------------------------------------------------------------
 
@@ -399,6 +420,15 @@ runs:
                 claim("and no artifact rail is measured off the previous build",
                       "cost.artifact_bytes" not in r["rails"])
 
+                r = measure(root, cfg(test="echo 'ok one (3ms)'; echo 'ok two in 0.2s'; "
+                                           "echo 'not ok three'; echo '2 tests passed'"),
+                            "a", 1, False)
+                claim("which claims passed is recorded by name, not only how many",
+                      r["held"] == ["ok one", "ok two"], r["held"])
+                claim("with the duration taken off, so the same claim reads the same "
+                      "on two runs", held_claims("ok one (12 ms)\n", D["claims_re"])
+                      == held_claims("ok one (3ms)\n", D["claims_re"]))
+
                 r = measure(root, cfg(test="echo 'ok one'; exit 1"), "a", 1, False)
                 claim("a failing test run still counts what passed", r["claims"] == 1)
                 claim("but does not report itself tested", not r["tested"])
@@ -472,6 +502,9 @@ runs:
         rails_path = "rails-%s.txt" % arm
         Path(rails_path).write_text(render(r["rails"]), encoding="utf-8")
         Path("harness-%s.log" % arm).write_text(r["log"], encoding="utf-8")
+        held_path = "held-%s.txt" % arm
+        Path(held_path).write_text("".join(c + "\n" for c in r.get("held", [])),
+                                   encoding="utf-8")
 
         print("  arm %s: built=%s tested=%s verified=%s suites=%d claims=%d checks=%d "
               "rails=%d" % (arm, "yes" if r["built"] else "no",
@@ -485,6 +518,6 @@ runs:
         out("tested", "yes" if r["tested"] else "no")
         out("verified", "yes" if r["verified"] else "no")
         out("suites", str(r["suites"])); out("claims", str(r["claims"]))
-        out("checks", str(r["checks"])); out("rails", rails_path)
+        out("checks", str(r["checks"])); out("rails", rails_path); out("held", held_path)
         out("why", r["why"].replace("\n", " ")[:300])
         PYEOF

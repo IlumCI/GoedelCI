@@ -713,11 +713,27 @@ runs:
             except subprocess.TimeoutExpired:
                 return False, ("Your code did not finish inside %ds. Something in it does "
                                "not terminate." % timeout)
-            if r.returncode == 0:
-                return True, ""
-            return False, ((r.stdout or "") + (r.stderr or "")).strip()
+            # The output either way: a caller that needs to know WHICH claims
+            # passed reads it from a run that succeeded.
+            return r.returncode == 0, ((r.stdout or "") + (r.stderr or "")).strip()
 
-        def rehearse(root, cfg, witness_only=False):
+        # >>> held -- byte-identical in `harness` and `draft`; template-check
+        #             refuses a copy that has drifted.
+        # A trailing duration is the one part of a pass line that changes run
+        # to run without the claim changing: `ok x (3ms)`, `PASS x in 0.2s`.
+        TIMING = re.compile(r"\s*(?:\(\s*\d+(?:\.\d+)?\s*[mun]?s\s*\)|in\s+\d+(?:\.\d+)?\s*[mun]?s)\s*$")
+
+        def held_claims(text, pattern):
+            """WHICH claims passed, not how many: each pass line, trimmed of a
+            trailing duration. A count cannot tell a test that was added from
+            one that replaced another -- measured on the first adoption, which
+            deleted a passing test, added two, and read as 6 -> 7."""
+            rx = re.compile(pattern, re.M)
+            return sorted({TIMING.sub("", line.strip())
+                           for line in text.splitlines() if rx.search(line)})
+        # <<< held
+
+        def rehearse(root, cfg, witness_only=False, before=None):
             """The judge's own build and test, over whatever is staged now.
 
             (passed, what to tell the model). The judge runs exactly these, so
@@ -749,6 +765,15 @@ runs:
             if not ok:
                 return False, ("the project's tests do not pass with your answer:\n"
                                + failing_only(err, cfg)[-3000:])
+            # The judge refuses a candidate that loses a claim the baseline
+            # held, whatever the totals; say so here, where it costs an attempt.
+            if before:
+                lost = sorted(set(before) - set(held_claims(err, cfg["harness"]["claims_re"])))
+                if lost:
+                    return False, (
+                        "Your answer removed or broke tests that passed before it, and a "
+                        "test that passed may not disappear. Keep every one of these "
+                        "passing, and add yours alongside them:\n  " + "\n  ".join(lost[:12]))
             return True, ""
 
         def draft(root, rung, cfg, seed, lineage):
@@ -769,6 +794,15 @@ runs:
                                    % err[:300])
             is_witness = kind["j1"] == "witness"
             last_error, attempts = "", 0
+            # What held before anything was drawn: the judge's baseline arm,
+            # run once, so every attempt can be told which claim it lost.
+            before = None
+            h = cfg["harness"]
+            if h.get("test") and h.get("claims_re"):
+                if h.get("clean"):
+                    run_check(root, h["clean"], h["timeout"])
+                _, text = run_check(root, h["test"], h["timeout"])
+                before = held_claims(text, h["claims_re"])
 
             for attempt in range(1, cfg["author"]["attempts"] + 1):
                 attempts = attempt
@@ -827,7 +861,7 @@ runs:
                     if not ok:
                         last_error = err[-4000:]
                         continue
-                    ok, err = rehearse(root, cfg)
+                    ok, err = rehearse(root, cfg, before=before)
                     if not ok:
                         last_error = err
                         continue
@@ -1352,6 +1386,29 @@ runs:
                     claim("and one that fails before and passes after is drawn",
                           got[3] == 3 and "assert f() == 2" in got[1] and "return 2" in got[2],
                           got[1:])
+                    # A pair that fails before and passes after -- and drops
+                    # the project's existing test to do it. The first real
+                    # adoption did exactly this and read as claims 6 -> 7.
+                    (Path(td) / "src/test_keep.py").write_text(
+                        "from a import f\nassert f() in (1, 2)\nprint('ok keep')\n")
+                    subprocess.run(["git", "-C", td, "add", "-A"], check=True)
+                    subprocess.run(["git", "-C", td, "-c", "user.name=t", "-c",
+                                    "user.email=t@t", "commit", "-qm", "2"], check=True)
+                    COUNTED = dict(TESTED, harness=dict(TESTED["harness"], claims_re=r"^ok\b",
+                        test="for t in src/test_*.py; do python3 \"$t\" || exit 1; done"))
+                    DROPS = ("<<<FILE src/test_keep.py>>>\nprint('ok other')\n<<<END>>>\n"
+                             "<<<FILE src/test_a.py>>>\nfrom a import f\nassert f() == 2\n"
+                             "print('ok a')\n<<<END>>>\n" + FIX, "stop")
+                    KEEPS = ("<<<FILE src/test_a.py>>>\nfrom a import f\nassert f() == 2\n"
+                             "print('ok a')\n<<<END>>>\n" + FIX, "stop")
+                    script[:] = [DROPS, KEEPS]; heard.clear()
+                    got2 = draft(td, dict(REPAIR), COUNTED, 1, "root")
+                    said = [m["messages"][1]["content"] for m in heard]
+                    claim("an answer that loses a claim the tree held before is fed back "
+                          "with the claim's name, however many it adds",
+                          len(said) > 1 and "may not disappear" in said[1]
+                          and "ok keep" in said[1], said[1][-300:] if len(said) > 1 else said)
+                    claim("and the answer that keeps it is drawn", got2[3] == 2, got2[3])
                     claim("with the workspace as it was, both arms having been run in it",
                           (Path(td) / "src/a.py").read_text() == "def f():\n    return 1\n"
                           and not (Path(td) / "src/test_a.py").exists())
